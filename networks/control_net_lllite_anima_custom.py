@@ -246,17 +246,19 @@ class LLLiteModuleDiT(nn.Module):
         scores = torch.matmul(q_h, k_h.transpose(-1, -2)) * (self.head_dim ** -0.5)
         attn_weights = F.softmax(scores, dim=-1)
 
-        # Compute attention output: (B, H, S, D)
-        out_h = torch.matmul(attn_weights, v_h)
+        # Optimize projection by projecting V before multiplying with attn_weights:
+        # V is (B, H, N, D), out_proj_down weight is (mlp_dim, H * D) which we reshape to (mlp_dim, H, D)
+        W_down = self.out_proj_down.weight.view(self.out_proj_down.out_features, self.n_heads, self.head_dim)
+        v_proj = torch.einsum("bhnd,rhd->bhnr", v_h, W_down)
 
-        # Transpose and reshape back to sequence space: (B, S, inner_dim)
-        out_style = out_h.transpose(1, 2).reshape(x.shape[0], x.shape[1], self.inner_dim)
+        # Compute head-summed attention output: (B, S, mlp_dim)
+        out_style = torch.einsum("bhsn,bhnr->bsr", attn_weights, v_proj)
 
         if self.dropout is not None and self.training:
             out_style = F.dropout(out_style, p=self.dropout)
 
-        # Project back to query_dim (using LoRA bottleneck)
-        out_style = self.out_proj_up(self.out_proj_down(out_style)) * self.multiplier  # (B, S, query_dim)
+        # Project back to query_dim: (B, S, query_dim)
+        out_style = self.out_proj_up(out_style) * self.multiplier
 
         # Merge style attention path with main attention path
         y_patched = y + out_style

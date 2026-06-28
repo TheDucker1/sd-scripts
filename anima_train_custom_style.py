@@ -22,6 +22,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
+
+try:
+    import xformers.ops as xops
+except ImportError:
+    xops = None
+
+try:
+    from sageattention import sageattn
+except ImportError:
+    sageattn = None
+
 from library import flux_train_utils, qwen_image_autoencoder_kl
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
@@ -74,12 +89,14 @@ class StyleDualKVModule(nn.Module):
         name: str,
         org_module: nn.Module,  # Attention module
         num_style_tokens: int,
+        k_basis: int,
         rank: int,
     ):
         super().__init__()
         self.module_name = name
         self.org_module = [org_module]
         self.num_style_tokens = num_style_tokens
+        self.k_basis = k_basis
         self.rank = rank
         self.multiplier = 1.0
 
@@ -89,21 +106,27 @@ class StyleDualKVModule(nn.Module):
         self.query_dim = getattr(org_module, "query_dim", org_module.q_proj.in_features if hasattr(org_module, "q_proj") else 512)
         self.inner_dim = self.n_heads * self.head_dim
 
-        # Direct style keys and values as learnable parameters (eliminates redundant dummy style token + projections)
-        self.k_style = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, self.head_dim))
-        self.v_style = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, self.head_dim))
-        nn.init.normal_(self.k_style, std=0.02)
+        # Low-rank decomposed style keys and merged full-rank style values
+        if k_basis is None or k_basis <= 0:
+            self.k_style = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, self.head_dim))
+            nn.init.normal_(self.k_style, std=0.02)
+            self.decomposed_keys = False
+        else:
+            self.k_style_u = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, k_basis))
+            self.k_style_v = nn.Parameter(torch.zeros(1, k_basis, self.n_heads, self.head_dim))
+            nn.init.normal_(self.k_style_u, std=0.02)
+            nn.init.normal_(self.k_style_v, std=0.02)
+            self.decomposed_keys = True
+
+        self.v_style = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, rank))
         nn.init.normal_(self.v_style, std=0.02)
+
         
         # Style QK-norm
         self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
 
-        # Output projection back to query_dim (bottlenecked using LoRA)
-        self.out_proj_down = nn.Linear(self.inner_dim, rank, bias=False)
+        # Output projection back to query_dim
         self.out_proj_up = nn.Linear(rank, self.query_dim, bias=False)
-        
-        # Initialize LoRA layers: down projection normally, up projection to zero (mathematical identity at start)
-        nn.init.normal_(self.out_proj_down.weight, std=1.0 / math.sqrt(self.inner_dim))
         nn.init.zeros_(self.out_proj_up.weight)
 
     def apply_to(self):
@@ -135,37 +158,44 @@ class StyleDualKVModule(nn.Module):
             from library.anima_models import apply_rotary_pos_emb
             q = apply_rotary_pos_emb(q, rope_emb, tensor_format=org.qkv_format, fused=False)
 
-        # 2. Get static learnable style keys and values
+        # 2. Reconstruct k_style and get v_style
+        if self.decomposed_keys:
+            # u: (1, S_style, H, K_basis) -> (1, H, S_style, K_basis)
+            u = self.k_style_u.to(dtype=q.dtype).transpose(1, 2)
+            # v: (1, K_basis, H, D) -> (1, H, K_basis, D)
+            v = self.k_style_v.to(dtype=q.dtype).transpose(1, 2)
+            k_style = torch.matmul(u, v).transpose(1, 2)  # (1, S_style, H, D)
+        else:
+            k_style = self.k_style.to(dtype=q.dtype)
+
+
         B = y.shape[0]
         # Expand/repeat k_style, v_style to batch dimension
-        k_style = self.k_style.repeat(B, 1, 1, 1)
-        v_style = self.v_style.repeat(B, 1, 1, 1)
+        k_style = k_style.repeat(B, 1, 1, 1)
+        v_style = self.v_style.to(dtype=q.dtype).repeat(B, 1, 1, 1)
 
         # CFG support
         if y.shape[0] // 2 == k_style.shape[0]:
             k_style = k_style.repeat(2, 1, 1, 1)
             v_style = v_style.repeat(2, 1, 1, 1)
 
-        # Apply style key norm
-        k_style = self.k_norm_style(k_style)
+        # Apply style key norm and cast to matching dtype
+        k_style = self.k_norm_style(k_style).to(dtype=q.dtype)
 
-        # 3. Transpose to align heads: (B, H, S, D) and (B, H, N_queries, D)
+        # 3. Standard SDPA attention path (extremely fast, no padding needed)
         q_h = q.transpose(1, 2)
         k_h = k_style.transpose(1, 2)
         v_h = v_style.transpose(1, 2)
-
-        # Compute multi-head attention scores: (B, H, S, N_queries)
-        scores = torch.matmul(q_h, k_h.transpose(-1, -2)) * (self.head_dim ** -0.5)
-        attn_weights = F.softmax(scores, dim=-1)
-
-        # Compute attention output: (B, H, S, D)
-        out_h = torch.matmul(attn_weights, v_h)
-
-        # Transpose and reshape back to sequence space: (B, S, inner_dim)
-        out_style = out_h.transpose(1, 2).reshape(x.shape[0], x.shape[1], self.inner_dim)
-
-        # Project back to query_dim (using LoRA bottleneck)
-        out_style = self.out_proj_up(self.out_proj_down(out_style)) * self.multiplier  # (B, S, query_dim)
+        out_patched_down = F.scaled_dot_product_attention(
+            q_h,
+            k_h,
+            v_h,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False
+        )
+        out_patched_down = out_patched_down.sum(dim=1)
+        out_style = self.out_proj_up(out_patched_down) * self.multiplier
 
         # Merge style attention path with main attention path
         y_patched = y + out_style
@@ -207,12 +237,14 @@ class StyleDualKVNetwork(nn.Module):
         dit: nn.Module,
         rank: int = 64,
         num_style_tokens: int = 64,
+        k_basis: int = 8,
         target_layers: str = "self_attn_kv_pre",
         target_blocks: Optional[str] = None,
     ):
         super().__init__()
         self.rank = rank
         self.num_style_tokens = num_style_tokens
+        self.k_basis = k_basis
         self.target_layers = target_layers
         self.target_blocks = target_blocks
 
@@ -222,20 +254,21 @@ class StyleDualKVNetwork(nn.Module):
         parsed_blocks = parse_block_selection(target_blocks)
 
         modules = self._create_modules(
-            dit, num_style_tokens, rank, atomics, target_blocks=parsed_blocks
+            dit, num_style_tokens, k_basis, rank, atomics, target_blocks=parsed_blocks
         )
         self.style_modules = nn.ModuleList(modules)
 
         logger.info(
             f"StyleDualKVNetwork: created {len(self.style_modules)} modules for "
             f"target={target_layers!r} (atomics={list(atomics)}), target_blocks={target_blocks!r}, "
-            f"num_style_tokens={num_style_tokens}, rank={rank}"
+            f"num_style_tokens={num_style_tokens}, k_basis={k_basis}, rank={rank}"
         )
 
     def _create_modules(
         self,
         dit: nn.Module,
         num_style_tokens: int,
+        k_basis: int,
         rank: int,
         atomics: Tuple[str, ...],
         target_blocks: Optional[set[int]] = None,
@@ -273,7 +306,7 @@ class StyleDualKVNetwork(nn.Module):
                 full_name = f"style_kv_dit_{name}".replace(".", "_")
                 modules.append(
                     StyleDualKVModule(
-                        full_name, module, num_style_tokens, rank
+                        full_name, module, num_style_tokens, k_basis, rank
                     )
                 )
 
@@ -350,11 +383,223 @@ def load_style_weights(network: StyleDualKVNetwork, file: str, strict: bool = Fa
     return info
 
 
+def warm_start_from_gallery(
+    args,
+    accelerator,
+    network,
+    dit,
+    vae,
+    train_dataloader,
+    weight_dtype,
+    dit_weight_dtype,
+    text_encoding_strategy,
+    tokenize_strategy,
+    qwen3_text_encoder,
+):
+    logger.info("Initializing Style KV parameters using warm-start features...")
+
+    # Put wrapper in eval mode to prevent any dropout/updates
+    wrapper = accelerator.unwrap_model(network) if hasattr(network, "unwrap_model") else network
+    unwrapped_wrapper = accelerator.unwrap_model(wrapper)
+
+    module_captures = {}
+    hook_handles = []
+
+    for m in unwrapped_wrapper.network.style_modules:
+        org = m.org_module[0]
+        if not hasattr(org, "k_proj") or not hasattr(org, "v_proj"):
+            logger.warning(f"Module {m.module_name} does not have k_proj or v_proj. Skipping hook.")
+            continue
+
+        module_captures[m.module_name] = {"k": [], "v": []}
+
+        def make_hook_k(name):
+            def hook(module, input, output):
+                module_captures[name]["k"].append(output.detach().cpu())
+            return hook
+
+        def make_hook_v(name):
+            def hook(module, input, output):
+                module_captures[name]["v"].append(output.detach().cpu())
+            return hook
+
+        hook_handles.append(org.k_proj.register_forward_hook(make_hook_k(m.module_name)))
+        hook_handles.append(org.v_proj.register_forward_hook(make_hook_v(m.module_name)))
+
+    # Disable style multipliers during collection
+    original_multipliers = [m.multiplier for m in unwrapped_wrapper.network.style_modules]
+    unwrapped_wrapper.network.set_multiplier(0.0)
+
+    unwrapped_wrapper.eval()
+    if hasattr(vae, "eval"):
+        vae.eval()
+
+    max_warm_start_batches = 8
+    collected_batches = 0
+
+    try:
+        for step, batch in enumerate(train_dataloader):
+            if collected_batches >= max_warm_start_batches:
+                break
+
+            # extract latents
+            if "latents" in batch and batch["latents"] is not None:
+                latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
+                if latents.ndim == 5:
+                    latents = latents.squeeze(2)
+            else:
+                with torch.no_grad():
+                    images = batch["images"].to(accelerator.device, dtype=weight_dtype)
+                    latents = vae.encode_pixels_to_latents(images).to(accelerator.device, dtype=dit_weight_dtype)
+
+            if torch.any(torch.isnan(latents)):
+                latents = torch.nan_to_num(latents, 0, out=latents)
+
+            # text encoding
+            text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+            if text_encoder_outputs_list is not None:
+                caption_dropout_rates = text_encoder_outputs_list[-1]
+                text_encoder_outputs_list = text_encoder_outputs_list[:-1]
+                text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
+                    *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
+                )
+                prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
+            else:
+                input_ids_list = batch["input_ids_list"]
+                with torch.no_grad():
+                    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
+                        tokenize_strategy, [qwen3_text_encoder], input_ids_list
+                    )
+
+            prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
+            attn_mask = attn_mask.to(accelerator.device)
+            t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
+            t5_attn_mask = t5_attn_mask.to(accelerator.device)
+
+            # Use fixed timestep boundary for style capture
+            bs = latents.shape[0]
+            sigmas = torch.full((bs,), args.warm_start_timestep, device=accelerator.device, dtype=dit_weight_dtype)
+            timesteps = sigmas * 1000.0
+            timesteps = timesteps / 1000.0
+
+            noise = torch.randn_like(latents)
+            noisy_model_input = (1.0 - sigmas.view(-1, 1, 1, 1)) * latents + sigmas.view(-1, 1, 1, 1) * noise
+
+            if torch.any(torch.isnan(noisy_model_input)):
+                noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+
+            padding_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], dtype=dit_weight_dtype, device=accelerator.device)
+            noisy_model_input = noisy_model_input.unsqueeze(2)
+
+            with torch.no_grad():
+                with accelerator.autocast():
+                    _ = unwrapped_wrapper(
+                        noisy_model_input,
+                        timesteps,
+                        prompt_embeds,
+                        padding_mask=padding_mask,
+                        source_attention_mask=attn_mask,
+                        t5_input_ids=t5_input_ids,
+                        t5_attn_mask=t5_attn_mask,
+                    )
+            collected_batches += 1
+
+    finally:
+        # Clean up hooks
+        for handle in hook_handles:
+            handle.remove()
+
+        # Restore multipliers
+        for m, orig_mult in zip(unwrapped_wrapper.network.style_modules, original_multipliers):
+            m.multiplier = orig_mult
+
+    # Apply warm start initialization using captured tensors
+    for m in unwrapped_wrapper.network.style_modules:
+        if m.module_name not in module_captures or len(module_captures[m.module_name]["k"]) == 0:
+            continue
+
+        # Concatenate captured features along token dimension
+        K_all = torch.cat(module_captures[m.module_name]["k"], dim=1) # (1, Total_tokens, H * D)
+        V_all = torch.cat(module_captures[m.module_name]["v"], dim=1) # (1, Total_tokens, H * D)
+
+        # Reshape to split heads
+        K_all = K_all.view(1, -1, m.n_heads, m.head_dim)
+        V_all = V_all.view(1, -1, m.n_heads, m.head_dim)
+
+        # Downsample token dimension to m.num_style_tokens
+        K_perm = K_all[0].permute(1, 2, 0)
+        K_pooled = F.adaptive_avg_pool1d(K_perm, m.num_style_tokens)
+        K_pooled = K_pooled.permute(2, 0, 1).unsqueeze(0) # (1, num_style_tokens, n_heads, head_dim)
+
+        V_perm = V_all[0].permute(1, 2, 0)
+        V_pooled = F.adaptive_avg_pool1d(V_perm, m.num_style_tokens)
+        V_pooled = V_pooled.permute(2, 0, 1).unsqueeze(0) # (1, num_style_tokens, n_heads, head_dim)
+
+        # Keys initialization
+        if not m.decomposed_keys:
+            m.k_style.data.copy_(K_pooled.to(m.k_style.dtype).to(m.k_style.device))
+        else:
+            for h in range(m.n_heads):
+                M_k = K_pooled[0, :, h, :].to(torch.float32)
+                U_k, S_k, Vh_k = torch.linalg.svd(M_k, full_matrices=False)
+
+                R_k = min(m.k_basis, U_k.shape[1], Vh_k.shape[0])
+                u_h = U_k[:, :R_k] * torch.sqrt(S_k[:R_k])
+                v_h = torch.sqrt(S_k[:R_k]).unsqueeze(1) * Vh_k[:R_k, :]
+
+                if R_k < m.k_basis:
+                    u_h_padded = torch.zeros(m.num_style_tokens, m.k_basis, dtype=u_h.dtype, device=u_h.device)
+                    u_h_padded[:, :R_k] = u_h
+                    u_h = u_h_padded
+
+                    v_h_padded = torch.zeros(m.k_basis, m.head_dim, dtype=v_h.dtype, device=v_h.device)
+                    v_h_padded[:R_k, :] = v_h
+                    v_h = v_h_padded
+
+                m.k_style_u.data[0, :, h, :] = u_h.to(m.k_style_u.dtype).to(m.k_style_u.device)
+                m.k_style_v.data[0, :, h, :] = v_h.to(m.k_style_v.dtype).to(m.k_style_v.device)
+
+        # Values SVD (project to m.rank) per head
+        for h in range(m.n_heads):
+            M_v = V_pooled[0, :, h, :].to(torch.float32)
+            U_v, S_v, Vh_v = torch.linalg.svd(M_v, full_matrices=False)
+
+            R_v = min(m.rank, U_v.shape[1])
+            v_h_val = U_v[:, :R_v] * torch.sqrt(S_v[:R_v])
+
+            if R_v < m.rank:
+                v_h_val_padded = torch.zeros(m.num_style_tokens, m.rank, dtype=v_h_val.dtype, device=v_h_val.device)
+                v_h_val_padded[:, :R_v] = v_h_val
+                v_h_val = v_h_val_padded
+
+            m.v_style.data[0, :, h, :] = v_h_val.to(m.v_style.dtype).to(m.v_style.device)
+
+
+        # Ensure small normal init output projection for stability and gradient flow
+        nn.init.normal_(m.out_proj_up.weight, std=0.01)
+
+
+    # Clean up device memory after warm-start
+    clean_memory_on_device(accelerator.device)
+    gc.collect()
+
+    logger.info("Warm-start style features successfully initialized.")
+
+
+
 class AnimaStyleWrapper(nn.Module):
     def __init__(self, dit: nn.Module, network: StyleDualKVNetwork):
         super().__init__()
         self.dit = dit
         self.network = network
+
+    def state_dict(self, *args, **kwargs):
+        # Override state_dict to only return the trainable network parameters, excluding the frozen dit
+        return self.network.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict, strict=False):
+        # Override load_state_dict to only load to the trainable network
+        return self.network.load_state_dict(state_dict, strict=strict)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -675,6 +920,7 @@ def train(args):
         dit,
         rank=args.network_dim,
         num_style_tokens=args.num_style_tokens,
+        k_basis=args.style_k_basis,
         target_layers=args.lllite_target_layers,
         target_blocks=args.lllite_target_blocks,
     )
@@ -750,6 +996,22 @@ def train(args):
         wrapper, optimizer, train_dataloader, lr_scheduler
     )
 
+    if args.warm_start:
+        warm_start_from_gallery(
+            args,
+            accelerator,
+            wrapper,
+            dit,
+            vae,
+            train_dataloader,
+            weight_dtype,
+            dit_weight_dtype,
+            text_encoding_strategy,
+            tokenize_strategy,
+            qwen3_text_encoder,
+        )
+
+
     if args.full_fp16:
         train_util.patch_accelerator_for_fp16_training(accelerator)
 
@@ -816,6 +1078,7 @@ def train(args):
         sai_metadata["style_dual_kv.version"] = "2.0"
         sai_metadata["style_dual_kv.rank"] = str(args.network_dim)
         sai_metadata["style_dual_kv.num_style_tokens"] = str(args.num_style_tokens)
+        sai_metadata["style_dual_kv.k_basis"] = str(args.style_k_basis)
         if args.lllite_target_blocks is not None:
             sai_metadata["style_dual_kv.target_blocks"] = str(args.lllite_target_blocks)
         unwrapped = accelerator.unwrap_model(wrapper).network
@@ -1068,6 +1331,24 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="pretrained weights to resume from / 学習を再開する重み",
     )
+    parser.add_argument(
+        "--style_k_basis",
+        type=int,
+        default=8,
+        help="basis rank for decomposing style keys / スタイルキー分解の基底ランク (default: 8)",
+    )
+    parser.add_argument(
+        "--warm_start",
+        action="store_true",
+        help="Warm start style key/value parameters using features extracted from style gallery images",
+    )
+    parser.add_argument(
+        "--warm_start_timestep",
+        type=float,
+        default=0.5,
+        help="Timestep boundary [0.0 - 1.0] at which to extract warm-start features (default: 0.5)",
+    )
+
 
 
 def setup_parser() -> argparse.ArgumentParser:

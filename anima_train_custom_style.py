@@ -404,6 +404,9 @@ def warm_start_from_gallery(
 
     module_captures = {}
     hook_handles = []
+    
+    # We will use a list wrapper containing a dictionary to store the current active capture dictionary
+    active_captures = [None]
 
     for m in unwrapped_wrapper.network.style_modules:
         org = m.org_module[0]
@@ -415,12 +418,14 @@ def warm_start_from_gallery(
 
         def make_hook_k(name):
             def hook(module, input, output):
-                module_captures[name]["k"].append(output.detach().cpu())
+                if active_captures[0] is not None:
+                    active_captures[0][name]["k"].append(output.detach().cpu())
             return hook
 
         def make_hook_v(name):
             def hook(module, input, output):
-                module_captures[name]["v"].append(output.detach().cpu())
+                if active_captures[0] is not None:
+                    active_captures[0][name]["v"].append(output.detach().cpu())
             return hook
 
         hook_handles.append(org.k_proj.register_forward_hook(make_hook_k(m.module_name)))
@@ -436,6 +441,9 @@ def warm_start_from_gallery(
 
     max_warm_start_batches = 8
     collected_batches = 0
+    warm_start_noise_runs = getattr(args, "warm_start_noise_runs", 1)
+    if warm_start_noise_runs < 1:
+        warm_start_noise_runs = 1
 
     try:
         for step, batch in enumerate(train_dataloader):
@@ -482,26 +490,43 @@ def warm_start_from_gallery(
             timesteps = sigmas * 1000.0
             timesteps = timesteps / 1000.0
 
-            noise = torch.randn_like(latents)
-            noisy_model_input = (1.0 - sigmas.view(-1, 1, 1, 1)) * latents + sigmas.view(-1, 1, 1, 1) * noise
-
-            if torch.any(torch.isnan(noisy_model_input)):
-                noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
-
             padding_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], dtype=dit_weight_dtype, device=accelerator.device)
-            noisy_model_input = noisy_model_input.unsqueeze(2)
 
-            with torch.no_grad():
-                with accelerator.autocast():
-                    _ = unwrapped_wrapper(
-                        noisy_model_input,
-                        timesteps,
-                        prompt_embeds,
-                        padding_mask=padding_mask,
-                        source_attention_mask=attn_mask,
-                        t5_input_ids=t5_input_ids,
-                        t5_attn_mask=t5_attn_mask,
-                    )
+            # Setup temporary captures for averaging multiple noise realizations
+            temp_captures = {m.module_name: {"k": [], "v": []} for m in unwrapped_wrapper.network.style_modules}
+            active_captures[0] = temp_captures
+
+            for _ in range(warm_start_noise_runs):
+                noise = torch.randn_like(latents)
+                noisy_model_input = (1.0 - sigmas.view(-1, 1, 1, 1)) * latents + sigmas.view(-1, 1, 1, 1) * noise
+
+                if torch.any(torch.isnan(noisy_model_input)):
+                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+
+                noisy_model_input_5d = noisy_model_input.unsqueeze(2)
+
+                with torch.no_grad():
+                    with accelerator.autocast():
+                        _ = unwrapped_wrapper(
+                            noisy_model_input_5d,
+                            timesteps,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            source_attention_mask=attn_mask,
+                            t5_input_ids=t5_input_ids,
+                            t5_attn_mask=t5_attn_mask,
+                        )
+
+            # Average the captured activations across all noise runs for this batch and store in module_captures
+            for m in unwrapped_wrapper.network.style_modules:
+                if len(temp_captures[m.module_name]["k"]) > 0:
+                    mean_k = torch.stack(temp_captures[m.module_name]["k"]).mean(dim=0)
+                    module_captures[m.module_name]["k"].append(mean_k)
+                if len(temp_captures[m.module_name]["v"]) > 0:
+                    mean_v = torch.stack(temp_captures[m.module_name]["v"]).mean(dim=0)
+                    module_captures[m.module_name]["v"].append(mean_v)
+
+            active_captures[0] = None
             collected_batches += 1
 
     finally:
@@ -933,8 +958,32 @@ def train(args):
     wrapper = AnimaStyleWrapper(dit, network)
 
     # Optimizer (Self-registering parameters)
-    trainable_params = list(network.parameters())
-    n_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
+    if args.style_kv_lr_multiplier != 1.0:
+        kv_params = []
+        proj_params = []
+        for name, param in network.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Check if parameter is a key or value parameter
+            if "k_style" in name or "v_style" in name:
+                kv_params.append(param)
+            else:
+                proj_params.append(param)
+        
+        trainable_params = [
+            {"params": proj_params, "lr": args.learning_rate},
+            {"params": kv_params, "lr": args.learning_rate * args.style_kv_lr_multiplier},
+        ]
+        n_trainable = sum(p.numel() for group in trainable_params for p in group["params"])
+        accelerator.print(
+            f"Using differential learning rates: projection/norms lr={args.learning_rate}, "
+            f"style keys/values lr={args.learning_rate * args.style_kv_lr_multiplier} "
+            f"(multiplier={args.style_kv_lr_multiplier})"
+        )
+    else:
+        trainable_params = list(network.parameters())
+        n_trainable = sum(p.numel() for trainable_params_ in [trainable_params] for p in trainable_params_ if p.requires_grad)
+        
     accelerator.print(f"number of trainable parameters: {n_trainable:,}")
 
     accelerator.print("prepare optimizer, data loader etc.")
@@ -1347,6 +1396,18 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=0.5,
         help="Timestep boundary [0.0 - 1.0] at which to extract warm-start features (default: 0.5)",
+    )
+    parser.add_argument(
+        "--warm_start_noise_runs",
+        type=int,
+        default=1,
+        help="Number of noise runs per warmup image to average out stochastic noise during initialization (default: 1)",
+    )
+    parser.add_argument(
+        "--style_kv_lr_multiplier",
+        type=float,
+        default=1.0,
+        help="Learning rate multiplier for the initialized style keys/values relative to the projection layer (default: 1.0)",
     )
 
 

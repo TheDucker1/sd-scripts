@@ -383,6 +383,46 @@ def load_style_weights(network: StyleDualKVNetwork, file: str, strict: bool = Fa
     return info
 
 
+def compute_style_orthogonal_loss(network: StyleDualKVNetwork) -> torch.Tensor:
+    total_ortho = 0.0
+    count = 0
+    for m in network.style_modules:
+        # 1. Values ortho loss
+        v = m.v_style  # (1, num_style_tokens, n_heads, rank)
+        num_tokens = v.shape[1]
+        if num_tokens <= 1:
+            continue
+        
+        # Flatten across heads and rank
+        v_tokens = v.squeeze(0).flatten(start_dim=1)  # (num_style_tokens, n_heads * rank)
+        v_norm = F.normalize(v_tokens, p=2, dim=1)
+        v_sim = torch.matmul(v_norm, v_norm.T)
+        identity = torch.eye(num_tokens, device=v.device, dtype=v.dtype)
+        
+        # We penalize any non-zero similarity between different tokens
+        loss_v = torch.mean((v_sim - identity) ** 2)
+        total_ortho = total_ortho + loss_v
+        count += 1
+
+        # 2. Keys ortho loss
+        if m.decomposed_keys:
+            k = m.k_style_u  # (1, num_style_tokens, n_heads, k_basis)
+            k_tokens = k.squeeze(0).flatten(start_dim=1)
+        else:
+            k = m.k_style  # (1, num_style_tokens, n_heads, head_dim)
+            k_tokens = k.squeeze(0).flatten(start_dim=1)
+            
+        k_norm = F.normalize(k_tokens, p=2, dim=1)
+        k_sim = torch.matmul(k_norm, k_norm.T)
+        loss_k = torch.mean((k_sim - identity) ** 2)
+        total_ortho = total_ortho + loss_k
+        count += 1
+        
+    if count == 0:
+        return torch.tensor(0.0)
+    return total_ortho / count
+
+
 def warm_start_from_gallery(
     args,
     accelerator,
@@ -958,32 +998,8 @@ def train(args):
     wrapper = AnimaStyleWrapper(dit, network)
 
     # Optimizer (Self-registering parameters)
-    if args.style_kv_lr_multiplier != 1.0:
-        kv_params = []
-        proj_params = []
-        for name, param in network.named_parameters():
-            if not param.requires_grad:
-                continue
-            # Check if parameter is a key or value parameter
-            if "k_style" in name or "v_style" in name:
-                kv_params.append(param)
-            else:
-                proj_params.append(param)
-        
-        trainable_params = [
-            {"params": proj_params, "lr": args.learning_rate},
-            {"params": kv_params, "lr": args.learning_rate * args.style_kv_lr_multiplier},
-        ]
-        n_trainable = sum(p.numel() for group in trainable_params for p in group["params"])
-        accelerator.print(
-            f"Using differential learning rates: projection/norms lr={args.learning_rate}, "
-            f"style keys/values lr={args.learning_rate * args.style_kv_lr_multiplier} "
-            f"(multiplier={args.style_kv_lr_multiplier})"
-        )
-    else:
-        trainable_params = list(network.parameters())
-        n_trainable = sum(p.numel() for trainable_params_ in [trainable_params] for p in trainable_params_ if p.requires_grad)
-        
+    trainable_params = list(network.parameters())
+    n_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
     accelerator.print(f"number of trainable parameters: {n_trainable:,}")
 
     accelerator.print("prepare optimizer, data loader etc.")
@@ -1265,6 +1281,12 @@ def train(args):
                 loss = loss * loss_weights
                 loss = loss.mean()
 
+                current_ortho_loss = 0.0
+                if args.style_ortho_loss_weight > 0.0:
+                    ortho_loss = compute_style_orthogonal_loss(accelerator.unwrap_model(wrapper).network)
+                    current_ortho_loss = ortho_loss.detach().item()
+                    loss = loss + args.style_ortho_loss_weight * ortho_loss
+
                 try:
                     accelerator.backward(loss)
                 except torch.cuda.OutOfMemoryError:
@@ -1299,11 +1321,16 @@ def train(args):
             current_loss = loss.detach().item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss, "lr": lr_scheduler.get_last_lr()[0]}
+                if args.style_ortho_loss_weight > 0.0:
+                    logs["loss/ortho"] = current_ortho_loss
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
-            progress_bar.set_postfix(**{"avr_loss": avr_loss})
+            postfix = {"avr_loss": avr_loss}
+            if args.style_ortho_loss_weight > 0.0:
+                postfix["ortho"] = current_ortho_loss
+            progress_bar.set_postfix(**postfix)
 
             if global_step >= args.max_train_steps:
                 break
@@ -1403,11 +1430,12 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         default=1,
         help="Number of noise runs per warmup image to average out stochastic noise during initialization (default: 1)",
     )
+
     parser.add_argument(
-        "--style_kv_lr_multiplier",
+        "--style_ortho_loss_weight",
         type=float,
-        default=1.0,
-        help="Learning rate multiplier for the initialized style keys/values relative to the projection layer (default: 1.0)",
+        default=0.0,
+        help="Weight for orthogonal/decorrelation loss on style tokens to prevent representation collapse (default: 0.0)",
     )
 
 

@@ -91,6 +91,7 @@ class StyleDualKVModule(nn.Module):
         num_style_tokens: int,
         k_basis: int,
         rank: int,
+        parent_network=None,
     ):
         super().__init__()
         self.module_name = name
@@ -127,7 +128,16 @@ class StyleDualKVModule(nn.Module):
 
         # Output projection back to query_dim
         self.out_proj_up = nn.Linear(rank, self.query_dim, bias=False)
-        nn.init.zeros_(self.out_proj_up.weight)
+        nn.init.normal_(self.out_proj_up.weight, std=0.01)
+
+        # Timestep modulation parameters (always enabled, defaults to no-op)
+        self.parent_network = [parent_network]
+        self.time_to_k_scale = nn.Linear(8, self.head_dim)
+        self.time_to_v_scale = nn.Linear(8, rank)
+        nn.init.zeros_(self.time_to_k_scale.weight)
+        nn.init.ones_(self.time_to_k_scale.bias)
+        nn.init.zeros_(self.time_to_v_scale.weight)
+        nn.init.ones_(self.time_to_v_scale.bias)
 
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
@@ -178,6 +188,35 @@ class StyleDualKVModule(nn.Module):
         if y.shape[0] // 2 == k_style.shape[0]:
             k_style = k_style.repeat(2, 1, 1, 1)
             v_style = v_style.repeat(2, 1, 1, 1)
+
+        # Apply timestep modulation if available
+        parent = self.parent_network[0]
+        timesteps = getattr(parent, "current_timesteps", None) if parent is not None else None
+        if timesteps is not None:
+            t_mod = timesteps.to(device=x.device, dtype=x.dtype)
+            if t_mod.ndim == 0:
+                t_mod = t_mod.unsqueeze(0)
+            if t_mod.shape[0] != B:
+                if t_mod.shape[0] == 1:
+                    t_mod = t_mod.repeat(B)
+                else:
+                    t_mod = t_mod.repeat(math.ceil(B / t_mod.shape[0]))[:B]
+            
+            # Compute cosine basis
+            scaled = t_mod.clone()
+            if scaled.max() > 1.0:
+                scaled = scaled / 1000.0  # normalize [0, 1000] to [0, 1]
+            scaled = scaled * math.pi
+            
+            num_basis = 8
+            basis_idx = torch.arange(num_basis, device=t_mod.device, dtype=t_mod.dtype)
+            basis = torch.cos(scaled[:, None] * basis_idx[None, :])
+            
+            k_scale = self.time_to_k_scale(basis)
+            v_scale = self.time_to_v_scale(basis)
+            
+            k_style = k_style * k_scale[:, None, None, :]
+            v_style = v_style * v_scale[:, None, None, :]
 
         # Apply style key norm and cast to matching dtype
         k_style = self.k_norm_style(k_style).to(dtype=q.dtype)
@@ -306,7 +345,7 @@ class StyleDualKVNetwork(nn.Module):
                 full_name = f"style_kv_dit_{name}".replace(".", "_")
                 modules.append(
                     StyleDualKVModule(
-                        full_name, module, num_style_tokens, k_basis, rank
+                        full_name, module, num_style_tokens, k_basis, rank, parent_network=self
                     )
                 )
 
@@ -423,232 +462,7 @@ def compute_style_orthogonal_loss(network: StyleDualKVNetwork) -> torch.Tensor:
     return total_ortho / count
 
 
-def warm_start_from_gallery(
-    args,
-    accelerator,
-    network,
-    dit,
-    vae,
-    train_dataloader,
-    weight_dtype,
-    dit_weight_dtype,
-    text_encoding_strategy,
-    tokenize_strategy,
-    qwen3_text_encoder,
-):
-    logger.info("Initializing Style KV parameters using warm-start features...")
-
-    # Put wrapper in eval mode to prevent any dropout/updates
-    wrapper = accelerator.unwrap_model(network) if hasattr(network, "unwrap_model") else network
-    unwrapped_wrapper = accelerator.unwrap_model(wrapper)
-
-    module_captures = {}
-    hook_handles = []
-    
-    # We will use a list wrapper containing a dictionary to store the current active capture dictionary
-    active_captures = [None]
-
-    for m in unwrapped_wrapper.network.style_modules:
-        org = m.org_module[0]
-        if not hasattr(org, "k_proj") or not hasattr(org, "v_proj"):
-            logger.warning(f"Module {m.module_name} does not have k_proj or v_proj. Skipping hook.")
-            continue
-
-        module_captures[m.module_name] = {"k": [], "v": []}
-
-        def make_hook_k(name):
-            def hook(module, input, output):
-                if active_captures[0] is not None:
-                    active_captures[0][name]["k"].append(output.detach().cpu())
-            return hook
-
-        def make_hook_v(name):
-            def hook(module, input, output):
-                if active_captures[0] is not None:
-                    active_captures[0][name]["v"].append(output.detach().cpu())
-            return hook
-
-        hook_handles.append(org.k_proj.register_forward_hook(make_hook_k(m.module_name)))
-        hook_handles.append(org.v_proj.register_forward_hook(make_hook_v(m.module_name)))
-
-    # Disable style multipliers during collection
-    original_multipliers = [m.multiplier for m in unwrapped_wrapper.network.style_modules]
-    unwrapped_wrapper.network.set_multiplier(0.0)
-
-    unwrapped_wrapper.eval()
-    if hasattr(vae, "eval"):
-        vae.eval()
-
-    max_warm_start_batches = 8
-    collected_batches = 0
-    warm_start_noise_runs = getattr(args, "warm_start_noise_runs", 1)
-    if warm_start_noise_runs < 1:
-        warm_start_noise_runs = 1
-
-    try:
-        for step, batch in enumerate(train_dataloader):
-            if collected_batches >= max_warm_start_batches:
-                break
-
-            # extract latents
-            if "latents" in batch and batch["latents"] is not None:
-                latents = batch["latents"].to(accelerator.device, dtype=dit_weight_dtype)
-                if latents.ndim == 5:
-                    latents = latents.squeeze(2)
-            else:
-                with torch.no_grad():
-                    images = batch["images"].to(accelerator.device, dtype=weight_dtype)
-                    latents = vae.encode_pixels_to_latents(images).to(accelerator.device, dtype=dit_weight_dtype)
-
-            if torch.any(torch.isnan(latents)):
-                latents = torch.nan_to_num(latents, 0, out=latents)
-
-            # text encoding
-            text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-            if text_encoder_outputs_list is not None:
-                caption_dropout_rates = text_encoder_outputs_list[-1]
-                text_encoder_outputs_list = text_encoder_outputs_list[:-1]
-                text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
-                    *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
-                )
-                prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
-            else:
-                input_ids_list = batch["input_ids_list"]
-                with torch.no_grad():
-                    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
-                        tokenize_strategy, [qwen3_text_encoder], input_ids_list
-                    )
-
-            prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
-            attn_mask = attn_mask.to(accelerator.device)
-            t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
-            t5_attn_mask = t5_attn_mask.to(accelerator.device)
-
-            # Use fixed timestep boundary for style capture
-            bs = latents.shape[0]
-            sigmas = torch.full((bs,), args.warm_start_timestep, device=accelerator.device, dtype=dit_weight_dtype)
-            timesteps = sigmas * 1000.0
-            timesteps = timesteps / 1000.0
-
-            padding_mask = torch.zeros(bs, 1, latents.shape[-2], latents.shape[-1], dtype=dit_weight_dtype, device=accelerator.device)
-
-            # Setup temporary captures for averaging multiple noise realizations
-            temp_captures = {m.module_name: {"k": [], "v": []} for m in unwrapped_wrapper.network.style_modules}
-            active_captures[0] = temp_captures
-
-            for _ in range(warm_start_noise_runs):
-                noise = torch.randn_like(latents)
-                noisy_model_input = (1.0 - sigmas.view(-1, 1, 1, 1)) * latents + sigmas.view(-1, 1, 1, 1) * noise
-
-                if torch.any(torch.isnan(noisy_model_input)):
-                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
-
-                noisy_model_input_5d = noisy_model_input.unsqueeze(2)
-
-                with torch.no_grad():
-                    with accelerator.autocast():
-                        _ = unwrapped_wrapper(
-                            noisy_model_input_5d,
-                            timesteps,
-                            prompt_embeds,
-                            padding_mask=padding_mask,
-                            source_attention_mask=attn_mask,
-                            t5_input_ids=t5_input_ids,
-                            t5_attn_mask=t5_attn_mask,
-                        )
-
-            # Average the captured activations across all noise runs for this batch and store in module_captures
-            for m in unwrapped_wrapper.network.style_modules:
-                if len(temp_captures[m.module_name]["k"]) > 0:
-                    mean_k = torch.stack(temp_captures[m.module_name]["k"]).mean(dim=0)
-                    module_captures[m.module_name]["k"].append(mean_k)
-                if len(temp_captures[m.module_name]["v"]) > 0:
-                    mean_v = torch.stack(temp_captures[m.module_name]["v"]).mean(dim=0)
-                    module_captures[m.module_name]["v"].append(mean_v)
-
-            active_captures[0] = None
-            collected_batches += 1
-
-    finally:
-        # Clean up hooks
-        for handle in hook_handles:
-            handle.remove()
-
-        # Restore multipliers
-        for m, orig_mult in zip(unwrapped_wrapper.network.style_modules, original_multipliers):
-            m.multiplier = orig_mult
-
-    # Apply warm start initialization using captured tensors
-    for m in unwrapped_wrapper.network.style_modules:
-        if m.module_name not in module_captures or len(module_captures[m.module_name]["k"]) == 0:
-            continue
-
-        # Concatenate captured features along token dimension
-        K_all = torch.cat(module_captures[m.module_name]["k"], dim=1) # (1, Total_tokens, H * D)
-        V_all = torch.cat(module_captures[m.module_name]["v"], dim=1) # (1, Total_tokens, H * D)
-
-        # Reshape to split heads
-        K_all = K_all.view(1, -1, m.n_heads, m.head_dim)
-        V_all = V_all.view(1, -1, m.n_heads, m.head_dim)
-
-        # Downsample token dimension to m.num_style_tokens
-        K_perm = K_all[0].permute(1, 2, 0)
-        K_pooled = F.adaptive_avg_pool1d(K_perm, m.num_style_tokens)
-        K_pooled = K_pooled.permute(2, 0, 1).unsqueeze(0) # (1, num_style_tokens, n_heads, head_dim)
-
-        V_perm = V_all[0].permute(1, 2, 0)
-        V_pooled = F.adaptive_avg_pool1d(V_perm, m.num_style_tokens)
-        V_pooled = V_pooled.permute(2, 0, 1).unsqueeze(0) # (1, num_style_tokens, n_heads, head_dim)
-
-        # Keys initialization
-        if not m.decomposed_keys:
-            m.k_style.data.copy_(K_pooled.to(m.k_style.dtype).to(m.k_style.device))
-        else:
-            for h in range(m.n_heads):
-                M_k = K_pooled[0, :, h, :].to(torch.float32)
-                U_k, S_k, Vh_k = torch.linalg.svd(M_k, full_matrices=False)
-
-                R_k = min(m.k_basis, U_k.shape[1], Vh_k.shape[0])
-                u_h = U_k[:, :R_k] * torch.sqrt(S_k[:R_k])
-                v_h = torch.sqrt(S_k[:R_k]).unsqueeze(1) * Vh_k[:R_k, :]
-
-                if R_k < m.k_basis:
-                    u_h_padded = torch.zeros(m.num_style_tokens, m.k_basis, dtype=u_h.dtype, device=u_h.device)
-                    u_h_padded[:, :R_k] = u_h
-                    u_h = u_h_padded
-
-                    v_h_padded = torch.zeros(m.k_basis, m.head_dim, dtype=v_h.dtype, device=v_h.device)
-                    v_h_padded[:R_k, :] = v_h
-                    v_h = v_h_padded
-
-                m.k_style_u.data[0, :, h, :] = u_h.to(m.k_style_u.dtype).to(m.k_style_u.device)
-                m.k_style_v.data[0, :, h, :] = v_h.to(m.k_style_v.dtype).to(m.k_style_v.device)
-
-        # Values SVD (project to m.rank) per head
-        for h in range(m.n_heads):
-            M_v = V_pooled[0, :, h, :].to(torch.float32)
-            U_v, S_v, Vh_v = torch.linalg.svd(M_v, full_matrices=False)
-
-            R_v = min(m.rank, U_v.shape[1])
-            v_h_val = U_v[:, :R_v] * torch.sqrt(S_v[:R_v])
-
-            if R_v < m.rank:
-                v_h_val_padded = torch.zeros(m.num_style_tokens, m.rank, dtype=v_h_val.dtype, device=v_h_val.device)
-                v_h_val_padded[:, :R_v] = v_h_val
-                v_h_val = v_h_val_padded
-
-            m.v_style.data[0, :, h, :] = v_h_val.to(m.v_style.dtype).to(m.v_style.device)
-
-
-        # Ensure small normal init output projection for stability and gradient flow
-        nn.init.normal_(m.out_proj_up.weight, std=0.01)
-
-
-    # Clean up device memory after warm-start
-    clean_memory_on_device(accelerator.device)
-    gc.collect()
-
-    logger.info("Warm-start style features successfully initialized.")
+# warm_start_from_gallery has been removed to favor pure random initialization for both K and V.
 
 
 
@@ -698,6 +512,7 @@ class AnimaStyleWrapper(nn.Module):
         context: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        self.network.current_timesteps = timesteps
         return self.dit(x, timesteps, context, **kwargs)
 
 
@@ -1061,20 +876,7 @@ def train(args):
         wrapper, optimizer, train_dataloader, lr_scheduler
     )
 
-    if args.warm_start:
-        warm_start_from_gallery(
-            args,
-            accelerator,
-            wrapper,
-            dit,
-            vae,
-            train_dataloader,
-            weight_dtype,
-            dit_weight_dtype,
-            text_encoding_strategy,
-            tokenize_strategy,
-            qwen3_text_encoder,
-        )
+    # SVD warm start has been removed. Keys and values remain randomly initialized.
 
 
     if args.full_fp16:
@@ -1413,23 +1215,7 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         default=8,
         help="basis rank for decomposing style keys / スタイルキー分解の基底ランク (default: 8)",
     )
-    parser.add_argument(
-        "--warm_start",
-        action="store_true",
-        help="Warm start style key/value parameters using features extracted from style gallery images",
-    )
-    parser.add_argument(
-        "--warm_start_timestep",
-        type=float,
-        default=0.5,
-        help="Timestep boundary [0.0 - 1.0] at which to extract warm-start features (default: 0.5)",
-    )
-    parser.add_argument(
-        "--warm_start_noise_runs",
-        type=int,
-        default=1,
-        help="Number of noise runs per warmup image to average out stochastic noise during initialization (default: 1)",
-    )
+    # SVD warm start arguments removed. Both keys and values are randomly initialized.
 
     parser.add_argument(
         "--style_ortho_loss_weight",

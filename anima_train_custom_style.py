@@ -173,23 +173,32 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, in_features: int, intermediate_features: int, out_features: int, dropout: float = 0.0):
+        super().__init__()
+        self.w_gate = nn.Linear(in_features, intermediate_features, bias=False)
+        self.w_up = nn.Linear(in_features, intermediate_features, bias=False)
+        self.w_down = nn.Linear(intermediate_features, out_features, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
+
 class StyleDualKVModule(nn.Module):
-    """Dual attention path implementation for style control using direct learnable style keys/values and LoRA output projection."""
+    """Dual style control path using a bottlenecked SwiGLU transformation of query features."""
 
     def __init__(
         self,
         name: str,
         org_module: nn.Module,  # Attention module
-        num_style_tokens: int,
-        k_basis: int,
         rank: int,
         parent_network=None,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.module_name = name
         self.org_module = [org_module]
-        self.num_style_tokens = num_style_tokens
-        self.k_basis = k_basis
         self.rank = rank
         self.multiplier = 1.0
 
@@ -199,25 +208,18 @@ class StyleDualKVModule(nn.Module):
         self.query_dim = getattr(org_module, "query_dim", org_module.q_proj.in_features if hasattr(org_module, "q_proj") else 512)
         self.inner_dim = self.n_heads * self.head_dim
 
-        # Low-rank decomposed style keys and merged full-rank style values
-        if k_basis is None or k_basis <= 0:
-            self.k_style = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, self.head_dim))
-            nn.init.normal_(self.k_style, std=0.02)
-            self.decomposed_keys = False
-        else:
-            self.k_style_u = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, k_basis))
-            self.k_style_v = nn.Parameter(torch.zeros(1, k_basis, self.n_heads, self.head_dim))
-            nn.init.normal_(self.k_style_u, std=0.02)
-            nn.init.normal_(self.k_style_v, std=0.02)
-            self.decomposed_keys = True
+        # Query down-projection to bottleneck space (per-head, shape: H x D x rank)
+        self.q_down_proj_weight = nn.Parameter(torch.zeros(self.n_heads, self.head_dim, rank))
+        nn.init.normal_(self.q_down_proj_weight, std=0.01)
 
-        self.v_style = nn.Parameter(torch.zeros(1, num_style_tokens, self.n_heads, rank))
-        nn.init.normal_(self.v_style, std=0.02)
+        # Style SwiGLU in bottleneck space
+        self.mlp = SwiGLU(rank, rank * 4, rank, dropout)
 
-        
-        # Style QK-norm
-        self.q_norm_style = RMSNorm(self.head_dim, eps=1e-6)
-        self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
+        # Style bottleneck normalization
+        self.q_norm = RMSNorm(rank, eps=1e-6)
+
+        # Query bottleneck dropout
+        self.q_dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
         # Output projection back to query_dim
         self.out_proj_up = nn.Linear(rank, self.query_dim, bias=False)
@@ -225,12 +227,9 @@ class StyleDualKVModule(nn.Module):
 
         # Timestep modulation parameters (always enabled, defaults to no-op)
         self.parent_network = [parent_network]
-        self.time_to_k_scale = nn.Linear(8, self.head_dim)
-        self.time_to_v_scale = nn.Linear(8, rank)
-        nn.init.zeros_(self.time_to_k_scale.weight)
-        nn.init.ones_(self.time_to_k_scale.bias)
-        nn.init.zeros_(self.time_to_v_scale.weight)
-        nn.init.ones_(self.time_to_v_scale.bias)
+        self.time_to_scale = nn.Linear(8, rank)
+        nn.init.zeros_(self.time_to_scale.weight)
+        nn.init.ones_(self.time_to_scale.bias)
 
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
@@ -261,28 +260,21 @@ class StyleDualKVModule(nn.Module):
             from library.anima_models import apply_rotary_pos_emb
             q = apply_rotary_pos_emb(q, rope_emb, tensor_format=org.qkv_format, fused=False)
 
-        # 2. Reconstruct k_style and get v_style
-        if self.decomposed_keys:
-            # u: (1, S_style, H, K_basis) -> (1, H, S_style, K_basis)
-            u = self.k_style_u.to(dtype=q.dtype).transpose(1, 2)
-            # v: (1, K_basis, H, D) -> (1, H, K_basis, D)
-            v = self.k_style_v.to(dtype=q.dtype).transpose(1, 2)
-            k_style = torch.matmul(u, v).transpose(1, 2)  # (1, S_style, H, D)
-        else:
-            k_style = self.k_style.to(dtype=q.dtype)
+        # Project each head's query to bottleneck space independently (shape: B, S, H, rank)
+        q_bottleneck = torch.einsum("bshd,hdr->bshr", q, self.q_down_proj_weight.to(q))
+        q_bottleneck = self.q_dropout(q_bottleneck)
 
+        # Apply style normalization
+        q_bottleneck = self.q_norm(q_bottleneck)
 
-        B = y.shape[0]
-        # Expand/repeat k_style, v_style to batch dimension
-        k_style = k_style.repeat(B, 1, 1, 1)
-        v_style = self.v_style.to(dtype=q.dtype).repeat(B, 1, 1, 1)
+        # Run SwiGLU MLP: (B, S, H, rank) -> (B, S, H, rank)
+        q_style = self.mlp(q_bottleneck)
 
-        # CFG support
-        if y.shape[0] // 2 == k_style.shape[0]:
-            k_style = k_style.repeat(2, 1, 1, 1)
-            v_style = v_style.repeat(2, 1, 1, 1)
+        # Aggregate style outputs from all heads: (B, S, H, rank) -> (B, S, rank)
+        out_patched_down = q_style.sum(dim=2)
 
         # Apply timestep modulation if available
+        B = y.shape[0]
         parent = self.parent_network[0]
         timesteps = getattr(parent, "current_timesteps", None) if parent is not None else None
         if timesteps is not None:
@@ -305,36 +297,13 @@ class StyleDualKVModule(nn.Module):
             basis_idx = torch.arange(num_basis, device=t_mod.device, dtype=t_mod.dtype)
             basis = torch.cos(scaled[:, None] * basis_idx[None, :])
             
-            k_scale = self.time_to_k_scale(basis)
-            v_scale = self.time_to_v_scale(basis)
-            
-            k_style = k_style * k_scale[:, None, None, :]
-            v_style = v_style * v_scale[:, None, None, :]
+            scale = self.time_to_scale(basis)
+            out_patched_down = out_patched_down * scale[:, None, :]
 
-        # Apply style QK-norm
-        q = self.q_norm_style(q)
-        k_style = self.k_norm_style(k_style).to(dtype=q.dtype)
-
-        # Transpose to align heads: (B, H, S, D)
-        q_h = q.transpose(1, 2)
-        k_h = k_style.transpose(1, 2)
-        v_h = v_style.transpose(1, 2).to(dtype=q.dtype)
-
-        # 3. Native SDPA with QK-norm (FlashAttention compatible)
-        out_h = F.scaled_dot_product_attention(
-            q_h,
-            k_h,
-            v_h,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False
-        )
-
-        # Sum over heads and project back to query_dim
-        out_patched_down = out_h.sum(dim=1)
+        # Project back to query_dim
         out_style = self.out_proj_up(out_patched_down) * self.multiplier
 
-        # Merge style attention path with main attention path
+        # Merge style path with main path
         y_patched = y + out_style
         return y_patched
 
@@ -367,23 +336,21 @@ def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
     return blocks
 
 class StyleDualKVNetwork(nn.Module):
-    """Style dual KV network using static learnable dummy style keys/values and bottlenecked output projections."""
+    """Style dual KV network using MLP-based bottleneck query transformation for style control."""
 
     def __init__(
         self,
         dit: nn.Module,
         rank: int = 64,
-        num_style_tokens: int = 64,
-        k_basis: int = 8,
         target_layers: str = "self_attn_kv_pre",
         target_blocks: Optional[str] = None,
+        style_dropout: float = 0.0,
     ):
         super().__init__()
         self.rank = rank
-        self.num_style_tokens = num_style_tokens
-        self.k_basis = k_basis
         self.target_layers = target_layers
         self.target_blocks = target_blocks
+        self.style_dropout = style_dropout
 
         from networks.control_net_lllite_anima import parse_target_layers
         atomics = parse_target_layers(target_layers)
@@ -391,24 +358,23 @@ class StyleDualKVNetwork(nn.Module):
         parsed_blocks = parse_block_selection(target_blocks)
 
         modules = self._create_modules(
-            dit, num_style_tokens, k_basis, rank, atomics, target_blocks=parsed_blocks
+            dit, rank, atomics, target_blocks=parsed_blocks, style_dropout=style_dropout
         )
         self.style_modules = nn.ModuleList(modules)
 
         logger.info(
             f"StyleDualKVNetwork: created {len(self.style_modules)} modules for "
             f"target={target_layers!r} (atomics={list(atomics)}), target_blocks={target_blocks!r}, "
-            f"num_style_tokens={num_style_tokens}, k_basis={k_basis}, rank={rank}"
+            f"rank={rank}, style_dropout={style_dropout}"
         )
 
     def _create_modules(
         self,
         dit: nn.Module,
-        num_style_tokens: int,
-        k_basis: int,
         rank: int,
         atomics: Tuple[str, ...],
         target_blocks: Optional[set[int]] = None,
+        style_dropout: float = 0.0,
     ) -> List[StyleDualKVModule]:
         modules: List[StyleDualKVModule] = []
         any_self = any(a in atomics for a in ("self_attn_q_pre", "self_attn_kv_pre"))
@@ -443,7 +409,7 @@ class StyleDualKVNetwork(nn.Module):
                 full_name = f"style_kv_dit_{name}".replace(".", "_")
                 modules.append(
                     StyleDualKVModule(
-                        full_name, module, num_style_tokens, k_basis, rank, parent_network=self
+                        full_name, module, rank, parent_network=self, dropout=style_dropout
                     )
                 )
 
@@ -518,46 +484,6 @@ def load_style_weights(network: StyleDualKVNetwork, file: str, strict: bool = Fa
     info = network.load_state_dict(converted, strict=strict)
     logger.info(f"loaded StyleDualKVNetwork weights from {file}: {info}")
     return info
-
-
-def compute_style_orthogonal_loss(network: StyleDualKVNetwork) -> torch.Tensor:
-    total_ortho = 0.0
-    count = 0
-    for m in network.style_modules:
-        # 1. Values ortho loss
-        v = m.v_style  # (1, num_style_tokens, n_heads, rank)
-        num_tokens = v.shape[1]
-        if num_tokens <= 1:
-            continue
-        
-        # Flatten across heads and rank
-        v_tokens = v.squeeze(0).flatten(start_dim=1)  # (num_style_tokens, n_heads * rank)
-        v_norm = F.normalize(v_tokens, p=2, dim=1)
-        v_sim = torch.matmul(v_norm, v_norm.T)
-        identity = torch.eye(num_tokens, device=v.device, dtype=v.dtype)
-        
-        # We penalize any non-zero similarity between different tokens
-        loss_v = torch.mean((v_sim - identity) ** 2)
-        total_ortho = total_ortho + loss_v
-        count += 1
-
-        # 2. Keys ortho loss
-        if m.decomposed_keys:
-            k = m.k_style_u  # (1, num_style_tokens, n_heads, k_basis)
-            k_tokens = k.squeeze(0).flatten(start_dim=1)
-        else:
-            k = m.k_style  # (1, num_style_tokens, n_heads, head_dim)
-            k_tokens = k.squeeze(0).flatten(start_dim=1)
-            
-        k_norm = F.normalize(k_tokens, p=2, dim=1)
-        k_sim = torch.matmul(k_norm, k_norm.T)
-        loss_k = torch.mean((k_sim - identity) ** 2)
-        total_ortho = total_ortho + loss_k
-        count += 1
-        
-    if count == 0:
-        return torch.tensor(0.0)
-    return total_ortho / count
 
 
 # warm_start_from_gallery has been removed to favor pure random initialization for both K and V.
@@ -924,10 +850,9 @@ def train(args):
     network = StyleDualKVNetwork(
         dit,
         rank=args.network_dim,
-        num_style_tokens=args.num_style_tokens,
-        k_basis=args.style_k_basis,
         target_layers=args.lllite_target_layers,
         target_blocks=args.lllite_target_blocks,
+        style_dropout=args.style_dropout,
     )
 
     if args.network_weights is not None:
@@ -1077,10 +1002,9 @@ def train(args):
             None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
         ).to_metadata_dict()
         sai_metadata["modelspec.architecture"] = "anima-preview/style-dual-kv-network"
-        sai_metadata["style_dual_kv.version"] = "2.0"
+        sai_metadata["style_dual_kv.version"] = "3.0"
         sai_metadata["style_dual_kv.rank"] = str(args.network_dim)
-        sai_metadata["style_dual_kv.num_style_tokens"] = str(args.num_style_tokens)
-        sai_metadata["style_dual_kv.k_basis"] = str(args.style_k_basis)
+        sai_metadata["style_dual_kv.style_dropout"] = str(args.style_dropout)
         if args.lllite_target_blocks is not None:
             sai_metadata["style_dual_kv.target_blocks"] = str(args.lllite_target_blocks)
         unwrapped = accelerator.unwrap_model(wrapper).network
@@ -1218,12 +1142,6 @@ def train(args):
                 loss = loss * loss_weights
                 loss = loss.mean()
 
-                current_ortho_loss = 0.0
-                if args.style_ortho_loss_weight > 0.0:
-                    ortho_loss = compute_style_orthogonal_loss(accelerator.unwrap_model(wrapper).network)
-                    current_ortho_loss = ortho_loss.detach().item()
-                    loss = loss + args.style_ortho_loss_weight * ortho_loss
-
                 try:
                     accelerator.backward(loss)
                 except torch.cuda.OutOfMemoryError:
@@ -1258,15 +1176,11 @@ def train(args):
             current_loss = loss.detach().item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss, "lr": lr_scheduler.get_last_lr()[0]}
-                if args.style_ortho_loss_weight > 0.0:
-                    logs["loss/ortho"] = current_ortho_loss
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             postfix = {"avr_loss": avr_loss}
-            if args.style_ortho_loss_weight > 0.0:
-                postfix["ortho"] = current_ortho_loss
             progress_bar.set_postfix(**postfix)
 
             if global_step >= args.max_train_steps:
@@ -1305,12 +1219,6 @@ def train(args):
 
 def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
-        "--num_style_tokens",
-        type=int,
-        default=64,
-        help="number of style query tokens / スタイルクエリトークン数 (default: 64)",
-    )
-    parser.add_argument(
         "--network_dim",
         type=int,
         default=64,
@@ -1344,25 +1252,19 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="pretrained weights to resume from / 学習を再開する重み",
     )
-    parser.add_argument(
-        "--style_k_basis",
-        type=int,
-        default=8,
-        help="basis rank for decomposing style keys / スタイルキー分解の基底ランク (default: 8)",
-    )
     # SVD warm start arguments removed. Both keys and values are randomly initialized.
 
-    parser.add_argument(
-        "--style_ortho_loss_weight",
-        type=float,
-        default=0.0,
-        help="Weight for orthogonal/decorrelation loss on style tokens to prevent representation collapse (default: 0.0)",
-    )
     parser.add_argument(
         "--alternate_prompt_probability",
         type=float,
         default=0.0,
         help="probability to use the alternate natural prompt ([same_name]_natural_prompt.txt) / 代替の自然言語プロンプトを使用する確率 (default: 0.0)",
+    )
+    parser.add_argument(
+        "--style_dropout",
+        type=float,
+        default=0.0,
+        help="dropout rate applied to query bottleneck / スタイルクエリボトルネックに適用するドロップアウト率 (default: 0.0)",
     )
 
 

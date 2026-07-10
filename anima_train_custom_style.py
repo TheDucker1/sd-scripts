@@ -146,9 +146,30 @@ def patch_dataset_getitem_and_caption():
                         modified_subset.shuffle_caption = False
                         modified_subset.caption_tag_dropout_rate = 0.0
                         modified_subset.token_warmup_step = 0
-                        return self.orig_process_caption(modified_subset, alternate_caption)
-                        
-            return self.orig_process_caption(subset, caption)
+                        processed_caption = self.orig_process_caption(modified_subset, alternate_caption)
+                    else:
+                        processed_caption = self.orig_process_caption(subset, caption)
+                else:
+                    processed_caption = self.orig_process_caption(subset, caption)
+            else:
+                processed_caption = self.orig_process_caption(subset, caption)
+
+            # Randomly inject custom style tags if defined
+            style_inject_tags_str = getattr(self, "style_inject_tags", None)
+            if style_inject_tags_str and processed_caption != "":
+                inject_tags = [t.strip() for t in style_inject_tags_str.split(",") if t.strip()]
+                if inject_tags:
+                    sep = getattr(subset, "caption_separator", ",")
+                    sep_split = sep.strip() if sep.strip() else ","
+                    tags = [t.strip() for t in processed_caption.split(sep_split) if t.strip()]
+                    
+                    for tag in inject_tags:
+                        idx = random.randint(0, len(tags))
+                        tags.insert(idx, tag)
+                    
+                    processed_caption = f"{sep_split} ".join(tags)
+
+            return processed_caption
             
         dataset_util.BaseDataset.__getitem__ = new_getitem
         dataset_util.BaseDataset.process_caption = new_process_caption
@@ -768,16 +789,18 @@ def train(args):
         blueprint = blueprint_generator.generate(user_config, args)
         train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
-    # Apply Alternate Prompt properties
+    # Apply Alternate Prompt and Injected Tags properties
     for group in [train_dataset_group, val_dataset_group]:
         if group is not None:
             if hasattr(group, "datasets"):
                 for dataset in group.datasets:
                     dataset.alternate_prompt_probability = getattr(args, "alternate_prompt_probability", 0.0)
+                    dataset.style_inject_tags = getattr(args, "style_inject_tags", None)
                     if dataset.alternate_prompt_probability > 0.0:
                         preload_alternate_prompts(dataset)
             elif hasattr(group, "image_data"):
                 group.alternate_prompt_probability = getattr(args, "alternate_prompt_probability", 0.0)
+                group.style_inject_tags = getattr(args, "style_inject_tags", None)
                 if group.alternate_prompt_probability > 0.0:
                     preload_alternate_prompts(group)
 
@@ -1354,6 +1377,12 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=0.1,
         help="dropout rate applied to query bottleneck / スタイルクエリボトルネックに適用するドロップアウト率 (default: 0.1)",
+    )
+    parser.add_argument(
+        "--style_inject_tags",
+        type=str,
+        default=None,
+        help="comma-separated tags to randomly inject into captions during training (e.g., 'logo,text') (default: None)",
     )
 
 

@@ -106,6 +106,46 @@ def preload_alternate_prompts(dataset):
                 logger.error(f"Error pre-loading natural prompt from {natural_prompt_path}: {e}")
 
 
+def inject_style_tags(dataset, style_inject_tags_str):
+    if not style_inject_tags_str:
+        return
+    import random
+    inject_tags = [t.strip() for t in style_inject_tags_str.split(",") if t.strip()]
+    if not inject_tags:
+        return
+    for image_info in dataset.image_data.values():
+        subset = dataset.image_to_subset.get(image_info.image_key)
+        sep = getattr(subset, "caption_separator", ",") if subset is not None else ","
+        sep_split = sep.strip() if sep.strip() else ","
+        
+        # Inject into standard caption
+        if image_info.caption:
+            tags = [t.strip() for t in image_info.caption.split(sep_split) if t.strip()]
+            for tag in inject_tags:
+                idx = random.randint(0, len(tags))
+                tags.insert(idx, tag)
+            image_info.caption = f"{sep_split} ".join(tags)
+            
+        # Inject into alternate caption
+        alternate_caption = getattr(image_info, "alternate_caption", None)
+        if alternate_caption:
+            tags = [t.strip() for t in alternate_caption.split(sep_split) if t.strip()]
+            for tag in inject_tags:
+                idx = random.randint(0, len(tags))
+                tags.insert(idx, tag)
+            image_info.alternate_caption = f"{sep_split} ".join(tags)
+
+
+def inject_style_tags_to_group(group, style_inject_tags_str):
+    if not style_inject_tags_str or group is None:
+        return
+    if hasattr(group, "datasets"):
+        for dataset in group.datasets:
+            inject_style_tags(dataset, style_inject_tags_str)
+    elif hasattr(group, "image_data"):
+        inject_style_tags(group, style_inject_tags_str)
+
+
 def patch_dataset_getitem_and_caption():
     import library.dataset as dataset_util
     
@@ -146,30 +186,9 @@ def patch_dataset_getitem_and_caption():
                         modified_subset.shuffle_caption = False
                         modified_subset.caption_tag_dropout_rate = 0.0
                         modified_subset.token_warmup_step = 0
-                        processed_caption = self.orig_process_caption(modified_subset, alternate_caption)
-                    else:
-                        processed_caption = self.orig_process_caption(subset, caption)
-                else:
-                    processed_caption = self.orig_process_caption(subset, caption)
-            else:
-                processed_caption = self.orig_process_caption(subset, caption)
-
-            # Randomly inject custom style tags if defined
-            style_inject_tags_str = getattr(self, "style_inject_tags", None)
-            if style_inject_tags_str and processed_caption != "":
-                inject_tags = [t.strip() for t in style_inject_tags_str.split(",") if t.strip()]
-                if inject_tags:
-                    sep = getattr(subset, "caption_separator", ",")
-                    sep_split = sep.strip() if sep.strip() else ","
-                    tags = [t.strip() for t in processed_caption.split(sep_split) if t.strip()]
-                    
-                    for tag in inject_tags:
-                        idx = random.randint(0, len(tags))
-                        tags.insert(idx, tag)
-                    
-                    processed_caption = f"{sep_split} ".join(tags)
-
-            return processed_caption
+                        return self.orig_process_caption(modified_subset, alternate_caption)
+                        
+            return self.orig_process_caption(subset, caption)
             
         dataset_util.BaseDataset.__getitem__ = new_getitem
         dataset_util.BaseDataset.process_caption = new_process_caption
@@ -803,6 +822,9 @@ def train(args):
                 group.style_inject_tags = getattr(args, "style_inject_tags", None)
                 if group.alternate_prompt_probability > 0.0:
                     preload_alternate_prompts(group)
+            
+            # Inject tags into raw captions before they are cached by the text encoder
+            inject_style_tags_to_group(group, getattr(args, "style_inject_tags", None))
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)

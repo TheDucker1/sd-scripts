@@ -51,6 +51,7 @@ from library import (
     strategy_base,
     strategy_anima,
     sai_model_spec,
+    attention,
 )
 import library.accelerator_setup as accelerator_setup
 import library.args as args_util
@@ -212,25 +213,22 @@ class RMSNorm(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
-
 class StyleDualKVModule(nn.Module):
-    """Dual attention path implementation for style control using dynamically projected style keys/values and LoRA output projection."""
+    """Asymmetric Decoupled Linear Style Dual KV Module (Approach B)."""
 
     def __init__(
         self,
         name: str,
         org_module: nn.Module,  # Attention module
-        rank: int,
-        parent_network=None,
-        separate_v_style: bool = False,
-        dropout: float = 0.0,
+        r_route: int,
+        r_payload: int,
     ):
         super().__init__()
         self.module_name = name
         self.org_module = [org_module]
-        self.rank = rank
+        self.r_route = r_route
+        self.r_payload = r_payload
         self.multiplier = 1.0
-        self.separate_v_style = separate_v_style
 
         # Extract dimensions from original Attention module
         self.n_heads = getattr(org_module, "n_heads", 8)
@@ -238,46 +236,27 @@ class StyleDualKVModule(nn.Module):
         self.query_dim = getattr(org_module, "query_dim", org_module.q_proj.in_features if hasattr(org_module, "q_proj") else 512)
         self.inner_dim = self.n_heads * self.head_dim
 
-        # Query down-projection to bottleneck space (per-head, shape: H x D x rank)
-        self.q_down_proj_weight = nn.Parameter(torch.zeros(self.n_heads, self.head_dim, rank))
-        nn.init.normal_(self.q_down_proj_weight, std=0.01)
+        # Spatial Routing Path (X -> r_route -> 2 * H * D_h)
+        self.route_down = nn.Linear(self.query_dim, r_route, bias=False)
+        self.route_up = nn.Linear(r_route, 2 * self.inner_dim, bias=False)
+        nn.init.normal_(self.route_down.weight, std=0.01)
+        nn.init.normal_(self.route_up.weight, std=0.02)
 
-        # Key projection: from rank to rank (per-head, shape: H x rank x rank)
-        self.k_proj = nn.Parameter(torch.zeros(self.n_heads, rank, rank))
-        nn.init.normal_(self.k_proj, std=0.02)
+        # Visual Payload Path (X -> r_payload -> H * D_h)
+        self.payload_down = nn.Linear(self.query_dim, r_payload, bias=False)
+        self.payload_up = nn.Linear(r_payload, self.inner_dim, bias=False)
+        nn.init.normal_(self.payload_down.weight, std=0.01)
+        nn.init.normal_(self.payload_up.weight, std=0.02)
 
-        # Value projection
-        if separate_v_style:
-            self.v_proj = nn.Parameter(torch.zeros(self.n_heads, rank, self.head_dim))
-            self.out_proj_down = nn.Linear(self.inner_dim, rank, bias=False)
-            nn.init.normal_(self.out_proj_down.weight, std=0.01)
-        else:
-            self.v_proj = nn.Parameter(torch.zeros(self.n_heads, rank, rank))
-            self.out_proj_down = None
-        nn.init.normal_(self.v_proj, std=0.02)
+        # Factorized Output Adapter (H * D_h -> r_payload -> D)
+        self.out_down = nn.Linear(self.inner_dim, r_payload, bias=False)
+        self.out_up = nn.Linear(r_payload, self.query_dim, bias=False)
+        nn.init.normal_(self.out_down.weight, std=0.01)
+        nn.init.zeros_(self.out_up.weight)
 
-        # Style QK-norm
-        self.q_norm_style = RMSNorm(rank, eps=1e-6)
-        self.k_norm_style = RMSNorm(rank, eps=1e-6)
-
-        # Query bottleneck dropout
-        self.q_dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
-
-        # Output projection back to query_dim
-        self.out_proj_up = nn.Linear(rank, self.query_dim, bias=False)
-        nn.init.zeros_(self.out_proj_up.weight)
-
-        # Timestep modulation parameters (always enabled, defaults to no-op)
-        self.parent_network = [parent_network]
-        self.time_to_k_scale = nn.Linear(8, rank)
-        if separate_v_style:
-            self.time_to_v_scale = nn.Linear(8, self.head_dim)
-        else:
-            self.time_to_v_scale = nn.Linear(8, rank)
-        nn.init.zeros_(self.time_to_k_scale.weight)
-        nn.init.ones_(self.time_to_k_scale.bias)
-        nn.init.zeros_(self.time_to_v_scale.weight)
-        nn.init.ones_(self.time_to_v_scale.bias)
+        # QK-Norm
+        self.q_norm_style = RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
 
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
@@ -297,88 +276,33 @@ class StyleDualKVModule(nn.Module):
         if self.multiplier == 0.0:
             return y
 
-        org = self.org_module[0]
+        B, S, _ = x.shape
 
-        # Compute q from x exactly as in the original Attention block
-        q = org.q_proj(x)
-        # Rearrange to (B, S, H, D)
-        q = q.view(q.shape[0], q.shape[1], org.n_heads, org.head_dim)
-        q = org.q_norm(q)
-        if org.is_selfattn and rope_emb is not None:
-            from library.anima_models import apply_rotary_pos_emb
-            q = apply_rotary_pos_emb(q, rope_emb, tensor_format=org.qkv_format, fused=False)
+        # 2. Spatial Routing Path
+        route_bot = self.route_down(x)
+        qk_style = self.route_up(route_bot)
+        q, k = qk_style.chunk(2, dim=-1)
+        
+        # Reshape to layout (B, S, H, D_h)
+        q = q.view(B, S, self.n_heads, self.head_dim)
+        k = k.view(B, S, self.n_heads, self.head_dim)
 
-        # Project each head's query to bottleneck space independently (shape: B, S, H, rank)
-        q_bottleneck = torch.einsum("bshd,hdr->bshr", q, self.q_down_proj_weight.to(q))
-        q_bottleneck = self.q_dropout(q_bottleneck)
+        # 3. Visual Payload Path
+        payload_bot = self.payload_down(x)
+        v = self.payload_up(payload_bot)
+        v = v.view(B, S, self.n_heads, self.head_dim)
 
-        # 2. Project q_bottleneck to keys and values dynamically (shape: B, S, H, rank/head_dim)
-        k = torch.einsum("bshr,hrk->bshk", q_bottleneck, self.k_proj.to(q_bottleneck))
-        if self.separate_v_style:
-            v = torch.einsum("bshr,hrd->bshd", q_bottleneck, self.v_proj.to(q_bottleneck))
-        else:
-            v = torch.einsum("bshr,hrk->bshk", q_bottleneck, self.v_proj.to(q_bottleneck))
+        # Apply QK-Norm
+        q = self.q_norm_style(q)
+        k = self.k_norm_style(k).to(dtype=q.dtype)
 
-        # Apply timestep modulation if available
-        parent = self.parent_network[0]
-        timesteps = getattr(parent, "current_timesteps", None) if parent is not None else None
-        if timesteps is not None:
-            B = y.shape[0]
-            t_mod = timesteps.to(device=x.device, dtype=x.dtype)
-            if t_mod.ndim == 0:
-                t_mod = t_mod.unsqueeze(0)
-            if t_mod.shape[0] != B:
-                if t_mod.shape[0] == 1:
-                    t_mod = t_mod.repeat(B)
-                else:
-                    t_mod = t_mod.repeat(math.ceil(B / t_mod.shape[0]))[:B]
-            
-            # Compute cosine basis
-            scaled = t_mod.clone()
-            if scaled.max() > 1.0:
-                scaled = scaled / 1000.0  # normalize [0, 1000] to [0, 1]
-            scaled = scaled * math.pi
-            
-            num_basis = 8
-            basis_idx = torch.arange(num_basis, device=t_mod.device, dtype=t_mod.dtype)
-            basis = torch.cos(scaled[:, None] * basis_idx[None, :])
-            
-            k_scale = self.time_to_k_scale(basis)
-            v_scale = self.time_to_v_scale(basis)
-            
-            k = k * k_scale[:, None, None, :]
-            v = v * v_scale[:, None, None, :]
+        # 4. Attention using the model's optimized dispatcher (supports SageAttn/Flash/xFormers/Torch + split_attn)
+        out_flat = attention.attention([q, k, v], attn_params=attn_params) # returns shape (B, S, H * D_h)
 
-        # Apply style QK-norm
-        q_bottleneck = self.q_norm_style(q_bottleneck)
-        k = self.k_norm_style(k).to(dtype=q_bottleneck.dtype)
+        # 5. Output Projection via Factorized Adapter
+        out_style = self.out_up(self.out_down(out_flat)) * self.multiplier
 
-        # Transpose to align heads: (B, H, S, rank)
-        q_h = q_bottleneck.transpose(1, 2)
-        k_h = k.transpose(1, 2)
-        v_h = v.transpose(1, 2).to(dtype=q_bottleneck.dtype)
-
-        # 3. Native SDPA with QK-norm (FlashAttention compatible)
-        out_h = F.scaled_dot_product_attention(
-            q_h,
-            k_h,
-            v_h,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False
-        )
-
-        # Project back to query_dim
-        if self.separate_v_style:
-            out_flat = out_h.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)
-            out_patched_down = self.out_proj_down(out_flat)
-        else:
-            out_patched_down = out_h.sum(dim=1)
-        out_style = self.out_proj_up(out_patched_down) * self.multiplier
-
-        # Merge style attention path with main attention path
-        y_patched = y + out_style
-        return y_patched
+        return y + out_style
 
 
 def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
@@ -409,24 +333,23 @@ def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
                 pass
     return blocks
 
+
 class StyleDualKVNetwork(nn.Module):
-    """Style dual KV network using query-derived style keys/values and bottlenecked output projections."""
+    """Style dual KV network using asymmetric decoupled linear projections."""
 
     def __init__(
         self,
         dit: nn.Module,
-        rank: int = 32,
+        r_route: int = 8,
+        r_payload: int = 16,
         target_layers: str = "self_attn_kv_pre",
         target_blocks: Optional[str] = None,
-        separate_v_style: bool = False,
-        style_dropout: float = 0.1,
     ):
         super().__init__()
-        self.rank = rank
+        self.r_route = r_route
+        self.r_payload = r_payload
         self.target_layers = target_layers
         self.target_blocks = target_blocks
-        self.separate_v_style = separate_v_style
-        self.style_dropout = style_dropout
 
         from networks.control_net_lllite_anima import parse_target_layers
         atomics = parse_target_layers(target_layers)
@@ -434,24 +357,23 @@ class StyleDualKVNetwork(nn.Module):
         parsed_blocks = parse_block_selection(target_blocks)
 
         modules = self._create_modules(
-            dit, rank, atomics, target_blocks=parsed_blocks, separate_v_style=separate_v_style, style_dropout=style_dropout
+            dit, r_route, r_payload, atomics, target_blocks=parsed_blocks
         )
         self.style_modules = nn.ModuleList(modules)
 
         logger.info(
             f"StyleDualKVNetwork: created {len(self.style_modules)} modules for "
             f"target={target_layers!r} (atomics={list(atomics)}), target_blocks={target_blocks!r}, "
-            f"rank={rank}, separate_v_style={separate_v_style}, style_dropout={style_dropout}"
+            f"r_route={r_route}, r_payload={r_payload}"
         )
 
     def _create_modules(
         self,
         dit: nn.Module,
-        rank: int,
+        r_route: int,
+        r_payload: int,
         atomics: Tuple[str, ...],
         target_blocks: Optional[set[int]] = None,
-        separate_v_style: bool = False,
-        style_dropout: float = 0.0,
     ) -> List[StyleDualKVModule]:
         modules: List[StyleDualKVModule] = []
         any_self = any(a in atomics for a in ("self_attn_q_pre", "self_attn_kv_pre"))
@@ -486,7 +408,7 @@ class StyleDualKVNetwork(nn.Module):
                 full_name = f"style_kv_dit_{name}".replace(".", "_")
                 modules.append(
                     StyleDualKVModule(
-                        full_name, module, rank, parent_network=self, separate_v_style=separate_v_style, dropout=style_dropout
+                        full_name, module, r_route, r_payload
                     )
                 )
 
@@ -563,39 +485,6 @@ def load_style_weights(network: StyleDualKVNetwork, file: str, strict: bool = Fa
     return info
 
 
-def compute_style_orthogonal_loss(network: StyleDualKVNetwork) -> torch.Tensor:
-    total_ortho = 0.0
-    count = 0
-    for m in network.style_modules:
-        # 1. Values projection ortho loss
-        v_proj = m.v_proj.to(torch.float32)
-        H, R, D = v_proj.shape
-        v_norm = F.normalize(v_proj, p=2, dim=-1)
-        v_sim = torch.matmul(v_norm, v_norm.transpose(-1, -2))  # (H, R, R)
-        I_v = torch.eye(R, device=v_proj.device, dtype=v_proj.dtype)
-        loss_v = torch.mean((v_sim - I_v) ** 2)
-        total_ortho = total_ortho + loss_v
-        count += 1
-
-        # 2. Keys projection ortho loss
-        k_proj = m.k_proj.to(torch.float32)
-        H_k, R_k, D_k = k_proj.shape
-        k_norm = F.normalize(k_proj, p=2, dim=-1)
-        k_sim = torch.matmul(k_norm, k_norm.transpose(-1, -2))  # (H, R, R)
-        I_k = torch.eye(R_k, device=k_proj.device, dtype=k_proj.dtype)
-        loss_k = torch.mean((k_sim - I_k) ** 2)
-        total_ortho = total_ortho + loss_k
-        count += 1
-        
-    if count == 0:
-        return torch.tensor(0.0)
-    return total_ortho / count
-
-
-# warm_start_from_gallery has been removed to favor pure random initialization for both K and V.
-
-
-
 class AnimaStyleWrapper(nn.Module):
     def __init__(self, dit: nn.Module, network: StyleDualKVNetwork):
         super().__init__()
@@ -642,7 +531,6 @@ class AnimaStyleWrapper(nn.Module):
         context: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        self.network.current_timesteps = timesteps
         return self.dit(x, timesteps, context, **kwargs)
 
 
@@ -960,11 +848,10 @@ def train(args):
     logger.info("Building Style Dual KV Network...")
     network = StyleDualKVNetwork(
         dit,
-        rank=args.network_dim,
+        r_route=args.r_route,
+        r_payload=args.r_payload,
         target_layers=args.lllite_target_layers,
         target_blocks=args.lllite_target_blocks,
-        separate_v_style=args.separate_v_style,
-        style_dropout=args.style_dropout,
     )
 
     if args.network_weights is not None:
@@ -1048,9 +935,6 @@ def train(args):
         dit_to_compile = accelerator.unwrap_model(wrapper).dit
         compile_utils.compile_transformer(args, dit_to_compile, [dit_to_compile.blocks], disable_linear=False)
 
-    # SVD warm start has been removed. Keys and values remain randomly initialized.
-
-
     if args.full_fp16:
         accelerator_setup.patch_accelerator_for_fp16_training(accelerator)
 
@@ -1115,9 +999,8 @@ def train(args):
         ).to_metadata_dict()
         sai_metadata["modelspec.architecture"] = "anima-preview/style-dual-kv-network"
         sai_metadata["style_dual_kv.version"] = "3.0"
-        sai_metadata["style_dual_kv.rank"] = str(args.network_dim)
-        sai_metadata["style_dual_kv.separate_v_style"] = str(args.separate_v_style)
-        sai_metadata["style_dual_kv.style_dropout"] = str(args.style_dropout)
+        sai_metadata["style_dual_kv.r_route"] = str(args.r_route)
+        sai_metadata["style_dual_kv.r_payload"] = str(args.r_payload)
         if args.lllite_target_blocks is not None:
             sai_metadata["style_dual_kv.target_blocks"] = str(args.lllite_target_blocks)
         unwrapped = accelerator.unwrap_model(wrapper).network
@@ -1255,12 +1138,6 @@ def train(args):
                 loss = loss * loss_weights
                 loss = loss.mean()
 
-                current_ortho_loss = 0.0
-                if args.style_ortho_loss_weight > 0.0:
-                    ortho_loss = compute_style_orthogonal_loss(accelerator.unwrap_model(wrapper).network)
-                    current_ortho_loss = ortho_loss.detach().item()
-                    loss = loss + args.style_ortho_loss_weight * ortho_loss
-
                 try:
                     accelerator.backward(loss)
                 except torch.cuda.OutOfMemoryError:
@@ -1295,15 +1172,11 @@ def train(args):
             current_loss = loss.detach().item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss, "lr": lr_scheduler.get_last_lr()[0]}
-                if args.style_ortho_loss_weight > 0.0:
-                    logs["loss/ortho"] = current_ortho_loss
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             postfix = {"avr_loss": avr_loss}
-            if args.style_ortho_loss_weight > 0.0:
-                postfix["ortho"] = current_ortho_loss
             progress_bar.set_postfix(**postfix)
 
             if global_step >= args.max_train_steps:
@@ -1342,10 +1215,16 @@ def train(args):
 
 def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
-        "--network_dim",
+        "--r_route",
         type=int,
-        default=32,
-        help="network dimension (LoRA rank) / ネットワーク次元数(LoRAランク) (default: 32)",
+        default=8,
+        help="rank for spatial routing path in Approach B (default: 8)",
+    )
+    parser.add_argument(
+        "--r_payload",
+        type=int,
+        default=16,
+        help="rank for visual payload path in Approach B (default: 16)",
     )
     parser.add_argument(
         "--lllite_target_layers",
@@ -1375,30 +1254,11 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="pretrained weights to resume from / 学習を再開する重み",
     )
-    # SVD warm start arguments removed. Both keys and values are randomly initialized.
-
-    parser.add_argument(
-        "--style_ortho_loss_weight",
-        type=float,
-        default=0.05,
-        help="Weight for orthogonal/decorrelation loss on style tokens to prevent representation collapse (default: 0.05)",
-    )
     parser.add_argument(
         "--alternate_prompt_probability",
         type=float,
         default=0.0,
-        help="probability to use the alternate natural prompt ([same_name]_natural_prompt.txt) / 代替の自然言語プロンプトを使用する確率 (default: 0.0)",
-    )
-    parser.add_argument(
-        "--separate_v_style",
-        action="store_true",
-        help="separate v_style and out_proj_down (the old way) instead of merging them / v_style と out_proj_down を結合せずに分離する (従来の方式)",
-    )
-    parser.add_argument(
-        "--style_dropout",
-        type=float,
-        default=0.1,
-        help="dropout rate applied to query bottleneck / スタイルクエリボトルネックに適用するドロップアウト率 (default: 0.1)",
+        help="probability to use the alternate natural prompt ([same_name]_natural_prompt.txt) / 代替的自然言語プロンプト使用確率 (default: 0.0)",
     )
     parser.add_argument(
         "--style_inject_tags",

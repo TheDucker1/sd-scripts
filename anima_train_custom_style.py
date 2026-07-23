@@ -214,7 +214,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 class StyleDualKVModule(nn.Module):
-    """Asymmetric Decoupled Linear Style Dual KV Module (Approach B)."""
+    """Style Dual KV Module using original Q, K bottleneck (r_route), V bottleneck (r_payload), and low-rank output correction dW (r_out)."""
 
     def __init__(
         self,
@@ -222,12 +222,14 @@ class StyleDualKVModule(nn.Module):
         org_module: nn.Module,  # Attention module
         r_route: int,
         r_payload: int,
+        r_out: int,
     ):
         super().__init__()
         self.module_name = name
         self.org_module = [org_module]
         self.r_route = r_route
         self.r_payload = r_payload
+        self.r_out = r_out
         self.multiplier = 1.0
 
         # Extract dimensions from original Attention module
@@ -236,30 +238,30 @@ class StyleDualKVModule(nn.Module):
         self.query_dim = getattr(org_module, "query_dim", org_module.q_proj.in_features if hasattr(org_module, "q_proj") else 512)
         self.inner_dim = self.n_heads * self.head_dim
 
-        # Spatial Routing Path (X -> r_route -> 2 * H * D_h)
-        self.route_down = nn.Linear(self.query_dim, r_route, bias=False)
-        self.route_up = nn.Linear(r_route, 2 * self.inner_dim, bias=False)
-        nn.init.normal_(self.route_down.weight, std=0.01)
-        nn.init.normal_(self.route_up.weight, std=0.02)
+        # Style Key Bottleneck Path (X -> r_route -> H * D_h)
+        self.k_down = nn.Linear(self.query_dim, r_route, bias=False)
+        self.k_up = nn.Linear(r_route, self.inner_dim, bias=False)
+        nn.init.normal_(self.k_down.weight, std=0.01)
+        nn.init.normal_(self.k_up.weight, std=0.02)
 
-        # Visual Payload Path (X -> r_payload -> H * D_h)
-        self.payload_down = nn.Linear(self.query_dim, r_payload, bias=False)
-        self.payload_up = nn.Linear(r_payload, self.inner_dim, bias=False)
-        nn.init.normal_(self.payload_down.weight, std=0.01)
-        nn.init.normal_(self.payload_up.weight, std=0.02)
+        # Style Value Bottleneck Path (X -> r_payload -> H * D_h)
+        self.v_down = nn.Linear(self.query_dim, r_payload, bias=False)
+        self.v_up = nn.Linear(r_payload, self.inner_dim, bias=False)
+        nn.init.normal_(self.v_down.weight, std=0.01)
+        nn.init.zeros_(self.v_up.weight)
 
-        # Factorized Output Adapter (H * D_h -> r_payload -> D)
-        self.out_down = nn.Linear(self.inner_dim, r_payload, bias=False)
-        self.out_up = nn.Linear(r_payload, self.query_dim, bias=False)
+        # Low-rank output projection correction dW (inner_dim -> r_out -> query_dim)
+        self.out_down = nn.Linear(self.inner_dim, r_out, bias=False)
+        self.out_up = nn.Linear(r_out, self.query_dim, bias=False)
         nn.init.normal_(self.out_down.weight, std=0.01)
         nn.init.zeros_(self.out_up.weight)
 
-        # QK-Norm
-        self.q_norm_style = RMSNorm(self.head_dim, eps=1e-6)
+        # K-Norm for style keys
         self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
 
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
+        self.org_compute_qkv = self.org_module[0].compute_qkv
         self.org_module[0].forward = self.forward
 
     def forward(
@@ -270,39 +272,57 @@ class StyleDualKVModule(nn.Module):
         rope_emb: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # 1. Run the original forward pass to get the normal attention output: (B, S, query_dim)
-        y = self.org_forward(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
+        org_attn = self.org_module[0]
 
         if self.multiplier == 0.0:
-            return y
+            return self.org_forward(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
+
+        captured_q = None
+
+        def hook_compute_qkv(*args, **kwargs):
+            nonlocal captured_q
+            q, k, v = self.org_compute_qkv(*args, **kwargs)
+            captured_q = q
+            return q, k, v
+
+        # 1. Run original forward pass, hooking compute_qkv to capture Q without recomputing
+        org_attn.compute_qkv = hook_compute_qkv
+        try:
+            y_orig = self.org_forward(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
+        finally:
+            org_attn.compute_qkv = self.org_compute_qkv
+
+        if captured_q is None:
+            return y_orig
 
         B, S, _ = x.shape
 
-        # 2. Spatial Routing Path
-        route_bot = self.route_down(x)
-        qk_style = self.route_up(route_bot)
-        q, k = qk_style.chunk(2, dim=-1)
-        
-        # Reshape to layout (B, S, H, D_h)
-        q = q.view(B, S, self.n_heads, self.head_dim)
-        k = k.view(B, S, self.n_heads, self.head_dim)
+        # 2. Style K bottleneck (r_route) and V bottleneck (r_payload)
+        k_style = self.k_up(self.k_down(x)).view(B, S, self.n_heads, self.head_dim)
+        v_style = self.v_up(self.v_down(x)).view(B, S, self.n_heads, self.head_dim)
 
-        # 3. Visual Payload Path
-        payload_bot = self.payload_down(x)
-        v = self.payload_up(payload_bot)
-        v = v.view(B, S, self.n_heads, self.head_dim)
+        # Apply K-Norm for style keys
+        k_style = self.k_norm_style(k_style).to(dtype=captured_q.dtype)
 
-        # Apply QK-Norm
-        q = self.q_norm_style(q)
-        k = self.k_norm_style(k).to(dtype=q.dtype)
+        # Cast for attention if dtypes differ under autocast
+        if captured_q.dtype != v_style.dtype:
+            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                target_dtype = v_style.dtype
+                q_style = captured_q.to(target_dtype)
+                k_style = k_style.to(target_dtype)
+            else:
+                q_style = captured_q
+        else:
+            q_style = captured_q
 
-        # 4. Attention using the model's optimized dispatcher (supports SageAttn/Flash/xFormers/Torch + split_attn)
-        out_flat = attention.attention([q, k, v], attn_params=attn_params) # returns shape (B, S, H * D_h)
+        # 3. Run style attention path using captured Q
+        out_style_flat = attention.attention([q_style, k_style, v_style], attn_params=attn_params)
 
-        # 5. Output Projection via Factorized Adapter
-        out_style = self.out_up(self.out_down(out_flat)) * self.multiplier
+        # 4. Output projection: shared W0 + low-rank correction dW
+        out_style = (org_attn.output_proj(out_style_flat) + self.out_up(self.out_down(out_style_flat))) * self.multiplier
 
-        return y + out_style
+        # 5. Add style output directly to original module output
+        return y_orig + out_style
 
 
 def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
@@ -335,19 +355,21 @@ def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
 
 
 class StyleDualKVNetwork(nn.Module):
-    """Style dual KV network using asymmetric decoupled linear projections."""
+    """Style dual KV network using original Q, dual KV bottlenecks, and low-rank output correction dW."""
 
     def __init__(
         self,
         dit: nn.Module,
-        r_route: int = 8,
+        r_route: int = 16,
         r_payload: int = 16,
+        r_out: int = 8,
         target_layers: str = "self_attn_kv_pre",
         target_blocks: Optional[str] = None,
     ):
         super().__init__()
         self.r_route = r_route
         self.r_payload = r_payload
+        self.r_out = r_out
         self.target_layers = target_layers
         self.target_blocks = target_blocks
 
@@ -357,14 +379,14 @@ class StyleDualKVNetwork(nn.Module):
         parsed_blocks = parse_block_selection(target_blocks)
 
         modules = self._create_modules(
-            dit, r_route, r_payload, atomics, target_blocks=parsed_blocks
+            dit, r_route, r_payload, r_out, atomics, target_blocks=parsed_blocks
         )
         self.style_modules = nn.ModuleList(modules)
 
         logger.info(
             f"StyleDualKVNetwork: created {len(self.style_modules)} modules for "
             f"target={target_layers!r} (atomics={list(atomics)}), target_blocks={target_blocks!r}, "
-            f"r_route={r_route}, r_payload={r_payload}"
+            f"r_route={r_route}, r_payload={r_payload}, r_out={r_out}"
         )
 
     def _create_modules(
@@ -372,6 +394,7 @@ class StyleDualKVNetwork(nn.Module):
         dit: nn.Module,
         r_route: int,
         r_payload: int,
+        r_out: int,
         atomics: Tuple[str, ...],
         target_blocks: Optional[set[int]] = None,
     ) -> List[StyleDualKVModule]:
@@ -408,7 +431,7 @@ class StyleDualKVNetwork(nn.Module):
                 full_name = f"style_kv_dit_{name}".replace(".", "_")
                 modules.append(
                     StyleDualKVModule(
-                        full_name, module, r_route, r_payload
+                        full_name, module, r_route, r_payload, r_out
                     )
                 )
 
@@ -850,6 +873,7 @@ def train(args):
         dit,
         r_route=args.r_route,
         r_payload=args.r_payload,
+        r_out=args.r_out,
         target_layers=args.lllite_target_layers,
         target_blocks=args.lllite_target_blocks,
     )
@@ -1001,6 +1025,7 @@ def train(args):
         sai_metadata["style_dual_kv.version"] = "3.0"
         sai_metadata["style_dual_kv.r_route"] = str(args.r_route)
         sai_metadata["style_dual_kv.r_payload"] = str(args.r_payload)
+        sai_metadata["style_dual_kv.r_out"] = str(args.r_out)
         if args.lllite_target_blocks is not None:
             sai_metadata["style_dual_kv.target_blocks"] = str(args.lllite_target_blocks)
         unwrapped = accelerator.unwrap_model(wrapper).network
@@ -1217,14 +1242,20 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--r_route",
         type=int,
-        default=8,
-        help="rank for spatial routing path in Approach B (default: 8)",
+        default=16,
+        help="rank for style K bottleneck path (default: 16)",
     )
     parser.add_argument(
         "--r_payload",
         type=int,
         default=16,
-        help="rank for visual payload path in Approach B (default: 16)",
+        help="rank for style V bottleneck path (default: 16)",
+    )
+    parser.add_argument(
+        "--r_out",
+        type=int,
+        default=8,
+        help="rank for low-rank output projection correction dW path (default: 8)",
     )
     parser.add_argument(
         "--lllite_target_layers",

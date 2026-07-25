@@ -214,7 +214,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 class StyleDualKVModule(nn.Module):
-    """Style Dual KV Module using original Q, K bottleneck (r_route), V bottleneck (r_payload), and low-rank output correction dW (r_out)."""
+    """Style Dual KV Module using original Q, K bottleneck (r_route), V MoE bottleneck (r_payload x num_experts), and low-rank output correction dW (r_out)."""
 
     def __init__(
         self,
@@ -223,6 +223,7 @@ class StyleDualKVModule(nn.Module):
         r_route: int,
         r_payload: int,
         r_out: int,
+        num_experts: int = 1,
     ):
         super().__init__()
         self.module_name = name
@@ -230,6 +231,7 @@ class StyleDualKVModule(nn.Module):
         self.r_route = r_route
         self.r_payload = r_payload
         self.r_out = r_out
+        self.num_experts = num_experts
         self.multiplier = 1.0
 
         # Extract dimensions from original Attention module
@@ -244,11 +246,22 @@ class StyleDualKVModule(nn.Module):
         nn.init.normal_(self.k_down.weight, std=0.01)
         nn.init.normal_(self.k_up.weight, std=0.02)
 
-        # Style Value Bottleneck Path (X -> r_payload -> H * D_h)
-        self.v_down = nn.Linear(self.query_dim, r_payload, bias=False)
-        self.v_up = nn.Linear(r_payload, self.inner_dim, bias=False)
-        nn.init.normal_(self.v_down.weight, std=0.01)
-        nn.init.zeros_(self.v_up.weight)
+        # Style Value MoE Bottleneck Path (X -> num_experts x [r_payload] -> H * D_h)
+        if self.num_experts > 1:
+            self.v_router = nn.Linear(self.query_dim, num_experts, bias=False)
+            nn.init.normal_(self.v_router.weight, std=0.01)
+        else:
+            self.v_router = None
+
+        self.v_down_experts = nn.ModuleList([
+            nn.Linear(self.query_dim, r_payload, bias=False) for _ in range(num_experts)
+        ])
+        self.v_up_experts = nn.ModuleList([
+            nn.Linear(r_payload, self.inner_dim, bias=False) for _ in range(num_experts)
+        ])
+        for v_down, v_up in zip(self.v_down_experts, self.v_up_experts):
+            nn.init.normal_(v_down.weight, std=0.01)
+            nn.init.zeros_(v_up.weight)
 
         # Low-rank output projection correction dW (inner_dim -> r_out -> query_dim)
         self.out_down = nn.Linear(self.inner_dim, r_out, bias=False)
@@ -260,9 +273,11 @@ class StyleDualKVModule(nn.Module):
         self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
 
     def apply_to(self):
-        self.org_forward = self.org_module[0].forward
-        self.org_compute_qkv = self.org_module[0].compute_qkv
-        self.org_module[0].forward = self.forward
+        org = self.org_module[0]
+        self.org_forward = [org.forward]
+        self.org_compute_qkv = [org.compute_qkv]
+        self.org_output_proj = [org.output_proj]
+        org.forward = self.forward
 
     def forward(
         self,
@@ -273,56 +288,78 @@ class StyleDualKVModule(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         org_attn = self.org_module[0]
+        org_forward_fn = self.org_forward[0]
+        org_compute_qkv_fn = self.org_compute_qkv[0]
+        org_output_proj_module = self.org_output_proj[0]
 
         if self.multiplier == 0.0:
-            return self.org_forward(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
+            return org_forward_fn(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
 
         captured_q = None
 
         def hook_compute_qkv(*args, **kwargs):
             nonlocal captured_q
-            q, k, v = self.org_compute_qkv(*args, **kwargs)
+            q, k, v = org_compute_qkv_fn(*args, **kwargs)
             captured_q = q
             return q, k, v
 
-        # 1. Run original forward pass, hooking compute_qkv to capture Q without recomputing
-        org_attn.compute_qkv = hook_compute_qkv
-        try:
-            y_orig = self.org_forward(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
-        finally:
-            org_attn.compute_qkv = self.org_compute_qkv
+        def hook_output_proj(out_orig_flat):
+            nonlocal captured_q
+            B, S, _ = x.shape
 
-        if captured_q is None:
-            return y_orig
+            # Style K bottleneck (r_route)
+            k_style = self.k_up(self.k_down(x)).view(B, S, self.n_heads, self.head_dim)
 
-        B, S, _ = x.shape
+            # Style V MoE bottleneck (r_payload x num_experts)
+            if self.num_experts > 1:
+                router_logits = self.v_router(x)
+                gains = F.softmax(router_logits, dim=-1)
+                v_style_flat = torch.zeros((B, S, self.inner_dim), dtype=x.dtype, device=x.device)
+                for i in range(self.num_experts):
+                    v_exp = self.v_up_experts[i](self.v_down_experts[i](x))
+                    v_style_flat = v_style_flat + gains[:, :, i:i+1] * v_exp
+                v_style = v_style_flat.view(B, S, self.n_heads, self.head_dim)
+            else:
+                v_style = self.v_up_experts[0](self.v_down_experts[0](x)).view(B, S, self.n_heads, self.head_dim)
 
-        # 2. Style K bottleneck (r_route) and V bottleneck (r_payload)
-        k_style = self.k_up(self.k_down(x)).view(B, S, self.n_heads, self.head_dim)
-        v_style = self.v_up(self.v_down(x)).view(B, S, self.n_heads, self.head_dim)
+            # Apply K-Norm for style keys
+            k_style = self.k_norm_style(k_style).to(dtype=captured_q.dtype)
 
-        # Apply K-Norm for style keys
-        k_style = self.k_norm_style(k_style).to(dtype=captured_q.dtype)
-
-        # Cast for attention if dtypes differ under autocast
-        if captured_q.dtype != v_style.dtype:
-            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
-                target_dtype = v_style.dtype
-                q_style = captured_q.to(target_dtype)
-                k_style = k_style.to(target_dtype)
+            # Cast for attention if dtypes differ under autocast
+            if captured_q.dtype != v_style.dtype:
+                if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                    target_dtype = v_style.dtype
+                    q_style = captured_q.to(target_dtype)
+                    k_style = k_style.to(target_dtype)
+                else:
+                    q_style = captured_q
             else:
                 q_style = captured_q
-        else:
-            q_style = captured_q
 
-        # 3. Run style attention path using captured Q
-        out_style_flat = attention.attention([q_style, k_style, v_style], attn_params=attn_params)
+            # Run style attention path using captured Q
+            out_style_flat = attention.attention([q_style, k_style, v_style], attn_params=attn_params)
 
-        # 4. Output projection: shared W0 + low-rank correction dW
-        out_style = (org_attn.output_proj(out_style_flat) + self.out_up(self.out_down(out_style_flat))) * self.multiplier
+            # Add style attention output to original attention output before shared W0 projection
+            out_combined_flat = out_orig_flat + out_style_flat * self.multiplier
 
-        # 5. Add style output directly to original module output
-        return y_orig + out_style
+            # Shared W0 projection
+            shared_proj = org_output_proj_module(out_combined_flat)
+
+            # Separate low-rank correction term dW
+            dw_term = self.out_up(self.out_down(out_style_flat)) * self.multiplier
+
+            return shared_proj + dw_term
+
+        # Hook compute_qkv and output_proj during original forward pass
+        object.__setattr__(org_attn, "compute_qkv", hook_compute_qkv)
+        object.__setattr__(org_attn, "output_proj", hook_output_proj)
+        try:
+            y = org_forward_fn(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
+        finally:
+            object.__setattr__(org_attn, "compute_qkv", org_compute_qkv_fn)
+            object.__setattr__(org_attn, "output_proj", org_output_proj_module)
+
+        return y
 
 
 def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
@@ -355,7 +392,7 @@ def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
 
 
 class StyleDualKVNetwork(nn.Module):
-    """Style dual KV network using original Q, dual KV bottlenecks, and low-rank output correction dW."""
+    """Style dual KV network using original Q, dual KV bottlenecks (with V MoE), and low-rank output correction dW."""
 
     def __init__(
         self,
@@ -363,6 +400,7 @@ class StyleDualKVNetwork(nn.Module):
         r_route: int = 16,
         r_payload: int = 16,
         r_out: int = 8,
+        num_experts: int = 1,
         target_layers: str = "self_attn_kv_pre",
         target_blocks: Optional[str] = None,
     ):
@@ -370,6 +408,7 @@ class StyleDualKVNetwork(nn.Module):
         self.r_route = r_route
         self.r_payload = r_payload
         self.r_out = r_out
+        self.num_experts = num_experts
         self.target_layers = target_layers
         self.target_blocks = target_blocks
 
@@ -379,14 +418,14 @@ class StyleDualKVNetwork(nn.Module):
         parsed_blocks = parse_block_selection(target_blocks)
 
         modules = self._create_modules(
-            dit, r_route, r_payload, r_out, atomics, target_blocks=parsed_blocks
+            dit, r_route, r_payload, r_out, num_experts, atomics, target_blocks=parsed_blocks
         )
         self.style_modules = nn.ModuleList(modules)
 
         logger.info(
             f"StyleDualKVNetwork: created {len(self.style_modules)} modules for "
             f"target={target_layers!r} (atomics={list(atomics)}), target_blocks={target_blocks!r}, "
-            f"r_route={r_route}, r_payload={r_payload}, r_out={r_out}"
+            f"r_route={r_route}, r_payload={r_payload}, r_out={r_out}, num_experts={num_experts}"
         )
 
     def _create_modules(
@@ -395,6 +434,7 @@ class StyleDualKVNetwork(nn.Module):
         r_route: int,
         r_payload: int,
         r_out: int,
+        num_experts: int,
         atomics: Tuple[str, ...],
         target_blocks: Optional[set[int]] = None,
     ) -> List[StyleDualKVModule]:
@@ -431,7 +471,7 @@ class StyleDualKVNetwork(nn.Module):
                 full_name = f"style_kv_dit_{name}".replace(".", "_")
                 modules.append(
                     StyleDualKVModule(
-                        full_name, module, r_route, r_payload, r_out
+                        full_name, module, r_route, r_payload, r_out, num_experts
                     )
                 )
 
@@ -874,6 +914,7 @@ def train(args):
         r_route=args.r_route,
         r_payload=args.r_payload,
         r_out=args.r_out,
+        num_experts=args.num_experts,
         target_layers=args.lllite_target_layers,
         target_blocks=args.lllite_target_blocks,
     )
@@ -1026,6 +1067,7 @@ def train(args):
         sai_metadata["style_dual_kv.r_route"] = str(args.r_route)
         sai_metadata["style_dual_kv.r_payload"] = str(args.r_payload)
         sai_metadata["style_dual_kv.r_out"] = str(args.r_out)
+        sai_metadata["style_dual_kv.num_experts"] = str(args.num_experts)
         if args.lllite_target_blocks is not None:
             sai_metadata["style_dual_kv.target_blocks"] = str(args.lllite_target_blocks)
         unwrapped = accelerator.unwrap_model(wrapper).network
@@ -1256,6 +1298,12 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=8,
         help="rank for low-rank output projection correction dW path (default: 8)",
+    )
+    parser.add_argument(
+        "--num_experts",
+        type=int,
+        default=1,
+        help="number of style value (V) MoE experts (default: 1)",
     )
     parser.add_argument(
         "--lllite_target_layers",

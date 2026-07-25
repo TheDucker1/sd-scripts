@@ -249,7 +249,7 @@ class StyleDualKVModule(nn.Module):
         # Style Value MoE Bottleneck Path (X -> num_experts x [r_payload] -> H * D_h)
         if self.num_experts > 1:
             self.v_router = nn.Linear(self.query_dim, num_experts, bias=False)
-            nn.init.normal_(self.v_router.weight, std=0.1)
+            nn.init.normal_(self.v_router.weight, std=0.01)
         else:
             self.v_router = None
 
@@ -275,8 +275,6 @@ class StyleDualKVModule(nn.Module):
     def apply_to(self):
         org = self.org_module[0]
         self.org_forward = [org.forward]
-        self.org_compute_qkv = [org.compute_qkv]
-        self.org_output_proj = [org.output_proj]
         org.forward = self.forward
 
     def forward(
@@ -289,79 +287,61 @@ class StyleDualKVModule(nn.Module):
     ) -> torch.Tensor:
         org_attn = self.org_module[0]
         org_forward_fn = self.org_forward[0]
-        org_compute_qkv_fn = self.org_compute_qkv[0]
-        org_output_proj_module = self.org_output_proj[0]
 
         if self.multiplier == 0.0:
             return org_forward_fn(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
 
-        captured_q = None
+        B, S, _ = x.shape
 
-        def hook_compute_qkv(*args, **kwargs):
-            nonlocal captured_q
-            q, k, v = org_compute_qkv_fn(*args, **kwargs)
-            captured_q = q
-            return q, k, v
+        # 1. Compute original q, k, v using frozen weights & RoPE
+        q, k_orig, v_orig = org_attn.compute_qkv(x, context, rope_emb=rope_emb)
 
-        def hook_output_proj(out_orig_flat):
-            nonlocal captured_q
-            B, S, _ = x.shape
+        # 2. Style K bottleneck (r_route)
+        k_style = self.k_up(self.k_down(x)).view(B, S, self.n_heads, self.head_dim)
 
-            # Style K bottleneck (r_route)
-            k_style = self.k_up(self.k_down(x)).view(B, S, self.n_heads, self.head_dim)
+        # 3. Style V MoE bottleneck (r_payload x num_experts)
+        if self.num_experts > 1:
+            router_logits = self.v_router(x)
+            gains = F.softmax(router_logits, dim=-1)
+            v_style_flat = torch.zeros((B, S, self.inner_dim), dtype=x.dtype, device=x.device)
+            for i in range(self.num_experts):
+                v_exp = self.v_up_experts[i](self.v_down_experts[i](x))
+                v_style_flat = v_style_flat + gains[:, :, i:i+1] * v_exp
+            v_style = v_style_flat.view(B, S, self.n_heads, self.head_dim)
+        else:
+            v_style = self.v_up_experts[0](self.v_down_experts[0](x)).view(B, S, self.n_heads, self.head_dim)
 
-            # Style V MoE bottleneck (r_payload x num_experts)
-            if self.num_experts > 1:
-                router_logits = self.v_router(x)
-                if self.training:
-                    router_logits = router_logits + torch.randn_like(router_logits) * 0.1
-                gains = F.softmax(router_logits, dim=-1)
-                v_style_flat = torch.zeros((B, S, self.inner_dim), dtype=x.dtype, device=x.device)
-                for i in range(self.num_experts):
-                    v_exp = self.v_up_experts[i](self.v_down_experts[i](x))
-                    v_style_flat = v_style_flat + gains[:, :, i:i+1] * v_exp
-                v_style = v_style_flat.view(B, S, self.n_heads, self.head_dim)
+        # Apply K-Norm for style keys
+        k_style = self.k_norm_style(k_style).to(dtype=q.dtype)
+
+        # Cast for attention if dtypes differ under autocast
+        if q.dtype != v_orig.dtype:
+            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                target_dtype = v_orig.dtype
+                q = q.to(target_dtype)
+                k_orig = k_orig.to(target_dtype)
+
+        if q.dtype != v_style.dtype:
+            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                target_dtype = v_style.dtype
+                q_style = q.to(target_dtype)
+                k_style = k_style.to(target_dtype)
             else:
-                v_style = self.v_up_experts[0](self.v_down_experts[0](x)).view(B, S, self.n_heads, self.head_dim)
+                q_style = q
+        else:
+            q_style = q
 
-            # Apply K-Norm for style keys
-            k_style = self.k_norm_style(k_style).to(dtype=captured_q.dtype)
+        # 4. Run attention for original path and style path
+        out_orig_flat = attention.attention([q, k_orig, v_orig], attn_params=attn_params)
+        out_style_flat = attention.attention([q_style, k_style, v_style], attn_params=attn_params)
 
-            # Cast for attention if dtypes differ under autocast
-            if captured_q.dtype != v_style.dtype:
-                if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
-                    target_dtype = v_style.dtype
-                    q_style = captured_q.to(target_dtype)
-                    k_style = k_style.to(target_dtype)
-                else:
-                    q_style = captured_q
-            else:
-                q_style = captured_q
+        # 5. Output projections: shared W0 + low-rank correction dW
+        style_projected = org_attn.output_proj(out_style_flat) + self.out_up(self.out_down(out_style_flat))
 
-            # Run style attention path using captured Q
-            out_style_flat = attention.attention([q_style, k_style, v_style], attn_params=attn_params)
+        # 6. Add style output to original attention output
+        total_out = org_attn.output_proj(out_orig_flat) + style_projected * self.multiplier
 
-            # Add style attention output to original attention output before shared W0 projection
-            out_combined_flat = out_orig_flat + out_style_flat * self.multiplier
-
-            # Shared W0 projection
-            shared_proj = org_output_proj_module(out_combined_flat)
-
-            # Separate low-rank correction term dW
-            dw_term = self.out_up(self.out_down(out_style_flat)) * self.multiplier
-
-            return shared_proj + dw_term
-
-        # Hook compute_qkv and output_proj during original forward pass
-        object.__setattr__(org_attn, "compute_qkv", hook_compute_qkv)
-        object.__setattr__(org_attn, "output_proj", hook_output_proj)
-        try:
-            y = org_forward_fn(x, attn_params=attn_params, context=context, rope_emb=rope_emb, **kwargs)
-        finally:
-            object.__setattr__(org_attn, "compute_qkv", org_compute_qkv_fn)
-            object.__setattr__(org_attn, "output_proj", org_output_proj_module)
-
-        return y
+        return org_attn.output_dropout(total_out)
 
 
 def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:

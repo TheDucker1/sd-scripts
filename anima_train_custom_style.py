@@ -249,7 +249,7 @@ class StyleDualKVModule(nn.Module):
         # Style Value MoE Bottleneck Path (X -> num_experts x [r_payload] -> H * D_h)
         if self.num_experts > 1:
             self.v_router = nn.Linear(self.query_dim, num_experts, bias=False)
-            nn.init.normal_(self.v_router.weight, std=0.01)
+            nn.init.normal_(self.v_router.weight, std=0.1)
         else:
             self.v_router = None
 
@@ -313,6 +313,8 @@ class StyleDualKVModule(nn.Module):
             # Style V MoE bottleneck (r_payload x num_experts)
             if self.num_experts > 1:
                 router_logits = self.v_router(x)
+                if self.training:
+                    router_logits = router_logits + torch.randn_like(router_logits) * 0.1
                 gains = F.softmax(router_logits, dim=-1)
                 v_style_flat = torch.zeros((B, S, self.inner_dim), dtype=x.dtype, device=x.device)
                 for i in range(self.num_experts):

@@ -243,13 +243,13 @@ class StyleDualKVModule(nn.Module):
         # Style Key Bottleneck Path (X -> r_route -> H * D_h)
         self.k_down = nn.Linear(self.query_dim, r_route, bias=False)
         self.k_up = nn.Linear(r_route, self.inner_dim, bias=False)
-        nn.init.normal_(self.k_down.weight, std=0.01)
-        nn.init.normal_(self.k_up.weight, std=0.02)
+        nn.init.kaiming_uniform_(self.k_down.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.k_up.weight, a=math.sqrt(5))
 
         # Style Value MoE Bottleneck Path (X -> num_experts x [r_payload] -> H * D_h)
         if self.num_experts > 1:
             self.v_router = nn.Linear(self.query_dim, num_experts, bias=False)
-            nn.init.normal_(self.v_router.weight, std=0.01)
+            nn.init.kaiming_uniform_(self.v_router.weight, a=math.sqrt(5))
         else:
             self.v_router = None
 
@@ -260,13 +260,13 @@ class StyleDualKVModule(nn.Module):
             nn.Linear(r_payload, self.inner_dim, bias=False) for _ in range(num_experts)
         ])
         for v_down, v_up in zip(self.v_down_experts, self.v_up_experts):
-            nn.init.normal_(v_down.weight, std=0.01)
+            nn.init.kaiming_uniform_(v_down.weight, a=math.sqrt(5))
             nn.init.zeros_(v_up.weight)
 
         # Low-rank output projection correction dW (inner_dim -> r_out -> query_dim)
         self.out_down = nn.Linear(self.inner_dim, r_out, bias=False)
         self.out_up = nn.Linear(r_out, self.query_dim, bias=False)
-        nn.init.normal_(self.out_down.weight, std=0.01)
+        nn.init.kaiming_uniform_(self.out_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.out_up.weight)
 
         # K-Norm for style keys

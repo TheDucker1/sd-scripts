@@ -269,6 +269,9 @@ class StyleDualKVModule(nn.Module):
         nn.init.kaiming_uniform_(self.out_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.out_up.weight)
 
+        # Input feature norm for prompt-length scale-invariant projections
+        self.input_norm = RMSNorm(self.query_dim, eps=1e-6)
+
         # K-Norm for style keys
         self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
 
@@ -296,20 +299,23 @@ class StyleDualKVModule(nn.Module):
         # 1. Compute original q, k, v using frozen weights & RoPE
         q, k_orig, v_orig = org_attn.compute_qkv(x, context, rope_emb=rope_emb)
 
+        # Standardize input latents to make style projections scale-invariant to text prompt length
+        x_norm = self.input_norm(x)
+
         # 2. Style K bottleneck (r_route)
-        k_style = self.k_up(self.k_down(x)).view(B, S, self.n_heads, self.head_dim)
+        k_style = self.k_up(self.k_down(x_norm)).view(B, S, self.n_heads, self.head_dim)
 
         # 3. Style V MoE bottleneck (r_payload x num_experts)
         if self.num_experts > 1:
-            router_logits = self.v_router(x)
+            router_logits = self.v_router(x_norm)
             gains = F.softmax(router_logits, dim=-1)
             v_style_flat = torch.zeros((B, S, self.inner_dim), dtype=x.dtype, device=x.device)
             for i in range(self.num_experts):
-                v_exp = self.v_up_experts[i](self.v_down_experts[i](x))
+                v_exp = self.v_up_experts[i](self.v_down_experts[i](x_norm))
                 v_style_flat = v_style_flat + gains[:, :, i:i+1] * v_exp
             v_style = v_style_flat.view(B, S, self.n_heads, self.head_dim)
         else:
-            v_style = self.v_up_experts[0](self.v_down_experts[0](x)).view(B, S, self.n_heads, self.head_dim)
+            v_style = self.v_up_experts[0](self.v_down_experts[0](x_norm)).view(B, S, self.n_heads, self.head_dim)
 
         # Apply K-Norm for style keys
         k_style = self.k_norm_style(k_style).to(dtype=q.dtype)

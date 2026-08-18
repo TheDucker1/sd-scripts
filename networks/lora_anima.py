@@ -245,10 +245,12 @@ def create_network(
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is None:
         exclude_patterns = []
-    else:
+    elif isinstance(exclude_patterns, str):
         exclude_patterns = ast.literal_eval(exclude_patterns)
         if not isinstance(exclude_patterns, list):
             exclude_patterns = [exclude_patterns]
+    elif not isinstance(exclude_patterns, list):
+        exclude_patterns = list(exclude_patterns)
 
     # add default exclude patterns
     exclude_patterns.append(r".*(_modulation|_norm|_embedder|final_layer).*")
@@ -256,7 +258,8 @@ def create_network(
     # regular expression for module selection: exclude and include
     include_patterns = kwargs.get("include_patterns", None)
     if include_patterns is not None:
-        include_patterns = ast.literal_eval(include_patterns)
+        if isinstance(include_patterns, str):
+            include_patterns = ast.literal_eval(include_patterns)
         if not isinstance(include_patterns, list):
             include_patterns = [include_patterns]
 

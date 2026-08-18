@@ -125,6 +125,12 @@ def conditional_loss(
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
+    elif loss_type in ["cossim", "cosine"]:
+        loss = -torch.nn.functional.cosine_similarity(model_pred, target, dim=-1)
+        if reduction == "mean":
+            loss = torch.mean(loss)
+        elif reduction == "sum":
+            loss = torch.sum(loss)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     return loss

@@ -519,8 +519,8 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--loss_type",
         type=str,
         default="l2",
-        choices=["l1", "l2", "huber", "smooth_l1"],
-        help="The type of loss function to use (L1, L2, Huber, or smooth L1), default is L2 / 使用する損失関数の種類（L1、L2、Huber、またはsmooth L1）、デフォルトはL2",
+        choices=["l1", "l2", "huber", "smooth_l1", "cossim", "cosine"],
+        help="The type of loss function to use (L1, L2, Huber, smooth L1, cossim/cosine), default is L2",
     )
     parser.add_argument(
         "--huber_schedule",

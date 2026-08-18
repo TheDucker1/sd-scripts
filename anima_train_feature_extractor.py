@@ -188,7 +188,7 @@ class AnimaFeatureExtractorTrainer(train_network.NetworkTrainer):
             mapping_width=args.adapter_width,
             mapping_d_ff=args.adapter_d_ff,
             adapter_depth=args.adapter_depth,
-            adapter_ffn_expansion=1.0,
+            adapter_ffn_expansion=args.adapter_ffn_expansion,
             adapter_norm_type="AdaRMS",
             adapter_use_gating=True,
             dropout=0.0,
@@ -593,7 +593,15 @@ class AnimaFeatureExtractorTrainer(train_network.NetworkTrainer):
 
         # Combine into single bundled state dict
         combined_sd = {}
-        target_dtype = save_dtype or torch.float32
+        if save_dtype is not None:
+            target_dtype = save_dtype
+        elif getattr(args, "mixed_precision", None) == "bf16":
+            target_dtype = torch.bfloat16
+        elif getattr(args, "mixed_precision", None) == "fp16":
+            target_dtype = torch.float16
+        else:
+            target_dtype = torch.float32
+
         for k, v in lora_sd.items():
             combined_sd[k] = v.detach().clone().to("cpu").to(target_dtype)
         for k, v in adapter_sd.items():
@@ -687,14 +695,20 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adapter_depth",
         type=int,
-        default=2,
-        help="Depth of projection FFN adapter per block (default: 2).",
+        default=3,
+        help="Depth of projection FFN adapter per block (default: 3, matching CleanDIFT).",
     )
     parser.add_argument(
         "--adapter_width",
         type=int,
         default=256,
         help="Width of timestep embedding & mapping network (default: 256).",
+    )
+    parser.add_argument(
+        "--adapter_ffn_expansion",
+        type=float,
+        default=1.0,
+        help="FFN expansion ratio for projection adapter layers (e.g. 1.0, 0.5, 0.25; default: 1.0).",
     )
     parser.add_argument(
         "--adapter_d_ff",

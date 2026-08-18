@@ -214,7 +214,7 @@ class AnimaFeatureProjectionNetwork(nn.Module):
         mapping_depth: int = 2,
         mapping_width: int = 256,
         mapping_d_ff: int = 768,
-        adapter_depth: int = 2,
+        adapter_depth: int = 3,
         adapter_ffn_expansion: float = 1.0,
         adapter_norm_type: str = "AdaRMS",
         adapter_use_gating: bool = True,

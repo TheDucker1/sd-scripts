@@ -42,7 +42,7 @@ from library.config_util import ConfigSanitizer, BlueprintGenerator
 from library.style_dataset_custom import StyleControlNetDataset
 from library.train_util import DatasetGroup
 from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
-from library.utils import setup_logging, add_logging_arguments
+from library.utils import setup_logging, add_logging_arguments, load_image, resize_image
 
 import networks.control_net_lllite_anima_custom as lllite_module
 from networks.control_net_lllite_anima_custom import (
@@ -78,7 +78,7 @@ def custom_controlnet_dataset_getitem(self, index):
     for i, image_key in enumerate(bucket[image_index : image_index + bucket_batch_size]):
         image_info = self.dreambooth_dataset_delegate.image_data[image_key]
         flipped = example["flippeds"][i]
-        cond_img = train_util.load_image(image_info.cond_img_path)
+        cond_img = load_image(image_info.cond_img_path)
 
         h_orig, w_orig = cond_img.shape[0], cond_img.shape[1]
         pixels = h_orig * w_orig
@@ -93,7 +93,7 @@ def custom_controlnet_dataset_getitem(self, index):
             h_new = max(64, h_orig - h_orig % 16)
 
         if w_new != w_orig or h_new != h_orig:
-            cond_img = train_util.resize_image(
+            cond_img = resize_image(
                 cond_img,
                 w_orig,
                 h_orig,
@@ -200,8 +200,8 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--lllite_mlp_dim",
         type=int,
-        default=64,
-        help="LLLite MLP (LoRA-rank-like) hidden dim / LLLite の中間次元 (default: 64)",
+        default=32,
+        help="LLLite MLP (LoRA-rank-like) hidden dim / LLLite の中間次元 (default: 32)",
     )
     parser.add_argument(
         "--lllite_target_layers",
@@ -213,23 +213,6 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
             f"presets: {list(LLLITE_PRESETS)}, atomic: {list(LLLITE_ATOMIC_SPECIFIERS)}. "
             "default: self_attn_kv_pre"
         ),
-    )
-    parser.add_argument(
-        "--lllite_cond_dim",
-        type=int,
-        default=64,
-        help="conditioning1 trunk channel width / conditioning1 内部の中間チャネル幅 (default: 64)",
-    )
-    parser.add_argument(
-        "--lllite_cond_resblocks",
-        type=int,
-        default=1,
-        help="number of ResBlocks in conditioning1 / conditioning1 の ResBlock 段数 (default: 1)",
-    )
-    parser.add_argument(
-        "--lllite_use_aspp",
-        action="store_true",
-        help="enable ASPP (Atrous Spatial Pyramid Pooling) at the end of conditioning1 / conditioning1 末尾に ASPP を挿入",
     )
     parser.add_argument(
         "--lllite_dropout",
@@ -248,12 +231,6 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         type=str,
         default=None,
         help="pretrained LLLite weights to resume from / 学習を再開する LLLite の初期重み",
-    )
-    parser.add_argument(
-        "--num_style_tokens",
-        type=int,
-        default=64,
-        help="number of style query tokens for Resampler / Resampler のスタイルクエリトークン数 (default: 64)",
     )
     parser.add_argument(
         "--lllite_target_blocks",
@@ -618,13 +595,8 @@ def train(args):
         dit,
         cond_emb_dim=args.cond_emb_dim,
         mlp_dim=args.lllite_mlp_dim,
-        target_layers=args.lllite_target_layers,
         dropout=args.lllite_dropout,
         multiplier=args.lllite_multiplier,
-        cond_dim=args.lllite_cond_dim,
-        cond_resblocks=args.lllite_cond_resblocks,
-        use_aspp=args.lllite_use_aspp,
-        num_style_tokens=args.num_style_tokens,
         target_blocks=args.lllite_target_blocks,
     )
 
@@ -773,15 +745,10 @@ def train(args):
         sai_metadata["modelspec.architecture"] = "anima-preview/control-net-lllite-decoupled"
         sai_metadata["lllite.version"] = LLLITE_ARCH_VERSION
         sai_metadata["lllite.cond_emb_dim"] = str(args.cond_emb_dim)
-        sai_metadata["lllite.num_style_tokens"] = str(args.num_style_tokens)
-        sai_metadata["lllite.cond_dim"] = str(args.lllite_cond_dim)
-        sai_metadata["lllite.cond_resblocks"] = str(args.lllite_cond_resblocks)
-        sai_metadata["lllite.use_aspp"] = "true" if args.lllite_use_aspp else "false"
+        sai_metadata["lllite.num_style_tokens"] = "1"
         if args.lllite_target_blocks is not None:
             sai_metadata["lllite.target_blocks"] = str(args.lllite_target_blocks)
         unwrapped = accelerator.unwrap_model(wrapper).lllite
-        if args.lllite_use_aspp:
-            sai_metadata["lllite.aspp_dilations"] = ",".join(str(d) for d in unwrapped.aspp_dilations)
         save_lllite_model(ckpt_file, unwrapped, dtype=save_dtype, metadata=sai_metadata)
 
     def _save_step(global_step_: int, epoch_: int):
@@ -964,6 +931,9 @@ def train(args):
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             progress_bar.set_postfix(**{"avr_loss": avr_loss})
+
+            # Clean up step tensors to prevent VRAM climbing and memory leaks
+            del loss, model_pred, noisy_model_input, noise, latents, cond_image
 
             if global_step >= args.max_train_steps:
                 break

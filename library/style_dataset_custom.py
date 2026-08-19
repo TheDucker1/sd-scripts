@@ -13,7 +13,7 @@ from accelerate import Accelerator
 
 logger = logging.getLogger(__name__)
 
-class StyleControlNetDataset(BaseDataset):
+class StyleControlNetDataset(DreamBoothDataset):
     def __init__(
         self,
         root_dir: str,
@@ -50,7 +50,8 @@ class StyleControlNetDataset(BaseDataset):
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
     ) -> None:
-        super().__init__(
+        BaseDataset.__init__(
+            self,
             resolution,
             network_multiplier,
             train_inpainting,

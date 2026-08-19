@@ -24,67 +24,42 @@ from networks.control_net_lllite_anima import (
 )
 
 
-class StyleQueryResampler(nn.Module):
-    """Q-Former/Perceiver-style Resampler.
-    Maps variable-length dense vision patches from frozen ViT to a fixed set of trainable style query tokens.
-    """
+class StyleTokenExtractor(nn.Module):
+    """LLM-style next-token predictor to extract a single style token from patch sequence."""
 
-    def __init__(self, num_queries: int, vit_hidden_size: int, cond_emb_dim: int, num_heads: int = 4):
+    def __init__(self, vit_hidden_size: int, cond_emb_dim: int):
         super().__init__()
-        self.num_queries = num_queries
-        self.cond_emb_dim = cond_emb_dim
-        self.num_heads = num_heads
+        self.style_query = nn.Parameter(torch.zeros(1, 1, vit_hidden_size))
+        nn.init.normal_(self.style_query, std=0.02)
+        
+        self.self_attn = nn.MultiheadAttention(embed_dim=vit_hidden_size, num_heads=4, batch_first=True)
+        self.norm1 = nn.LayerNorm(vit_hidden_size)
+        self.norm2 = nn.LayerNorm(vit_hidden_size)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(vit_hidden_size, vit_hidden_size),
+            nn.GELU(),
+            nn.Linear(vit_hidden_size, cond_emb_dim),
+        )
 
-        # Trainable style queries
-        self.queries = nn.Parameter(torch.zeros(num_queries, cond_emb_dim))
-        nn.init.normal_(self.queries, std=0.02)
-
-        # Cross-Attention projections (Q from queries, K/V from ViT)
-        self.q_proj = nn.Linear(cond_emb_dim, cond_emb_dim)
-        self.k_proj = nn.Linear(vit_hidden_size, cond_emb_dim)
-        self.v_proj = nn.Linear(vit_hidden_size, cond_emb_dim)
-
-        self.out_proj = nn.Linear(cond_emb_dim, cond_emb_dim)
-        self.norm = nn.LayerNorm(cond_emb_dim)
-
-    def forward(self, vit_embeds: torch.Tensor) -> torch.Tensor:
-        # vit_embeds: (B, S_cond, vit_hidden_size)
-        B = vit_embeds.shape[0]
-
-        # Expand trainable style queries to batch dimension
-        # q_embeds: (B, num_queries, cond_emb_dim)
-        q_embeds = self.queries.unsqueeze(0).repeat(B, 1, 1)
-
-        # Multi-head projection
-        # Q: (B, num_queries, cond_emb_dim)
-        # K, V: (B, S_cond, cond_emb_dim)
-        Q = self.q_proj(q_embeds)
-        K = self.k_proj(vit_embeds)
-        V = self.v_proj(vit_embeds)
-
-        # Split heads
-        # Q: (B * num_heads, num_queries, head_dim)
-        # K, V: (B * num_heads, S_cond, head_dim)
-        d_head = self.cond_emb_dim // self.num_heads
-        Q = Q.view(B, self.num_queries, self.num_heads, d_head).transpose(1, 2).reshape(B * self.num_heads, self.num_queries, d_head)
-        K = K.view(B, -1, self.num_heads, d_head).transpose(1, 2).reshape(B * self.num_heads, -1, d_head)
-        V = V.view(B, -1, self.num_heads, d_head).transpose(1, 2).reshape(B * self.num_heads, -1, d_head)
-
-        # Compute dot-product attention
-        scores = torch.bmm(Q, K.transpose(1, 2)) * (d_head ** -0.5)
-        attn_weights = F.softmax(scores, dim=-1)
-
-        # Attention output: (B * num_heads, num_queries, head_dim)
-        attn_out = torch.bmm(attn_weights, V)
-
-        # Re-merge heads
-        # attn_out: (B, num_queries, cond_emb_dim)
-        attn_out = attn_out.view(B, self.num_heads, self.num_queries, d_head).transpose(1, 2).reshape(B, self.num_queries, self.cond_emb_dim)
-
-        # Feed-forward project and norm with residual connection
-        cx = self.out_proj(attn_out)
-        cx = self.norm(cx + q_embeds)
-        return cx
+    def forward(self, cls_token: torch.Tensor, patch_tokens: torch.Tensor) -> torch.Tensor:
+        B = cls_token.shape[0]
+        # Repeat style query parameter to batch dimension, aligning device and dtype
+        query = self.style_query.expand(B, -1, -1).to(device=cls_token.device, dtype=cls_token.dtype)  # (B, 1, vit_hidden_size)
+        
+        # Concatenate: [cls] [patches] [query]
+        seq = torch.cat([cls_token, patch_tokens, query], dim=1)  # (B, 1 + S_patches + 1, vit_hidden_size)
+        
+        # Self-attention over the sequence
+        attn_out, _ = self.self_attn(seq, seq, seq)
+        seq = self.norm1(seq + attn_out)
+        
+        # Extract the last token (the style query)
+        style_token_raw = seq[:, -1, :]  # (B, vit_hidden_size)
+        
+        # Project to cond_emb_dim
+        style_token = self.mlp(style_token_raw)  # (B, cond_emb_dim)
+        return style_token.unsqueeze(1)  # (B, 1, cond_emb_dim)
 
 
 class FrozenViTDecoupledConditioning(nn.Module):
@@ -97,9 +72,9 @@ class FrozenViTDecoupledConditioning(nn.Module):
         self.image_encoder.requires_grad_(False)
         self.image_encoder.eval()
 
-    def forward(self, cond_image: torch.Tensor) -> torch.Tensor:
+    def forward(self, cond_image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         self.image_encoder.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             # Convert input [-1, 1] (standard loader format) to [0, 1]
             img_01 = (cond_image + 1.0) / 2.0
             
@@ -110,18 +85,11 @@ class FrozenViTDecoupledConditioning(nn.Module):
 
             # Pass through pre-trained vision backbone
             outputs = self.image_encoder(pixel_values=pixel_values)
-            # outputs.last_hidden_state: (B, S_cond, vit_hidden_size)
-            # Drop CLS token (index 0) and 4 register tokens (indices 1-4) to isolate local spatial patches
-            vit_embeds = outputs.last_hidden_state[:, 5:, :]
+            # Extract CLS token and spatial patches, removing randperm entirely
+            cls_token = outputs.last_hidden_state[:, 0:1, :]
+            patch_tokens = outputs.last_hidden_state[:, 5:, :]
 
-            # 2. Shuffle spatial patches along sequence dimension during training
-            if self.training:
-                B, S_patches, D_vit = vit_embeds.shape
-                # Scramble each batch item independently to completely shatter layout structures
-                perms = [torch.randperm(S_patches, device=vit_embeds.device) for _ in range(B)]
-                vit_embeds = torch.stack([vit_embeds[i, perms[i], :] for i in range(B)], dim=0)
-
-        return vit_embeds
+        return cls_token, patch_tokens
 
 
 class RMSNorm(nn.Module):
@@ -137,17 +105,17 @@ class RMSNorm(nn.Module):
 
 
 class LLLiteModuleDiT(nn.Module):
-    """Dual attention path implementation for style control using a decoupled style token stream (IP-Adapter style)
-    with layer-specific cross-attention resampler."""
+    """Dual attention path implementation for style control using a low-rank bottlenecked
+    cross-attention against a single global style token."""
 
     def __init__(
         self,
         name: str,
         org_module: nn.Module,  # Attention module
         cond_emb_dim: int,
-        mlp_dim: int,           # LoRA rank
+        mlp_dim: int,           # Bottleneck rank dimension
         vit_hidden_size: int,
-        num_style_tokens: int,
+        num_style_tokens: int,  # Unused, kept for CLI arg compatibility
         dropout: Optional[float] = None,
         multiplier: float = 1.0,
         attn_dim: Optional[int] = None,
@@ -156,6 +124,7 @@ class LLLiteModuleDiT(nn.Module):
         self.lllite_name = name
         self.org_module = [org_module]
         self.cond_emb_dim = cond_emb_dim
+        self.mlp_dim = mlp_dim
         self.dropout = dropout
         self.multiplier = multiplier
 
@@ -166,28 +135,24 @@ class LLLiteModuleDiT(nn.Module):
         self.context_dim = getattr(org_module, "context_dim", self.query_dim)
         self.inner_dim = self.n_heads * self.head_dim
 
-        # Layer-specific Style Query Resampler
-        self.resampler = StyleQueryResampler(
-            num_queries=num_style_tokens,
-            vit_hidden_size=vit_hidden_size,
-            cond_emb_dim=cond_emb_dim,
-            num_heads=4,
-        )
+        # Bottleneck projection for queries (per-head: head_dim -> mlp_dim)
+        self.q_down_proj_weight = nn.Parameter(torch.zeros(self.n_heads, self.head_dim, mlp_dim))
+        nn.init.normal_(self.q_down_proj_weight, std=0.01)
 
-        # Projections for style keys/values from style tokens (after resampler)
-        self.k_style = nn.Linear(cond_emb_dim, self.inner_dim, bias=False)
-        self.v_style = nn.Linear(cond_emb_dim, self.inner_dim, bias=False)
+        # Projections for style keys/values from the single style token in the bottleneck space
+        self.k_style = nn.Linear(cond_emb_dim, self.n_heads * mlp_dim, bias=False)
+        self.v_style = nn.Linear(cond_emb_dim, self.n_heads * mlp_dim, bias=False)
+        nn.init.normal_(self.k_style.weight, std=0.02)
+        nn.init.normal_(self.v_style.weight, std=0.02)
         
-        # Style QK-norm
-        self.k_norm_style = RMSNorm(self.head_dim, eps=1e-6)
+        # Style key norm in the bottleneck space
+        self.k_norm_style = RMSNorm(mlp_dim, eps=1e-6)
 
-        # Output projection back to query_dim (bottlenecked using LoRA style)
-        self.out_proj_down = nn.Linear(self.inner_dim, mlp_dim, bias=False)
-        self.out_proj_up = nn.Linear(mlp_dim, self.query_dim, bias=False)
-        nn.init.normal_(self.out_proj_down.weight, std=1.0 / math.sqrt(self.inner_dim))
+        # Output projection back to query_dim (zero-initialized for stability)
+        self.out_proj_up = nn.Linear(self.n_heads * mlp_dim, self.query_dim, bias=False)
         nn.init.zeros_(self.out_proj_up.weight)
 
-        # Stored conditioning embeddings sequence (B, N_queries, cond_emb_dim)
+        # Stored single style token (B, 1, cond_emb_dim)
         self.vit_embeds: Optional[torch.Tensor] = None
 
     def apply_to(self):
@@ -208,8 +173,7 @@ class LLLiteModuleDiT(nn.Module):
         if self.multiplier == 0.0 or self.vit_embeds is None:
             return y
 
-        # Run layer-specific resampler to map vit_embeds to layer style tokens
-        cx = self.resampler(self.vit_embeds)  # (B, num_style_tokens, cond_emb_dim)
+        cx = self.vit_embeds  # Single style token of shape (B, 1, cond_emb_dim)
 
         # CFG support
         if y.shape[0] // 2 == cx.shape[0]:
@@ -226,33 +190,34 @@ class LLLiteModuleDiT(nn.Module):
             from library.anima_models import apply_rotary_pos_emb
             q = apply_rotary_pos_emb(q, rope_emb, tensor_format=org.qkv_format, fused=False)
 
-        # 2. Project style tokens to key and value spaces
-        k_style = self.k_style(cx)  # (B, num_queries, inner_dim)
-        v_style = self.v_style(cx)  # (B, num_queries, inner_dim)
+        # Bottleneck the query: (B, S, H, rank)
+        q_bottleneck = torch.einsum("bshd,hdr->bshr", q, self.q_down_proj_weight.to(q))
 
-        # Rearrange to (B, num_queries, H, D)
-        k_style = k_style.view(k_style.shape[0], k_style.shape[1], self.n_heads, self.head_dim)
-        v_style = v_style.view(v_style.shape[0], v_style.shape[1], self.n_heads, self.head_dim)
+        # Project style token to key and value spaces in the bottleneck space: (B, 1, H * mlp_dim)
+        k_style = self.k_style(cx)
+        v_style = self.v_style(cx)
+
+        # Rearrange to (B, 1, H, rank)
+        k_style = k_style.view(k_style.shape[0], 1, self.n_heads, self.mlp_dim)
+        v_style = v_style.view(v_style.shape[0], 1, self.n_heads, self.mlp_dim)
 
         # Apply style key norm
         k_style = self.k_norm_style(k_style)
 
-        # 3. Transpose to align heads: (B, H, S, D) and (B, H, num_queries, D)
-        q_h = q.transpose(1, 2)
+        # Transpose to align heads: (B, H, S, rank) and (B, H, 1, rank)
+        q_h = q_bottleneck.transpose(1, 2)
         k_h = k_style.transpose(1, 2)
         v_h = v_style.transpose(1, 2)
 
-        # Compute multi-head attention scores: (B, H, S, num_queries)
-        scores = torch.matmul(q_h, k_h.transpose(-1, -2)) * (self.head_dim ** -0.5)
+        # Compute multi-head attention scores: (B, H, S, 1)
+        scores = torch.matmul(q_h, k_h.transpose(-1, -2)) * (self.mlp_dim ** -0.5)
         attn_weights = F.softmax(scores, dim=-1)
 
-        # Optimize projection by projecting V before multiplying with attn_weights:
-        # V is (B, H, N, D), out_proj_down weight is (mlp_dim, H * D) which we reshape to (mlp_dim, H, D)
-        W_down = self.out_proj_down.weight.view(self.out_proj_down.out_features, self.n_heads, self.head_dim)
-        v_proj = torch.einsum("bhnd,rhd->bhnr", v_h, W_down)
+        # Compute head-wise attention output: (B, H, S, rank)
+        out_style_h = attn_weights * v_h
 
-        # Compute head-summed attention output: (B, S, mlp_dim)
-        out_style = torch.einsum("bhsn,bhnr->bsr", attn_weights, v_proj)
+        # Flatten heads to shape: (B, S, H * rank)
+        out_style = out_style_h.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)
 
         if self.dropout is not None and self.training:
             out_style = F.dropout(out_style, p=self.dropout)
@@ -296,24 +261,19 @@ def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
 
 class DecoupledControlNetLLLiteDiT(nn.Module):
     """Anima DiT using Dynamic Cross-Attention ControlNet-LLLite.
-    Completely decoupled from conditioning resolution using a frozen DINOv3 ViT backbone.
+    Completely decoupled from conditioning resolution using a frozen DINOv3 ViT backbone
+    and global next-token StyleTokenExtractor.
     """
 
     def __init__(
         self,
         dit: nn.Module,
         cond_emb_dim: int = 32,
-        mlp_dim: int = 64,
-        target_layers: str = "self_attn_kv_pre",  # Kept in signature for script compatibility but ignored
+        mlp_dim: int = 32,
         dropout: Optional[float] = None,
         multiplier: float = 1.0,
-        cond_dim: int = 64,  # Ignored, kept for CLI arg compatibility
-        cond_resblocks: int = 1,  # Ignored, kept for CLI arg compatibility
-        use_aspp: bool = False,  # Ignored, kept for CLI arg compatibility
-        aspp_dilations: Tuple[int, ...] = ASPP_DEFAULT_DILATIONS,  # Ignored
         attn_dim: Optional[int] = None,
         vit_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
-        num_style_tokens: int = 64,
         target_blocks: Optional[str] = None,
     ):
         super().__init__()
@@ -325,12 +285,8 @@ class DecoupledControlNetLLLiteDiT(nn.Module):
         self.target_atomics = ("self_attn_kv_pre",)
         self.dropout = dropout
         self.multiplier = multiplier
-        self.cond_dim = cond_dim
-        self.cond_resblocks = cond_resblocks
-        self.use_aspp = use_aspp
-        self.aspp_dilations = tuple(aspp_dilations) if use_aspp else ()
         self.attn_dim = attn_dim
-        self.num_style_tokens = num_style_tokens
+        self.num_style_tokens = 1
         self.target_blocks = target_blocks
 
         # Frozen ViT conditioning backbone (returns raw patch embeddings)
@@ -339,16 +295,22 @@ class DecoupledControlNetLLLiteDiT(nn.Module):
         )
         vit_hidden_size = self.conditioning1.image_encoder.config.hidden_size
 
+        # StyleTokenExtractor (LLM-style next-token predictor)
+        self.style_extractor = StyleTokenExtractor(
+            vit_hidden_size=vit_hidden_size,
+            cond_emb_dim=cond_emb_dim,
+        )
+
         parsed_blocks = parse_block_selection(target_blocks)
         modules = self._create_modules(
-            dit, cond_emb_dim, mlp_dim, vit_hidden_size, num_style_tokens, dropout, multiplier, attn_dim, target_blocks=parsed_blocks
+            dit, cond_emb_dim, mlp_dim, vit_hidden_size, 1, dropout, multiplier, attn_dim, target_blocks=parsed_blocks
         )
         self.lllite_modules = nn.ModuleList(modules)
 
         logger.info(
             f"ControlNet-LLLite (Anima Decoupled Style Resampler v{LLLITE_ARCH_VERSION}): created {len(self.lllite_modules)} modules for "
             f"target={self.target_layers!r} (atomics={list(self.target_atomics)}), target_blocks={target_blocks!r}, "
-            f"DINOv3 vision backbone={vit_model_name}, num_style_tokens={num_style_tokens}, "
+            f"DINOv3 vision backbone={vit_model_name}, num_style_tokens=1, "
             f"cond_emb_dim={cond_emb_dim}, mlp_dim={mlp_dim}"
         )
 
@@ -408,10 +370,14 @@ class DecoupledControlNetLLLiteDiT(nn.Module):
             for m in self.lllite_modules:
                 m.vit_embeds = None
             return
-        # Run frozen vision backbone once to extract spatial patches
-        vit_embeds = self.conditioning1(cond_image)  # (B, S_cond, vit_hidden_size)
+        # Run frozen vision backbone once to extract CLS and patches
+        cls_token, patch_tokens = self.conditioning1(cond_image)  # (B, 1, vit_hidden_size), (B, S_patches, vit_hidden_size)
+        
+        # Predict the single style token
+        style_token = self.style_extractor(cls_token, patch_tokens)  # (B, 1, cond_emb_dim)
+        
         for m in self.lllite_modules:
-            m.vit_embeds = vit_embeds
+            m.vit_embeds = style_token
 
     def clear_cond_image(self):
         self.set_cond_image(None)
@@ -433,6 +399,12 @@ class DecoupledAnimaControlNetLLLiteWrapper(nn.Module):
         super().__init__()
         self.dit = dit
         self.lllite = lllite
+
+    def state_dict(self, destination=None, prefix="", keep_vars=False):
+        return self.lllite.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+    def load_state_dict(self, state_dict, strict=True):
+        return self.lllite.load_state_dict(state_dict, strict=strict)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -636,25 +608,17 @@ if __name__ == "__main__":
     dim = 64
     dit = _DummyDiT(num_blocks=2, dim=dim)
     
-    num_style_tokens = 32
     lllite = DecoupledControlNetLLLiteDiT(
         dit,
         cond_emb_dim=32,
-        mlp_dim=64,
-        target_layers="self_attn_kv_pre",
-        cond_dim=64,
-        cond_resblocks=1,
-        use_aspp=True,
-        num_style_tokens=num_style_tokens,
+        mlp_dim=32,
     )
 
     # Test target_blocks parameter
     lllite_filtered = DecoupledControlNetLLLiteDiT(
         dit,
         cond_emb_dim=32,
-        mlp_dim=64,
-        target_layers="self_attn_kv_pre",
-        num_style_tokens=num_style_tokens,
+        mlp_dim=32,
         target_blocks="1",
     )
     assert len(lllite_filtered.lllite_modules) == 1, f"Expected 1 module under block index filter, got {len(lllite_filtered.lllite_modules)}"
@@ -670,7 +634,7 @@ if __name__ == "__main__":
 
     logger.info(f"Target Latent Size: {H_target}x{W_target}")
     logger.info(f"Conditioning Image Size: {H_cond}x{W_cond}")
-    logger.info(f"Testing with learnable style token count: {num_style_tokens}")
+    logger.info("Testing with learnable style token count: 1")
 
     x_in = torch.randn(B, dim, 1, H_target, W_target)
     timesteps = torch.randn(B)
@@ -689,33 +653,39 @@ if __name__ == "__main__":
     lllite.eval()
     y_active_eval = wrapper(x_in, timesteps, context, cond_image=cond_image)
     
-    # Assert that internal conditioning features have exactly num_style_tokens sequence length inside each module
+    # Assert that internal conditioning features have exactly 1 sequence length inside each module
     for idx, m in enumerate(lllite.lllite_modules):
-        cx_out = m.resampler(m.vit_embeds)
-        assert cx_out.shape == (B, num_style_tokens, lllite.cond_emb_dim), f"Module {idx} Cond embeddings shape mismatch: {cx_out.shape}"
-    logger.info(f"  Verified exact conditioning sequence length is {num_style_tokens} per layer: PASSED")
-    logger.info("  Free-dimension DINOv3 dynamic resampler inference forward pass: PASSED")
+        cx_out = m.vit_embeds
+        assert cx_out.shape == (B, 1, lllite.cond_emb_dim), f"Module {idx} Cond embeddings shape mismatch: {cx_out.shape}"
+    logger.info("  Verified exact conditioning sequence length is 1 per layer: PASSED")
+    logger.info("  Free-dimension DINOv3 style predictor inference forward pass: PASSED")
 
-    # Dynamic cross-attention forward pass in training mode (Shuffling active)
+    # Dynamic cross-attention forward pass in training mode
     lllite.train()
     y_active_train = wrapper(x_in, timesteps, context, cond_image=cond_image)
-    logger.info("  Free-dimension DINOv3 dynamic resampler training forward pass (scrambling active): PASSED")
+    logger.info("  Free-dimension DINOv3 style predictor training forward pass: PASSED")
+
+    # Test state_dict delegation
+    sd = wrapper.state_dict()
+    assert any(k.startswith("lllite_modules.") for k in sd.keys()), "wrapper state_dict missing lllite keys"
+    assert not any(k.startswith("dit.") for k in sd.keys()), "wrapper state_dict leaked frozen DiT parameters"
+    logger.info("  Wrapper state_dict delegation check: PASSED")
 
     # 3. Test backpropagation gradient flow
     # Patch dummy backprop
     y_dummy_kv = lllite.lllite_modules[0](torch.randn(B, H_target*W_target, dim))
     y_dummy_kv.sum().backward()
     
-    grad_queries = lllite.lllite_modules[0].resampler.queries.grad
-    grad_q_proj = lllite.lllite_modules[0].resampler.q_proj.weight.grad
+    grad_style_query = lllite.style_extractor.style_query.grad
+    grad_self_attn = lllite.style_extractor.self_attn.in_proj_weight.grad
     grad_k_style = lllite.lllite_modules[0].k_style.weight.grad
-    grad_out_proj_down = lllite.lllite_modules[0].out_proj_down.weight.grad
+    grad_q_down_proj_weight = lllite.lllite_modules[0].q_down_proj_weight.grad
     grad_out_proj_up = lllite.lllite_modules[0].out_proj_up.weight.grad
 
-    assert grad_queries is not None, "Gradient did not flow to learnable style queries"
-    assert grad_q_proj is not None, "Gradient did not flow to resampler Query projection"
+    assert grad_style_query is not None, "Gradient did not flow to style query parameter"
+    assert grad_self_attn is not None, "Gradient did not flow to style extractor self attention"
     assert grad_k_style is not None, "Gradient did not flow to style key projection"
-    assert grad_out_proj_down is not None, "Gradient did not flow to out_proj_down"
+    assert grad_q_down_proj_weight is not None, "Gradient did not flow to query down projection"
     assert grad_out_proj_up is not None, "Gradient did not flow to out_proj_up"
 
     logger.info("  Backpropagation gradient flow & frozen resampler check: PASSED")

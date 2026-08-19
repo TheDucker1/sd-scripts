@@ -98,8 +98,8 @@ class FourierFeatures(nn.Module):
         # x: [B, 1] or [B]
         if x.ndim == 1:
             x = x.unsqueeze(-1)
-        f = 2.0 * math.pi * x.float() @ self.weight.T
-        return torch.cat([f.cos(), f.sin()], dim=-1).to(dtype=x.dtype if x.dtype.is_floating_point else torch.float32)
+        f = 2.0 * math.pi * x.to(self.weight.dtype) @ self.weight.T
+        return torch.cat([f.cos(), f.sin()], dim=-1).to(dtype=self.weight.dtype)
 
 
 class FeedForwardBlock(nn.Module):

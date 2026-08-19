@@ -550,6 +550,10 @@ def extract_cleandift_style_features(
             fps=None,
             padding_mask=padding_mask,
         )
+        if rope_emb_L_1_1_D is not None:
+            rope_emb_L_1_1_D = rope_emb_L_1_1_D.to(style_input_5d.device)
+        if extra_pos_emb is not None:
+            extra_pos_emb = extra_pos_emb.to(style_input_5d.device)
 
         t_clean_2d = t_clean.unsqueeze(1) if t_clean.ndim == 1 else t_clean
         t_embedding_B_T_D, adaln_lora_B_T_3D = anima.t_embedder(t_clean_2d)

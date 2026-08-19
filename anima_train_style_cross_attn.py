@@ -174,13 +174,25 @@ class AnimaStyleCrossAttnTrainer(anima_train_network.AnimaNetworkTrainer):
         unwrapped_style_net = self.style_cross_attn_net
 
         def on_prompt_start(prompt_dict, acc):
-            style_img_path = prompt_dict.get("cn", prompt_dict.get("i", prompt_dict.get("image", None)))
-            style_multiplier = float(prompt_dict.get("am", 1.0))
+            style_img_path = (
+                prompt_dict.get("controlnet_image")
+                or prompt_dict.get("cn")
+                or prompt_dict.get("image")
+                or prompt_dict.get("i")
+            )
+            mult = prompt_dict.get("additional_network_multiplier")
+            if isinstance(mult, (list, tuple)) and len(mult) > 0:
+                style_multiplier = float(mult[0])
+            elif mult is not None:
+                style_multiplier = float(mult)
+            else:
+                style_multiplier = float(prompt_dict.get("am", 1.0))
 
             if style_img_path is not None and os.path.exists(style_img_path) and unwrapped_style_net is not None:
                 from PIL import Image
                 import torchvision.transforms.functional as TF
 
+                logger.info(f"[Sample Preview] Extracting CleanDIFT style features from: {style_img_path} (scale: {style_multiplier})")
                 img = Image.open(style_img_path).convert("RGB")
                 w_orig, h_orig = img.size
                 scale = 768 / max(h_orig, w_orig)

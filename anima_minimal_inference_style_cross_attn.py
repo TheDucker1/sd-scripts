@@ -222,12 +222,24 @@ def main():
 
     for idx, p_dict in enumerate(prompt_dicts):
         prompt_text = p_dict.get("prompt", "")
-        neg_prompt_text = p_dict.get("n", args.negative_prompt)
-        style_img_path = p_dict.get("cn", p_dict.get("i", args.style_image))
-        style_multiplier = float(p_dict.get("am", args.style_multiplier))
-        w = int(p_dict.get("w", args.image_size[1]))
-        h = int(p_dict.get("h", args.image_size[0]))
-        seed = int(p_dict.get("d", args.seed)) if ("d" in p_dict or args.seed is not None) else None
+        neg_prompt_text = p_dict.get("negative_prompt", p_dict.get("n", args.negative_prompt))
+        style_img_path = (
+            p_dict.get("controlnet_image")
+            or p_dict.get("cn")
+            or p_dict.get("image")
+            or p_dict.get("i")
+            or args.style_image
+        )
+        mult = p_dict.get("additional_network_multiplier")
+        if isinstance(mult, (list, tuple)) and len(mult) > 0:
+            style_multiplier = float(mult[0])
+        elif mult is not None:
+            style_multiplier = float(mult)
+        else:
+            style_multiplier = float(p_dict.get("am", args.style_multiplier))
+        w = int(p_dict.get("width", p_dict.get("w", args.image_size[1])))
+        h = int(p_dict.get("height", p_dict.get("h", args.image_size[0])))
+        seed = int(p_dict.get("seed", p_dict.get("d", args.seed))) if ("seed" in p_dict or "d" in p_dict or args.seed is not None) else None
 
         logger.info(f"\n--- Generating [{idx+1}/{len(prompt_dicts)}] ---")
         logger.info(f"Prompt: {prompt_text}")

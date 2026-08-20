@@ -67,9 +67,14 @@ class AnimaStyleCrossAttnTrainer(anima_train_network.AnimaNetworkTrainer):
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         super().post_process_network(args, accelerator, network, text_encoders, unet)
-        # Move VAE to accelerator.device once before training starts to encode dynamic conditioning images
+        # If latents are cached, VAE is not needed during training -> offload to CPU to save ~2GB VRAM
         if self.vae is not None:
-            self.vae.to(accelerator.device)
+            if getattr(args, "cache_latents", False):
+                self.vae.to("cpu")
+                clean_memory_on_device(accelerator.device)
+                logger.info("Latents are cached: offloaded VAE to CPU to save ~2GB VRAM.")
+            else:
+                self.vae.to(accelerator.device)
 
     def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, list[nn.Module]]:
         """Loads DiT via base trainer, then attaches the CleanDIFT LoRA encoder."""
@@ -202,10 +207,13 @@ class AnimaStyleCrossAttnTrainer(anima_train_network.AnimaNetworkTrainer):
 
                 tensor = TF.to_tensor(img_resized)
                 tensor = (tensor - 0.5) * 2.0
-                tensor = tensor.unsqueeze(0).to(device=acc.device, dtype=weight_dtype)
+                vae_param = next(vae.parameters(), None)
+                vae_device = vae_param.device if vae_param is not None else acc.device
+                vae_dtype = vae_param.dtype if vae_param is not None else weight_dtype
+                tensor = tensor.unsqueeze(0).to(device=vae_device, dtype=vae_dtype)
 
                 with torch.no_grad():
-                    style_lat = vae.encode_pixels_to_latents(tensor)
+                    style_lat = vae.encode_pixels_to_latents(tensor).to(device=acc.device, dtype=weight_dtype)
                     null_pe, null_am, null_t5_ids, null_t5_am = self.get_null_text_conds(1, acc.device, weight_dtype)
 
                     unwrapped_style_net.set_style_features(None)
@@ -312,10 +320,16 @@ class AnimaStyleCrossAttnTrainer(anima_train_network.AnimaNetworkTrainer):
         # --------------------------------------------------------------------
         # 3. Extract Style Features from Clean Style Image (t=0, NULL prompt)
         # --------------------------------------------------------------------
-        if "conditioning_images" in batch and batch["conditioning_images"] is not None:
-            style_imgs = batch["conditioning_images"].to(accelerator.device, dtype=vae_dtype or weight_dtype)
+        if "conditioning_latents" in batch and batch["conditioning_latents"] is not None:
+            style_latents = batch["conditioning_latents"].to(accelerator.device, dtype=weight_dtype)
+        elif "conditioning_images" in batch and batch["conditioning_images"] is not None:
+            active_vae = self.vae if self.vae is not None else vae
+            vae_param = next(active_vae.parameters(), None)
+            vae_device = vae_param.device if vae_param is not None else accelerator.device
+            vae_dtype_actual = vae_param.dtype if vae_param is not None else (vae_dtype or weight_dtype)
+            style_imgs = batch["conditioning_images"].to(device=vae_device, dtype=vae_dtype_actual)
             with torch.no_grad():
-                style_latents = self.encode_images_to_latents(args, vae, style_imgs).to(
+                style_latents = self.encode_images_to_latents(args, active_vae, style_imgs).to(
                     accelerator.device, dtype=weight_dtype
                 )
         else:

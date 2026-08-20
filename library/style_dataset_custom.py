@@ -191,7 +191,9 @@ class StyleControlNetDataset(DreamBoothDataset):
         self._length = 0
 
     def set_current_strategies(self):
-        return self.dreambooth_dataset_delegate.set_current_strategies()
+        res = self.dreambooth_dataset_delegate.set_current_strategies()
+        self.latents_caching_strategy = getattr(self.dreambooth_dataset_delegate, "latents_caching_strategy", None)
+        return res
 
     def make_buckets(self):
         self.dreambooth_dataset_delegate.make_buckets()
@@ -220,7 +222,9 @@ class StyleControlNetDataset(DreamBoothDataset):
         bucket_batch_size = self.dreambooth_dataset_delegate.buckets_indices[index].bucket_batch_size
         image_index = self.dreambooth_dataset_delegate.buckets_indices[index].batch_index * bucket_batch_size
 
+        conditioning_latents = []
         conditioning_images = []
+        has_cached_latents = True
 
         for i, image_key in enumerate(bucket[image_index : image_index + bucket_batch_size]):
             image_info = self.dreambooth_dataset_delegate.image_data[image_key]
@@ -238,42 +242,80 @@ class StyleControlNetDataset(DreamBoothDataset):
             else:
                 cond_img_path = target_path
             
-            cond_img = load_image(cond_img_path)
+            # Look up ImageInfo for cond_img_path to load pre-cached latents if available
+            norm_cond_path = os.path.normcase(os.path.abspath(cond_img_path))
+            cond_info = self.dreambooth_dataset_delegate.image_data.get(cond_img_path, None)
+            if cond_info is None:
+                for info in self.dreambooth_dataset_delegate.image_data.values():
+                    if os.path.normcase(os.path.abspath(info.absolute_path)) == norm_cond_path:
+                        cond_info = info
+                        break
 
-            h_orig, w_orig = cond_img.shape[0], cond_img.shape[1]
-            pixels = h_orig * w_orig
-            
-            # Enforce at most 1MP (1,048,576 pixels) while preserving original aspect ratio
-            if pixels > 1048576:
-                scale = math.sqrt(1048576 / pixels)
-                w_new = max(64, int(w_orig * scale) - int(w_orig * scale) % 16)
-                h_new = max(64, int(h_orig * scale) - int(h_orig * scale) % 16)
+            strategy = (
+                getattr(self.dreambooth_dataset_delegate, "latents_caching_strategy", None)
+                or getattr(self, "latents_caching_strategy", None)
+            )
+            if strategy is None:
+                try:
+                    from library.strategy_base import LatentsCachingStrategy
+                    strategy = LatentsCachingStrategy.get_strategy()
+                except Exception:
+                    strategy = None
+
+            loaded_lat = None
+            if cond_info is not None:
+                if cond_info.latents is not None:
+                    loaded_lat = cond_info.latents if not flipped else (cond_info.latents_flipped if cond_info.latents_flipped is not None else torch.flip(cond_info.latents, [-1]))
+                elif cond_info.latents_npz is not None and strategy is not None:
+                    lat, _, _, flipped_lat, _ = strategy.load_latents_from_disk(
+                        cond_info.latents_npz, cond_info.bucket_reso
+                    )
+                    loaded_lat = torch.FloatTensor(flipped_lat if (flipped and flipped_lat is not None) else lat)
+                elif strategy is not None and cond_info.bucket_reso is not None:
+                    npz_path = strategy.get_latents_npz_path(cond_info.absolute_path, cond_info.bucket_reso)
+                    if os.path.isfile(npz_path):
+                        lat, _, _, flipped_lat, _ = strategy.load_latents_from_disk(
+                            npz_path, cond_info.bucket_reso
+                        )
+                        loaded_lat = torch.FloatTensor(flipped_lat if (flipped and flipped_lat is not None) else lat)
+
+            if loaded_lat is not None:
+                conditioning_latents.append(loaded_lat)
             else:
-                w_new = max(64, w_orig - w_orig % 16)
-                h_new = max(64, h_orig - h_orig % 16)
+                has_cached_latents = False
+                cond_img = load_image(cond_img_path)
 
-            if w_new != w_orig or h_new != h_orig:
-                cond_img = resize_image(
-                    cond_img,
-                    w_orig,
-                    h_orig,
-                    w_new,
-                    h_new,
-                    self.resize_interpolation,
-                )
+                h_orig, w_orig = cond_img.shape[0], cond_img.shape[1]
+                pixels = h_orig * w_orig
+                
+                # Enforce at most 1MP (1,048,576 pixels) while preserving original aspect ratio
+                if pixels > 1048576:
+                    scale = math.sqrt(1048576 / pixels)
+                    w_new = max(64, int(w_orig * scale) - int(w_orig * scale) % 16)
+                    h_new = max(64, int(h_orig * scale) - int(h_orig * scale) % 16)
+                else:
+                    w_new = max(64, w_orig - w_orig % 16)
+                    h_new = max(64, h_orig - h_orig % 16)
 
-            if flipped:
-                cond_img = cond_img[:, ::-1, :].copy()  # match target horizontal flip
+                if w_new != w_orig or h_new != h_orig:
+                    cond_img = resize_image(
+                        cond_img,
+                        w_orig,
+                        h_orig,
+                        w_new,
+                        h_new,
+                        self.resize_interpolation,
+                    )
 
-            # Apply independent random horizontal and vertical flips to teach style invariance
-            if random.random() < 0.5:
-                cond_img = cond_img[:, ::-1, :].copy()
-            if random.random() < 0.5:
-                cond_img = cond_img[::-1, :, :].copy()
+                if flipped:
+                    cond_img = cond_img[:, ::-1, :].copy()  # match target horizontal flip
 
-            cond_img = self.conditioning_image_transforms(cond_img)
-            conditioning_images.append(cond_img)
+                cond_img = self.conditioning_image_transforms(cond_img)
+                conditioning_images.append(cond_img)
 
-        example["conditioning_images"] = torch.stack(conditioning_images).to(memory_format=torch.contiguous_format).float()
+        if has_cached_latents and len(conditioning_latents) == len(bucket[image_index : image_index + bucket_batch_size]):
+            example["conditioning_latents"] = torch.stack(conditioning_latents).to(memory_format=torch.contiguous_format).float()
+        elif len(conditioning_images) > 0:
+            example["conditioning_images"] = torch.stack(conditioning_images).to(memory_format=torch.contiguous_format).float()
 
         return example

@@ -949,7 +949,7 @@ class Block(nn.Module):
         # ⚡ Optional Style Bottleneck Cross-Attention (injected before MLP) ⚡
         if hasattr(self, "style_cross_attn") and self.style_cross_attn is not None:
             if hasattr(self, "_active_style_feat") and self._active_style_feat is not None:
-                x_B_T_H_W_D = x_B_T_H_W_D + self.style_cross_attn(x_B_T_H_W_D, self._active_style_feat)
+                x_B_T_H_W_D = x_B_T_H_W_D + self.style_cross_attn(x_B_T_H_W_D, self._active_style_feat, attn_params=attn_params)
 
         # 3. MLP
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp_B_T_1_1_D, shift_mlp_B_T_1_1_D)

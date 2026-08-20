@@ -545,7 +545,10 @@ def sample_images(
     # Unwrap models
     dit = accelerator.unwrap_model(dit)
     if text_encoder is not None:
-        text_encoder = accelerator.unwrap_model(text_encoder)
+        if isinstance(text_encoder, (list, tuple)):
+            text_encoder = [accelerator.unwrap_model(te) if te is not None else None for te in text_encoder]
+        else:
+            text_encoder = accelerator.unwrap_model(text_encoder)
 
     dit.switch_block_swap_for_inference()
 
@@ -658,7 +661,8 @@ def _sample_image_inference(
             return sample_prompts_te_outputs[prpt]
         if text_encoder is not None:
             tokens = tokenize_strategy.tokenize(prpt)
-            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens)
+            te_list = text_encoder if isinstance(text_encoder, (list, tuple)) else [text_encoder]
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, te_list, tokens)
             return encoded
         return None
 
@@ -731,7 +735,8 @@ def _sample_image_inference(
     gc.collect()
     synchronize_device(accelerator.device)
     clean_memory_on_device(accelerator.device)
-    org_vae_device = vae.device
+    vae_param = next(vae.parameters(), None)
+    org_vae_device = vae_param.device if vae_param is not None else getattr(vae, "device", "cpu")
     vae.to(accelerator.device)
     decoded = vae.decode_to_pixels(latents)
     vae.to(org_vae_device)

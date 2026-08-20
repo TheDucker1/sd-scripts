@@ -34,20 +34,18 @@ class RMSNorm(nn.Module):
 
 
 class StyleBottleneckCrossAttention(nn.Module):
-    """Low-rank separate bottleneck style path (Cross-Attention + MLP -> Residual) for injecting CleanDIFT style features into Anima DiT.
+    """Low-rank style cross-attention branch using unified attention.attention for injecting CleanDIFT style features into Anima DiT.
 
     1. Cross-Attn: Projects generation hidden states (dim=2048) and style features (dim=2048)
-       down to bottleneck dimension (default: 64), computes scaled dot-product cross-attention.
-    2. Bottleneck MLP: Passes cross-attention output through low-rank RMSNorm + FFN (SiLU activation).
-    3. Residual: Projects back to model_dim with zero-initialized weights and adds as a residual update.
+       to inner_dim (num_heads * head_dim), applies per-head QK-norm, and computes cross-attention via library.attention.attention.
+    2. Linear Residual: Projects back to model_dim with zero-initialized weights and adds as a residual update.
     """
 
     def __init__(
         self,
         model_dim: int = 2048,
         attn_dim: int = 64,
-        num_heads: int = 1,
-        mlp_ratio: float = 2.0,
+        num_heads: int = 8,
         dropout: float = 0.0,
         scale: float = 1.0,
     ):
@@ -55,61 +53,48 @@ class StyleBottleneckCrossAttention(nn.Module):
         self.model_dim = model_dim
         self.attn_dim = attn_dim
         self.num_heads = num_heads
-        self.head_dim = attn_dim // num_heads
-        assert attn_dim % num_heads == 0, f"attn_dim ({attn_dim}) must be divisible by num_heads ({num_heads})"
-        self.mlp_dim = int(attn_dim * mlp_ratio)
-        self.mlp_ratio = mlp_ratio
+        self.head_dim = attn_dim // num_heads if attn_dim % num_heads == 0 else 64
+        self.inner_dim = self.num_heads * self.head_dim
 
         self.scale = scale
         self.dropout = dropout
 
-        # 1. Normalization for Cross-Attention
-        self.norm_q = RMSNorm(model_dim)
-        self.norm_kv = RMSNorm(model_dim)
+        # 1. Projections & per-head QK-norm matching codebase
+        self.to_q = nn.Linear(model_dim, self.inner_dim, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
 
-        # Projections to bottleneck dimension
-        self.to_q = nn.Linear(model_dim, attn_dim, bias=False)
-        self.to_k = nn.Linear(model_dim, attn_dim, bias=False)
-        self.to_v = nn.Linear(model_dim, attn_dim, bias=False)
+        self.to_k = nn.Linear(model_dim, self.inner_dim, bias=False)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
 
-        # 2. Bottleneck Style MLP
-        self.norm_mlp = RMSNorm(attn_dim)
-        self.mlp_in = nn.Linear(attn_dim, self.mlp_dim, bias=False)
-        self.mlp_act = nn.SiLU()
-        self.mlp_out = nn.Linear(self.mlp_dim, model_dim, bias=False)
+        self.to_v = nn.Linear(model_dim, self.inner_dim, bias=False)
+
+        # 2. Linear output projection
+        self.to_out = nn.Linear(self.inner_dim, model_dim, bias=False)
 
         self.init_weights()
 
-    @property
-    def to_out(self) -> nn.Linear:
-        """Alias for backward compatibility with scripts accessing to_out directly."""
-        return self.mlp_out
-
     def init_weights(self) -> None:
-        # Standard projection initialization for Q, K, V
         std = 1.0 / math.sqrt(self.model_dim)
-        nn.init.trunc_normal_(self.to_q.weight, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.to_k.weight, std=std, a=-2 * std, b=2 * std)
-        nn.init.trunc_normal_(self.to_v.weight, std=std, a=-2 * std, b=2 * std)
+        torch.nn.init.trunc_normal_(self.to_q.weight, std=std, a=-2 * std, b=2 * std)
+        torch.nn.init.trunc_normal_(self.to_k.weight, std=std, a=-2 * std, b=2 * std)
+        torch.nn.init.trunc_normal_(self.to_v.weight, std=std, a=-2 * std, b=2 * std)
 
-        # MLP in projection
-        std_mlp = 1.0 / math.sqrt(self.attn_dim)
-        nn.init.trunc_normal_(self.mlp_in.weight, std=std_mlp, a=-2 * std_mlp, b=2 * std_mlp)
-
-        # CRITICAL: Zero-initialize final MLP out projection for exact step 0 identity mapping
-        nn.init.zeros_(self.mlp_out.weight)
-        if self.mlp_out.bias is not None:
-            nn.init.zeros_(self.mlp_out.bias)
+        # CRITICAL: Zero-initialize final output projection for exact step 0 identity mapping
+        torch.nn.init.zeros_(self.to_out.weight)
+        if self.to_out.bias is not None:
+            torch.nn.init.zeros_(self.to_out.bias)
 
     def forward(
         self,
         x: torch.Tensor,
         style_feats: torch.Tensor,
+        attn_params: Optional[attention.AttentionParams] = None,
         scale: Optional[float] = None,
     ) -> torch.Tensor:
         """Args:
             x: Generation hidden states, shape (B, S_gen, D) or (B, T, H, W, D).
             style_feats: CleanDIFT style features, shape (B, S_style, D).
+            attn_params: Optional unified attention parameters for flash/torch/xformers/sageattn.
             scale: Optional runtime multiplier for style injection strength.
 
         Returns:
@@ -117,11 +102,9 @@ class StyleBottleneckCrossAttention(nn.Module):
         """
         orig_shape = x.shape
         if x.ndim == 5:
-            # (B, T, H, W, D) -> (B, (T H W), D)
             B, T, H, W, D = orig_shape
             x_flat = rearrange(x, "b t h w d -> b (t h w) d")
         elif x.ndim == 4:
-            # (B, H, W, D) -> (B, (H W), D)
             B, H, W, D = orig_shape
             x_flat = rearrange(x, "b h w d -> b (h w) d")
         elif x.ndim == 3:
@@ -136,55 +119,40 @@ class StyleBottleneckCrossAttention(nn.Module):
             style_flat = rearrange(style_feats, "b h w d -> b (h w) d")
         elif style_feats.ndim == 3:
             style_flat = style_feats
-        else:
-            raise ValueError(f"Unsupported input shape for style_feats: {style_feats.shape}")
+        if style_flat.device != x_flat.device:
+            style_flat = style_flat.to(x_flat.device, dtype=x_flat.dtype, non_blocking=True)
 
-        # 1. Normalize queries and keys/values
-        q_in = self.norm_q(x_flat)
-        kv_in = self.norm_kv(style_flat)
+        B, S_gen, _ = x_flat.shape
+        _, S_style, _ = style_flat.shape
 
-        # 2. Project to bottleneck space
-        q = self.to_q(q_in)  # (B, S_gen, attn_dim)
-        k = self.to_k(kv_in)  # (B, S_style, attn_dim)
-        v = self.to_v(kv_in)  # (B, S_style, attn_dim)
+        # 1. Project Q, K, V and apply per-head QK-norm
+        q = self.to_q(x_flat).view(B, S_gen, self.num_heads, self.head_dim)
+        q = self.q_norm(q)
 
-        # 3. Reshape for multi-head attention: (B, S, H * D_h) -> (B, H, S, D_h)
-        if self.num_heads > 1:
-            q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
-            k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
-            v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
-        else:
-            q = q.unsqueeze(1)  # (B, 1, S_gen, attn_dim)
-            k = k.unsqueeze(1)  # (B, 1, S_style, attn_dim)
-            v = v.unsqueeze(1)  # (B, 1, S_style, attn_dim)
+        k = self.to_k(style_flat).view(B, S_style, self.num_heads, self.head_dim)
+        k = self.k_norm(k)
 
-        # 4. Scaled Dot-Product Cross-Attention in bottleneck space
-        dropout_p = self.dropout if self.training else 0.0
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=dropout_p,
-            is_causal=False,
-        )
+        v = self.to_v(style_flat).view(B, S_style, self.num_heads, self.head_dim)
 
-        if self.num_heads > 1:
-            attn_out = rearrange(attn_out, "b h s d -> b s (h d)")
-        else:
-            attn_out = attn_out.squeeze(1)  # (B, S_gen, attn_dim)
+        # Cast for attention if dtypes differ under autocast
+        if q.dtype != v.dtype:
+            if attn_params is not None and (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                target_dtype = v.dtype
+                q = q.to(target_dtype)
+                k = k.to(target_dtype)
 
-        # 5. Bottleneck Style MLP: RMSNorm -> Linear_in -> SiLU -> Linear_out (to model_dim)
-        h_mlp = self.norm_mlp(attn_out)
-        h_mlp = self.mlp_act(self.mlp_in(h_mlp))
-        delta_x = self.mlp_out(h_mlp)  # (B, S_gen, model_dim)
+        # 2. Call unified attention from codebase
+        out = attention.attention([q, k, v], attn_params=attn_params, drop_rate=self.dropout if self.training else 0.0)
 
-        # 6. Apply scale
+        # 3. Linear output projection (out: [B, S_gen, inner_dim] -> [B, S_gen, model_dim])
+        delta_x = self.to_out(out)
+
+        # 4. Apply scale
         s = scale if scale is not None else self.scale
         if s != 1.0:
             delta_x = delta_x * s
 
-        # 7. Reshape back to match input
+        # 5. Reshape back to match input
         if x.ndim == 5:
             delta_x = rearrange(delta_x, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         elif x.ndim == 4:
@@ -603,8 +571,8 @@ def extract_cleandift_style_features(
             x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
 
             if idx in target_blocks:
-                # Capture features post-block: (B, T, H, W, D) -> (B, (T H W), D)
-                features[idx] = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d").detach()
+                # Capture features post-block: (B, T, H, W, D) -> (B, (T H W), D) and offload to CPU RAM immediately
+                features[idx] = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d").detach().to("cpu", non_blocking=True)
 
             if getattr(anima, "blocks_to_swap", None):
                 anima.offloader.submit_move_blocks(anima.blocks, idx)

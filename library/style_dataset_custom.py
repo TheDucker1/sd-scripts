@@ -195,6 +195,24 @@ class StyleControlNetDataset(DreamBoothDataset):
         self.latents_caching_strategy = getattr(self.dreambooth_dataset_delegate, "latents_caching_strategy", None)
         return res
 
+    def set_seed(self, seed):
+        super().set_seed(seed)
+        self.dreambooth_dataset_delegate.set_seed(seed)
+
+    def set_current_epoch(self, epoch):
+        super().set_current_epoch(epoch)
+        self.dreambooth_dataset_delegate.set_current_epoch(epoch)
+        self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
+        self._length = self.dreambooth_dataset_delegate._length
+
+    def set_current_step(self, step):
+        super().set_current_step(step)
+        self.dreambooth_dataset_delegate.set_current_step(step)
+
+    def set_max_train_steps(self, max_train_steps):
+        super().set_max_train_steps(max_train_steps)
+        self.dreambooth_dataset_delegate.set_max_train_steps(max_train_steps)
+
     def make_buckets(self):
         self.dreambooth_dataset_delegate.make_buckets()
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager

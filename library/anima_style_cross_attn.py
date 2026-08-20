@@ -499,7 +499,8 @@ def extract_cleandift_style_features(
     null_attn_mask: Optional[torch.Tensor] = None,
     clean_timestep: float = 0.0,
     target_blocks: Optional[List[int]] = None,
-    weight_dtype: torch.dtype = torch.bfloat16,
+    weight_dtype: Optional[torch.dtype] = None,
+    offload_to_cpu: bool = True,
 ) -> Dict[int, torch.Tensor]:
     """Runs a single forward pass through DiT with CleanDIFT LoRA active (multiplier=1.0)
 
@@ -571,8 +572,10 @@ def extract_cleandift_style_features(
             x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
 
             if idx in target_blocks:
-                # Capture features post-block: (B, T, H, W, D) -> (B, (T H W), D) and offload to CPU RAM immediately
-                features[idx] = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d").detach().to("cpu", non_blocking=True)
+                feat = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d").detach()
+                if offload_to_cpu:
+                    feat = feat.to("cpu", non_blocking=True)
+                features[idx] = feat
 
             if getattr(anima, "blocks_to_swap", None):
                 anima.offloader.submit_move_blocks(anima.blocks, idx)

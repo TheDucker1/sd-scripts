@@ -354,6 +354,7 @@ class AnimaStyleCrossAttnTrainer(anima_train_network.AnimaNetworkTrainer):
                 clean_timestep=0.0,
                 target_blocks=unwrapped_style_net.target_blocks,
                 weight_dtype=weight_dtype,
+                offload_to_cpu=getattr(args, "offload_style_features", True),
             )
 
         # --------------------------------------------------------------------
@@ -513,6 +514,13 @@ def setup_parser() -> argparse.ArgumentParser:
         dest="style_dataset",
         action="store_false",
         help="Disable StyleControlNetDataset and use standard dataset loader.",
+    )
+    parser.add_argument(
+        "--no_offload_style_features",
+        dest="offload_style_features",
+        action="store_false",
+        default=True,
+        help="Keep extracted CleanDIFT style features directly in GPU VRAM (for GPUs with >16GB VRAM).",
     )
 
     # Configure defaults matching command.txt

@@ -34,11 +34,12 @@ class RMSNorm(nn.Module):
 
 
 class StyleBottleneckCrossAttention(nn.Module):
-    """Low-rank bottleneck cross-attention for injecting CleanDIFT style features before MLP in Anima DiT.
+    """Low-rank separate bottleneck style path (Cross-Attention + MLP -> Residual) for injecting CleanDIFT style features into Anima DiT.
 
-    Projects both generation hidden states (dim=2048) and style features (dim=2048)
-    down to a compact bottleneck dimension (default: 64), computes scaled dot-product
-    cross-attention, and projects back up with zero-initialized output weights.
+    1. Cross-Attn: Projects generation hidden states (dim=2048) and style features (dim=2048)
+       down to bottleneck dimension (default: 64), computes scaled dot-product cross-attention.
+    2. Bottleneck MLP: Passes cross-attention output through low-rank RMSNorm + FFN (SiLU activation).
+    3. Residual: Projects back to model_dim with zero-initialized weights and adds as a residual update.
     """
 
     def __init__(
@@ -46,6 +47,7 @@ class StyleBottleneckCrossAttention(nn.Module):
         model_dim: int = 2048,
         attn_dim: int = 64,
         num_heads: int = 1,
+        mlp_ratio: float = 2.0,
         dropout: float = 0.0,
         scale: float = 1.0,
     ):
@@ -55,11 +57,13 @@ class StyleBottleneckCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = attn_dim // num_heads
         assert attn_dim % num_heads == 0, f"attn_dim ({attn_dim}) must be divisible by num_heads ({num_heads})"
+        self.mlp_dim = int(attn_dim * mlp_ratio)
+        self.mlp_ratio = mlp_ratio
 
         self.scale = scale
         self.dropout = dropout
 
-        # Normalization
+        # 1. Normalization for Cross-Attention
         self.norm_q = RMSNorm(model_dim)
         self.norm_kv = RMSNorm(model_dim)
 
@@ -68,10 +72,18 @@ class StyleBottleneckCrossAttention(nn.Module):
         self.to_k = nn.Linear(model_dim, attn_dim, bias=False)
         self.to_v = nn.Linear(model_dim, attn_dim, bias=False)
 
-        # Up-projection back to model_dim
-        self.to_out = nn.Linear(attn_dim, model_dim, bias=False)
+        # 2. Bottleneck Style MLP
+        self.norm_mlp = RMSNorm(attn_dim)
+        self.mlp_in = nn.Linear(attn_dim, self.mlp_dim, bias=False)
+        self.mlp_act = nn.SiLU()
+        self.mlp_out = nn.Linear(self.mlp_dim, model_dim, bias=False)
 
         self.init_weights()
+
+    @property
+    def to_out(self) -> nn.Linear:
+        """Alias for backward compatibility with scripts accessing to_out directly."""
+        return self.mlp_out
 
     def init_weights(self) -> None:
         # Standard projection initialization for Q, K, V
@@ -80,10 +92,14 @@ class StyleBottleneckCrossAttention(nn.Module):
         nn.init.trunc_normal_(self.to_k.weight, std=std, a=-2 * std, b=2 * std)
         nn.init.trunc_normal_(self.to_v.weight, std=std, a=-2 * std, b=2 * std)
 
-        # CRITICAL: Zero-initialize output projection for exact identity mapping at step 0
-        nn.init.zeros_(self.to_out.weight)
-        if self.to_out.bias is not None:
-            nn.init.zeros_(self.to_out.bias)
+        # MLP in projection
+        std_mlp = 1.0 / math.sqrt(self.attn_dim)
+        nn.init.trunc_normal_(self.mlp_in.weight, std=std_mlp, a=-2 * std_mlp, b=2 * std_mlp)
+
+        # CRITICAL: Zero-initialize final MLP out projection for exact step 0 identity mapping
+        nn.init.zeros_(self.mlp_out.weight)
+        if self.mlp_out.bias is not None:
+            nn.init.zeros_(self.mlp_out.bias)
 
     def forward(
         self,
@@ -142,7 +158,7 @@ class StyleBottleneckCrossAttention(nn.Module):
             k = k.unsqueeze(1)  # (B, 1, S_style, attn_dim)
             v = v.unsqueeze(1)  # (B, 1, S_style, attn_dim)
 
-        # 4. Scaled Dot-Product Cross-Attention
+        # 4. Scaled Dot-Product Cross-Attention in bottleneck space
         dropout_p = self.dropout if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(
             q,
@@ -158,8 +174,10 @@ class StyleBottleneckCrossAttention(nn.Module):
         else:
             attn_out = attn_out.squeeze(1)  # (B, S_gen, attn_dim)
 
-        # 5. Up-projection to model_dim
-        delta_x = self.to_out(attn_out)  # (B, S_gen, model_dim)
+        # 5. Bottleneck Style MLP: RMSNorm -> Linear_in -> SiLU -> Linear_out (to model_dim)
+        h_mlp = self.norm_mlp(attn_out)
+        h_mlp = self.mlp_act(self.mlp_in(h_mlp))
+        delta_x = self.mlp_out(h_mlp)  # (B, S_gen, model_dim)
 
         # 6. Apply scale
         s = scale if scale is not None else self.scale
@@ -173,6 +191,10 @@ class StyleBottleneckCrossAttention(nn.Module):
             delta_x = rearrange(delta_x, "b (h w) d -> b h w d", h=H, w=W)
 
         return delta_x
+
+
+# StyleBottleneckBranch alias
+StyleBottleneckBranch = StyleBottleneckCrossAttention
 
 
 class StyleBottleneckBlock(anima_models.Block):

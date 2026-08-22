@@ -42,6 +42,9 @@ class FineTuningDataset(BaseDataset):
         validation_split: float,
         resize_interpolation: Optional[str],
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: float = 0.0,
+        **kwargs,
     ) -> None:
         super().__init__(
             resolution,
@@ -50,6 +53,9 @@ class FineTuningDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            style_inject_tags=style_inject_tags,
+            alternate_prompt_probability=alternate_prompt_probability,
+            **kwargs,
         )
 
         self.batch_size = batch_size

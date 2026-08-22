@@ -44,6 +44,9 @@ class ControlNetDataset(BaseDataset):
         validation_seed: Optional[int],
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: float = 0.0,
+        **kwargs,
     ) -> None:
         super().__init__(
             resolution,
@@ -52,6 +55,9 @@ class ControlNetDataset(BaseDataset):
             debug_dataset,
             resize_interpolation,
             skip_image_resolution,
+            style_inject_tags=style_inject_tags,
+            alternate_prompt_probability=alternate_prompt_probability,
+            **kwargs,
         )
 
         db_subsets = []

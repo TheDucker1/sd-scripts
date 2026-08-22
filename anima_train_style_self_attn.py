@@ -49,6 +49,7 @@ from library import (
     deepspeed_utils,
     anima_train_utils,
     anima_utils,
+    anima_models,
     strategy_base,
     strategy_anima,
     sai_model_spec,
@@ -108,15 +109,22 @@ def preload_alternate_prompts(dataset):
                 logger.error(f"Error pre-loading natural prompt from {natural_prompt_path}: {e}")
 
 
-def inject_style_tags(dataset, style_inject_tags_str):
-    if not style_inject_tags_str:
-        return
+def inject_style_tags(dataset, global_style_inject_tags_str=None):
     import random
-    inject_tags = [t.strip() for t in style_inject_tags_str.split(",") if t.strip()]
-    if not inject_tags:
-        return
     for image_info in dataset.image_data.values():
         subset = dataset.image_to_subset.get(image_info.image_key)
+        # Check subset-level -> dataset-level -> global CLI fallback
+        tags_str = (
+            getattr(subset, "style_inject_tags", None)
+            or getattr(dataset, "style_inject_tags", None)
+            or global_style_inject_tags_str
+        )
+        if not tags_str:
+            continue
+        inject_tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+        if not inject_tags:
+            continue
+
         sep = getattr(subset, "caption_separator", ",") if subset is not None else ","
         sep_split = sep.strip() if sep.strip() else ","
         
@@ -124,8 +132,9 @@ def inject_style_tags(dataset, style_inject_tags_str):
         if image_info.caption:
             tags = [t.strip() for t in image_info.caption.split(sep_split) if t.strip()]
             for tag in inject_tags:
-                idx = random.randint(0, len(tags))
-                tags.insert(idx, tag)
+                if tag not in tags:
+                    idx = random.randint(0, len(tags))
+                    tags.insert(idx, tag)
             image_info.caption = f"{sep_split} ".join(tags)
             
         # Inject into alternate caption
@@ -133,8 +142,9 @@ def inject_style_tags(dataset, style_inject_tags_str):
         if alternate_caption:
             tags = [t.strip() for t in alternate_caption.split(sep_split) if t.strip()]
             for tag in inject_tags:
-                idx = random.randint(0, len(tags))
-                tags.insert(idx, tag)
+                if tag not in tags:
+                    idx = random.randint(0, len(tags))
+                    tags.insert(idx, tag)
             image_info.alternate_caption = f"{sep_split} ".join(tags)
 
 
@@ -180,10 +190,14 @@ def patch_dataset_getitem_and_caption():
                 except Exception:
                     pass
             
-            if image_info is not None and getattr(self, "alternate_prompt_probability", 0.0) > 0.0:
+            prob = getattr(subset, "alternate_prompt_probability", None)
+            if prob is None or prob <= 0.0:
+                prob = getattr(self, "alternate_prompt_probability", 0.0)
+
+            if image_info is not None and prob > 0.0:
                 alternate_caption = getattr(image_info, "alternate_caption", None)
                 if alternate_caption is not None:
-                    if random.random() < self.alternate_prompt_probability:
+                    if random.random() < prob:
                         modified_subset = copy.copy(subset)
                         modified_subset.shuffle_caption = False
                         modified_subset.caption_tag_dropout_rate = 0.0
@@ -217,10 +231,10 @@ class RMSNorm(nn.Module):
 
 class StyleSelfAttnModule(nn.Module):
     """
-    Bottleneck Self-Attention Style Module structurally identical to Anima's native Attention.
-    - Injected sequentially: x -> self_attn -> cross_attn -> [style_self_attn] -> mlp.
-    - Uses identical Attention design: q/k/v proj, q/k/v RMSNorm, output proj (zero-init).
-    - Integrated with block's AdaLN scale, shift, and gate for full timestep awareness.
+    Parallel Bottleneck Self-Attention Style Module.
+    - Evaluates bottleneck Self-Attention in parallel on the block's clean spatial input x (normalized_x_self).
+    - Base Cross-Attention runs clean without style interference.
+    - Injects the style residual directly AFTER Cross-Attention (before MLP).
     """
     def __init__(
         self,
@@ -242,20 +256,17 @@ class StyleSelfAttnModule(nn.Module):
         self.multiplier = 1.0
         self.dropout = dropout
 
-        # Block-level LayerNorm matching block.layer_norm_self_attn
-        self.layer_norm = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
-
-        # Q, K, V projections matching native Attention
+        # Q, K, V projections strictly matching native Attention structure in bottleneck dimension
         self.q_proj = nn.Linear(model_dim, self.inner_dim, bias=False)
         self.k_proj = nn.Linear(model_dim, self.inner_dim, bias=False)
         self.v_proj = nn.Linear(model_dim, self.inner_dim, bias=False)
 
-        # Per-head Q, K, V normalization matching native Attention
+        # Per-head QK-norm strictly matching native Attention
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-        self.v_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.v_norm = nn.Identity()
 
-        # Output projection back to model_dim (zero-initialized)
+        # Output projection back to model_dim (zero-initialized) & dropout
         self.output_proj = nn.Linear(self.inner_dim, model_dim, bias=False)
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
 
@@ -270,41 +281,29 @@ class StyleSelfAttnModule(nn.Module):
         # Zero-initialize final output projection so step 0 is exact identity
         torch.nn.init.zeros_(self.output_proj.weight)
 
-    def forward_style(self, normalized_x: torch.Tensor, attn_params=None, rope_emb=None) -> torch.Tensor:
-        if self.multiplier == 0.0:
-            return torch.zeros_like(normalized_x)
-
-        orig_shape = normalized_x.shape
-        if normalized_x.ndim == 5:
-            B, T, H, W, D = orig_shape
-            x_flat = rearrange(normalized_x, "b t h w d -> b (t h w) d")
-        elif normalized_x.ndim == 4:
-            B, H, W, D = orig_shape
-            x_flat = rearrange(normalized_x, "b h w d -> b (h w) d")
-        elif normalized_x.ndim == 3:
-            B, S, D = orig_shape
-            x_flat = normalized_x
-        else:
-            raise ValueError(f"Unsupported input shape: {orig_shape}")
-
-        B, S, _ = x_flat.shape
-
-        # 1. Compute Q, K, V and apply per-head Q, K, V normalization
-        q = self.q_proj(x_flat).view(B, S, self.num_heads, self.head_dim)
-        k = self.k_proj(x_flat).view(B, S, self.num_heads, self.head_dim)
-        v = self.v_proj(x_flat).view(B, S, self.num_heads, self.head_dim)
+    def compute_qkv(self, x: torch.Tensor) -> tuple:
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q, k, v = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.num_heads, d=self.head_dim),
+            (q, k, v),
+        )
 
         q = self.q_norm(q)
         k = self.k_norm(k)
         v = self.v_norm(v)
+        return q, k, v
 
-        # 2. Setup attention parameters
-        style_attn_params = attention.AttentionParams.create_attention_params(
-            attn_params.attn_mode if attn_params is not None else "torch", False
-        )
+    def forward_style(
+        self,
+        x: torch.Tensor,
+        attn_params: attention.AttentionParams,
+    ) -> torch.Tensor:
+        q, k, v = self.compute_qkv(x)
 
-        # Autocast and FlashAttention dtype alignment (FlashAttention only supports fp16 and bf16)
-        if not style_attn_params.supports_fp32 and q.dtype == torch.float32:
+        # Autocast and FlashAttention dtype alignment
+        if not attn_params.supports_fp32 and q.dtype == torch.float32:
             target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             q = q.to(target_dtype)
             k = k.to(target_dtype)
@@ -314,24 +313,11 @@ class StyleSelfAttnModule(nn.Module):
             q = q.to(target_dtype)
             k = k.to(target_dtype)
 
-        # 3. Compute attention over image sequence
-        out = attention.attention(
-            [q, k, v],
-            attn_params=style_attn_params,
-            drop_rate=self.dropout if self.training else 0.0,
-        )
-
-        # 4. Output projection and multiplier
-        out = out.to(self.output_proj.weight.dtype)
-        delta_x = self.output_dropout(self.output_proj(out)) * self.multiplier
-
-        # 4. Reshape back to match input
-        if normalized_x.ndim == 5:
-            delta_x = rearrange(delta_x, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-        elif normalized_x.ndim == 4:
-            delta_x = rearrange(delta_x, "b (h w) d -> b h w d", h=H, w=W)
-
-        return delta_x
+        qkv = [q, k, v]
+        del q, k, v
+        result = attention.attention(qkv, attn_params=attn_params, drop_rate=self.dropout if self.training else 0.0)
+        result = result.to(self.output_proj.weight.dtype)
+        return self.output_dropout(self.output_proj(result))
 
     def apply_to(self):
         block = self.block[0]
@@ -392,11 +378,14 @@ class StyleSelfAttnModule(nn.Module):
             def _adaln_fn(_x, _norm_layer, _scale, _shift):
                 return _norm_layer(_x) * (1 + _scale) + _shift
 
-            # 1. Base Self-Attention
+            # 1. Base Self-Attention & Parallel Style Bottleneck Self-Attention
             normalized_x = _adaln_fn(x_B_T_H_W_D, block.layer_norm_self_attn, scale_self_attn_B_T_1_1_D, shift_self_attn_B_T_1_1_D)
+            rearranged_normalized_x = rearrange(normalized_x, "b t h w d -> b (t h w) d")
+
+            # Base Self-Attn output
             result = rearrange(
                 block.self_attn(
-                    rearrange(normalized_x, "b t h w d -> b (t h w) d"),
+                    rearranged_normalized_x,
                     attn_params,
                     None,
                     rope_emb=rope_emb_L_1_1_D,
@@ -406,9 +395,26 @@ class StyleSelfAttnModule(nn.Module):
                 h=H,
                 w=W,
             )
+
+            # Parallel Style Bottleneck Self-Attn (computed on the clean spatial input, no RoPE)
+            if self.multiplier != 0.0:
+                style_result = rearrange(
+                    self.forward_style(
+                        rearranged_normalized_x,
+                        attn_params,
+                    ),
+                    "b (t h w) d -> b t h w d",
+                    t=T,
+                    h=H,
+                    w=W,
+                )
+            else:
+                style_result = None
+
+            # Base Self-Attn residual update (clean, before style is added)
             x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result
 
-            # 2. Base Cross-Attention
+            # 2. Base Cross-Attention (queries text prompt cleanly)
             normalized_x = _adaln_fn(x_B_T_H_W_D, block.layer_norm_cross_attn, scale_cross_attn_B_T_1_1_D, shift_cross_attn_B_T_1_1_D)
             result = rearrange(
                 block.cross_attn(
@@ -424,12 +430,11 @@ class StyleSelfAttnModule(nn.Module):
             )
             x_B_T_H_W_D = result * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
 
-            # ⚡ 3. Style Bottleneck Self-Attention (Sequential Refiner with AdaLN) ⚡
-            normalized_style_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm, scale_self_attn_B_T_1_1_D, shift_self_attn_B_T_1_1_D)
-            style_result = self.forward_style(normalized_style_x, attn_params=attn_params, rope_emb=rope_emb_L_1_1_D)
-            x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D.to(x_B_T_H_W_D.dtype) * style_result.to(x_B_T_H_W_D.dtype)
+            # ⚡ 3. Add Parallel Style Residual AFTER Cross-Attention (before MLP) ⚡
+            if style_result is not None:
+                x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D.to(x_B_T_H_W_D.dtype) * (style_result * self.multiplier).to(x_B_T_H_W_D.dtype)
 
-            # 4. Base MLP (processes the styled representation)
+            # 4. Base MLP
             normalized_x = _adaln_fn(x_B_T_H_W_D, block.layer_norm_mlp, scale_mlp_B_T_1_1_D, shift_mlp_B_T_1_1_D)
             result = block.mlp(normalized_x)
             x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result
@@ -629,9 +634,9 @@ class AnimaStyleWrapper(nn.Module):
         return self.dit(x, timesteps, context, **kwargs)
 
 
-def custom_get_noisy_model_input_and_timesteps(
-    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def custom_sample_timesteps_and_sigmas(
+    args, noise_scheduler, latents: torch.Tensor, device, dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
     bsz, h, w = latents.shape[0], latents.shape[-2], latents.shape[-1]
     assert bsz > 0, "Batch size not large enough"
     num_timesteps = noise_scheduler.config.num_train_timesteps
@@ -681,10 +686,15 @@ def custom_get_noisy_model_input_and_timesteps(
         sigmas = sigmas.clamp(t_min, t_max)
 
     sigmas = sigmas.view(-1, 1, 1, 1) if latents.ndim == 4 else sigmas.view(-1, 1, 1, 1, 1)
+    return timesteps.to(dtype), sigmas
 
-    if args.ip_noise_gamma:
+
+def custom_get_noisy_model_input(
+    args, latents: torch.Tensor, noise: torch.Tensor, sigmas: torch.Tensor, dtype
+) -> torch.Tensor:
+    if getattr(args, "ip_noise_gamma", None):
         xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
-        if args.ip_noise_gamma_random_strength:
+        if getattr(args, "ip_noise_gamma_random_strength", False):
             ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
         else:
             ip_noise_gamma = args.ip_noise_gamma
@@ -692,7 +702,15 @@ def custom_get_noisy_model_input_and_timesteps(
     else:
         noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
 
-    return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
+    return noisy_model_input.to(dtype)
+
+
+def custom_get_noisy_model_input_and_timesteps(
+    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    timesteps, sigmas = custom_sample_timesteps_and_sigmas(args, noise_scheduler, latents, device, dtype)
+    noisy_model_input = custom_get_noisy_model_input(args, latents, noise, sigmas, dtype)
+    return noisy_model_input, timesteps, sigmas
 
 
 # ---------------------------------------------------------------------------
@@ -793,13 +811,21 @@ def train(args):
         if group is not None:
             if hasattr(group, "datasets"):
                 for dataset in group.datasets:
-                    dataset.alternate_prompt_probability = getattr(args, "alternate_prompt_probability", 0.0)
-                    dataset.style_inject_tags = getattr(args, "style_inject_tags", None)
+                    prob = getattr(dataset, "alternate_prompt_probability", 0.0) or getattr(args, "alternate_prompt_probability", 0.0)
+                    for subset in getattr(dataset, "subsets", []):
+                        sub_prob = getattr(subset, "alternate_prompt_probability", None)
+                        if sub_prob is not None and sub_prob > 0.0:
+                            prob = max(prob, sub_prob)
+                    dataset.alternate_prompt_probability = prob
                     if dataset.alternate_prompt_probability > 0.0:
                         preload_alternate_prompts(dataset)
             elif hasattr(group, "image_data"):
-                group.alternate_prompt_probability = getattr(args, "alternate_prompt_probability", 0.0)
-                group.style_inject_tags = getattr(args, "style_inject_tags", None)
+                prob = getattr(group, "alternate_prompt_probability", 0.0) or getattr(args, "alternate_prompt_probability", 0.0)
+                for subset in getattr(group, "subsets", []):
+                    sub_prob = getattr(subset, "alternate_prompt_probability", None)
+                    if sub_prob is not None and sub_prob > 0.0:
+                        prob = max(prob, sub_prob)
+                group.alternate_prompt_probability = prob
                 if group.alternate_prompt_probability > 0.0:
                     preload_alternate_prompts(group)
             
@@ -1149,67 +1175,89 @@ def train(args):
                 t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
                 t5_attn_mask = t5_attn_mask.to(accelerator.device)
 
-                # noise + timesteps
-                noise = torch.randn_like(latents)
-                noisy_model_input, timesteps, sigmas = custom_get_noisy_model_input_and_timesteps(
-                    args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
+                # sample timesteps and sigmas once for the entire batch
+                timesteps, sigmas = custom_sample_timesteps_and_sigmas(
+                    args, noise_scheduler_copy, latents, accelerator.device, dit_weight_dtype
                 )
-                timesteps = timesteps / 1000.0
-                if torch.any(torch.isnan(noisy_model_input)):
-                    accelerator.print("NaN found in noisy_model_input, replacing with zeros")
-                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+                timesteps_input = timesteps / 1000.0
 
                 # padding mask
                 bs = latents.shape[0]
                 h_latent, w_latent = latents.shape[-2], latents.shape[-1]
                 padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
 
-                # 5D input for Anima DiT
-                noisy_model_input = noisy_model_input.unsqueeze(2)  # (B, C, 1, H, W)
-
-                with accelerator.autocast():
-                    model_pred = wrapper(
-                        noisy_model_input,
-                        timesteps,
-                        prompt_embeds,
-                        padding_mask=padding_mask,
-                        source_attention_mask=attn_mask,
-                        t5_input_ids=t5_input_ids,
-                        t5_attn_mask=t5_attn_mask,
-                    )
-                model_pred = model_pred.squeeze(2)
-
-                target = noise - latents
-
                 weighting = anima_train_utils.compute_loss_weighting_for_anima(
                     weighting_scheme=args.weighting_scheme, sigmas=sigmas
                 )
-                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
-                loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    loss = apply_masked_loss(loss, batch)
-                loss = loss.mean([1, 2, 3])
-
-                if weighting is not None:
-                    loss = loss * weighting
-
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps_input, None)
                 loss_weights = batch["loss_weights"]
-                loss = loss * loss_weights
-                loss = loss.mean()
 
-                try:
-                    accelerator.backward(loss)
-                except torch.cuda.OutOfMemoryError:
-                    logger.error(
-                        f"OOM at step={global_step} epoch={epoch} "
-                        f"latents={tuple(latents.shape)} "
-                        f"prompt_embeds={tuple(prompt_embeds.shape)}"
+                # determine noise evaluations (antithetic sampling when antithetic_noise_k > 0)
+                antithetic_k = getattr(args, "antithetic_noise_k", 0) or 0
+                if antithetic_k > 0:
+                    noises_to_eval = []
+                    for _ in range(antithetic_k):
+                        base_noise = torch.randn_like(latents)
+                        noises_to_eval.append(base_noise)
+                        noises_to_eval.append(-base_noise)
+                else:
+                    noises_to_eval = [torch.randn_like(latents)]
+
+                num_noises = len(noises_to_eval)
+                batch_loss_total = 0.0
+
+                for noise in noises_to_eval:
+                    noisy_model_input = custom_get_noisy_model_input(
+                        args, latents, noise, sigmas, dit_weight_dtype
                     )
+                    if torch.any(torch.isnan(noisy_model_input)):
+                        accelerator.print("NaN found in noisy_model_input, replacing with zeros")
+                        noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+
+                    # 5D input for Anima DiT
+                    noisy_model_input = noisy_model_input.unsqueeze(2)  # (B, C, 1, H, W)
+
+                    with accelerator.autocast():
+                        model_pred = wrapper(
+                            noisy_model_input,
+                            timesteps_input,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            source_attention_mask=attn_mask,
+                            t5_input_ids=t5_input_ids,
+                            t5_attn_mask=t5_attn_mask,
+                        )
+                    model_pred = model_pred.squeeze(2)
+
+                    target = noise - latents
+
+                    loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        loss = apply_masked_loss(loss, batch)
+                    loss = loss.mean([1, 2, 3])
+
+                    if weighting is not None:
+                        loss = loss * weighting
+
+                    loss = (loss * loss_weights).mean()
+
+                    scaled_loss = loss / num_noises
+
                     try:
-                        logger.error(torch.cuda.memory_summary(abbreviated=False))
-                    except Exception as e:
-                        logger.error(f"failed to dump memory_summary: {e}")
-                    raise
+                        accelerator.backward(scaled_loss)
+                    except torch.cuda.OutOfMemoryError:
+                        logger.error(
+                            f"OOM at step={global_step} epoch={epoch} "
+                            f"latents={tuple(latents.shape)} "
+                            f"prompt_embeds={tuple(prompt_embeds.shape)}"
+                        )
+                        try:
+                            logger.error(torch.cuda.memory_summary(abbreviated=False))
+                        except Exception as e:
+                            logger.error(f"failed to dump memory_summary: {e}")
+                        raise
+
+                    batch_loss_total += loss.detach()
 
                 if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                     params_to_clip = list(accelerator.unwrap_model(wrapper).network.parameters())
@@ -1228,7 +1276,7 @@ def train(args):
                     _save_step(global_step, epoch)
                 optimizer_train_fn()
 
-            current_loss = loss.detach().item()
+            current_loss = (batch_loss_total / num_noises).item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss, "lr": lr_scheduler.get_last_lr()[0]}
                 accelerator.log(logs, step=global_step)
@@ -1370,6 +1418,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Probability of selecting alternate natural prompts during training.",
+    )
+    parser.add_argument(
+        "--antithetic_noise_k",
+        type=int,
+        default=0,
+        help="Number of antithetic noise pairs (+eps, -eps) to evaluate and accumulate per batch step (default: 0, disabled). e.g. 1 runs 2 passes.",
     )
 
     return parser

@@ -946,10 +946,13 @@ class Block(nn.Module):
         )
         x_B_T_H_W_D = result * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
 
-        # ⚡ Optional Style Bottleneck Cross-Attention (injected before MLP) ⚡
+        # ⚡ Optional Style Bottleneck Cross-Attention (injected before MLP with AdaLN) ⚡
         if hasattr(self, "style_cross_attn") and self.style_cross_attn is not None:
             if hasattr(self, "_active_style_feat") and self._active_style_feat is not None:
-                x_B_T_H_W_D = x_B_T_H_W_D + self.style_cross_attn(x_B_T_H_W_D, self._active_style_feat, attn_params=attn_params)
+                style_layer_norm = getattr(self.style_cross_attn, "layer_norm", self.layer_norm_cross_attn)
+                normalized_style_x = _adaln_fn(x_B_T_H_W_D, style_layer_norm, scale_cross_attn_B_T_1_1_D, shift_cross_attn_B_T_1_1_D)
+                style_res = self.style_cross_attn(normalized_style_x, self._active_style_feat, attn_params=attn_params)
+                x_B_T_H_W_D = x_B_T_H_W_D + gate_cross_attn_B_T_1_1_D.to(x_B_T_H_W_D.dtype) * style_res.to(x_B_T_H_W_D.dtype)
 
         # 3. MLP
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp_B_T_1_1_D, shift_mlp_B_T_1_1_D)

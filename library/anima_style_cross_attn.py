@@ -37,8 +37,8 @@ class StyleBottleneckCrossAttention(nn.Module):
     """Low-rank style cross-attention branch using unified attention.attention for injecting CleanDIFT style features into Anima DiT.
 
     1. Cross-Attn: Projects generation hidden states (dim=2048) and style features (dim=2048)
-       to inner_dim (num_heads * head_dim), applies per-head QK-norm, and computes cross-attention via library.attention.attention.
-    2. Linear Residual: Projects back to model_dim with zero-initialized weights and adds as a residual update.
+       to inner_dim (num_heads * head_dim), applies per-head Q, K, V normalization, and computes cross-attention via library.attention.attention.
+    2. Linear Residual: Projects back to model_dim with zero-initialized weights and adds as a residual update with AdaLN gating.
     """
 
     def __init__(
@@ -59,7 +59,10 @@ class StyleBottleneckCrossAttention(nn.Module):
         self.scale = scale
         self.dropout = dropout
 
-        # 1. Projections & per-head QK-norm matching codebase
+        # Block-level LayerNorm for AdaLN standardization
+        self.layer_norm = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
+
+        # 1. Projections & per-head Q, K, V norm matching native Attention
         self.to_q = nn.Linear(model_dim, self.inner_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
 
@@ -67,17 +70,19 @@ class StyleBottleneckCrossAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
 
         self.to_v = nn.Linear(model_dim, self.inner_dim, bias=False)
+        self.v_norm = RMSNorm(self.head_dim, eps=1e-6)
 
-        # 2. Linear output projection
+        # 2. Linear output projection & dropout
         self.to_out = nn.Linear(self.inner_dim, model_dim, bias=False)
+        self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
 
         self.init_weights()
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self.model_dim)
-        torch.nn.init.trunc_normal_(self.to_q.weight, std=std, a=-2 * std, b=2 * std)
-        torch.nn.init.trunc_normal_(self.to_k.weight, std=std, a=-2 * std, b=2 * std)
-        torch.nn.init.trunc_normal_(self.to_v.weight, std=std, a=-2 * std, b=2 * std)
+        torch.nn.init.trunc_normal_(self.to_q.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(self.to_k.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(self.to_v.weight, std=std, a=-3 * std, b=3 * std)
 
         # CRITICAL: Zero-initialize final output projection for exact step 0 identity mapping
         torch.nn.init.zeros_(self.to_out.weight)
@@ -92,7 +97,7 @@ class StyleBottleneckCrossAttention(nn.Module):
         scale: Optional[float] = None,
     ) -> torch.Tensor:
         """Args:
-            x: Generation hidden states, shape (B, S_gen, D) or (B, T, H, W, D).
+            x: Generation hidden states (AdaLN-normalized), shape (B, S_gen, D) or (B, T, H, W, D).
             style_feats: CleanDIFT style features, shape (B, S_style, D).
             attn_params: Optional unified attention parameters for flash/torch/xformers/sageattn.
             scale: Optional runtime multiplier for style injection strength.
@@ -119,13 +124,16 @@ class StyleBottleneckCrossAttention(nn.Module):
             style_flat = rearrange(style_feats, "b h w d -> b (h w) d")
         elif style_feats.ndim == 3:
             style_flat = style_feats
+        else:
+            style_flat = style_feats
+
         if style_flat.device != x_flat.device:
             style_flat = style_flat.to(x_flat.device, dtype=x_flat.dtype, non_blocking=True)
 
         B, S_gen, _ = x_flat.shape
         _, S_style, _ = style_flat.shape
 
-        # 1. Project Q, K, V and apply per-head QK-norm
+        # 1. Project Q, K, V and apply per-head Q, K, V normalization
         q = self.to_q(x_flat).view(B, S_gen, self.num_heads, self.head_dim)
         q = self.q_norm(q)
 
@@ -133,26 +141,35 @@ class StyleBottleneckCrossAttention(nn.Module):
         k = self.k_norm(k)
 
         v = self.to_v(style_flat).view(B, S_style, self.num_heads, self.head_dim)
+        v = self.v_norm(v)
 
-        # Cast for attention if dtypes differ under autocast
-        if q.dtype != v.dtype:
-            if attn_params is not None and (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
-                target_dtype = v.dtype
-                q = q.to(target_dtype)
-                k = k.to(target_dtype)
+        # 2. Setup attention parameters & FlashAttention fp32 check
+        style_attn_params = attention.AttentionParams.create_attention_params(
+            attn_params.attn_mode if attn_params is not None else "torch", False
+        )
+        if not style_attn_params.supports_fp32 and q.dtype == torch.float32:
+            target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            q = q.to(target_dtype)
+            k = k.to(target_dtype)
+            v = v.to(target_dtype)
+        elif q.dtype != v.dtype:
+            target_dtype = v.dtype
+            q = q.to(target_dtype)
+            k = k.to(target_dtype)
 
-        # 2. Call unified attention from codebase
-        out = attention.attention([q, k, v], attn_params=attn_params, drop_rate=self.dropout if self.training else 0.0)
+        # 3. Call unified attention from codebase
+        out = attention.attention([q, k, v], attn_params=style_attn_params, drop_rate=self.dropout if self.training else 0.0)
 
-        # 3. Linear output projection (out: [B, S_gen, inner_dim] -> [B, S_gen, model_dim])
-        delta_x = self.to_out(out)
+        # 4. Linear output projection (out: [B, S_gen, inner_dim] -> [B, S_gen, model_dim])
+        out = out.to(self.to_out.weight.dtype)
+        delta_x = self.output_dropout(self.to_out(out))
 
-        # 4. Apply scale
+        # 5. Apply scale
         s = scale if scale is not None else self.scale
         if s != 1.0:
             delta_x = delta_x * s
 
-        # 5. Reshape back to match input
+        # 6. Reshape back to match input
         if x.ndim == 5:
             delta_x = rearrange(delta_x, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         elif x.ndim == 4:

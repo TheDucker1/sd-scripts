@@ -77,6 +77,8 @@ class BaseSubsetParams:
     validation_seed: int = 0
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
+    style_inject_tags: Optional[str] = None
+    alternate_prompt_probability: float = 0.0
 
 
 @dataclass
@@ -111,6 +113,8 @@ class BaseDatasetParams:
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
     skip_image_resolution: Optional[Tuple[int, int]] = None
+    style_inject_tags: Optional[str] = None
+    alternate_prompt_probability: float = 0.0
 
 @dataclass
 class DreamBoothDatasetParams(BaseDatasetParams):
@@ -201,6 +205,8 @@ class ConfigSanitizer:
         "caption_suffix": str,
         "custom_attributes": dict,
         "resize_interpolation": str,
+        "style_inject_tags": str,
+        "alternate_prompt_probability": Any(float, int),
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -248,6 +254,8 @@ class ConfigSanitizer:
         "network_multiplier": float,
         "resize_interpolation": str,
         "skip_image_resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
+        "style_inject_tags": str,
+        "alternate_prompt_probability": Any(float, int),
     }
 
     # options handled by argparse but not handled by user config

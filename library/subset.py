@@ -36,6 +36,9 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: Optional[float] = None,
+        **kwargs,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -67,6 +70,8 @@ class BaseSubset:
         self.validation_split = validation_split
 
         self.resize_interpolation = resize_interpolation
+        self.style_inject_tags = style_inject_tags
+        self.alternate_prompt_probability = alternate_prompt_probability
 
 
 class DreamBoothSubset(BaseSubset):
@@ -100,6 +105,9 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: Optional[float] = None,
+        **kwargs,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -128,6 +136,9 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            style_inject_tags=style_inject_tags,
+            alternate_prompt_probability=alternate_prompt_probability,
+            **kwargs,
         )
 
         self.is_reg = is_reg
@@ -171,6 +182,9 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: Optional[float] = None,
+        **kwargs,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -199,6 +213,9 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            style_inject_tags=style_inject_tags,
+            alternate_prompt_probability=alternate_prompt_probability,
+            **kwargs,
         )
 
         self.metadata_file = metadata_file
@@ -238,6 +255,9 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: Optional[float] = None,
+        **kwargs,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -266,6 +286,9 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            style_inject_tags=style_inject_tags,
+            alternate_prompt_probability=alternate_prompt_probability,
+            **kwargs,
         )
 
         self.conditioning_data_dir = conditioning_data_dir

@@ -368,6 +368,9 @@ class BaseDataset(torch.utils.data.Dataset):
         debug_dataset: bool,
         resize_interpolation: Optional[str] = None,
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        style_inject_tags: Optional[str] = None,
+        alternate_prompt_probability: float = 0.0,
+        **kwargs,
     ) -> None:
         super().__init__()
 
@@ -375,6 +378,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
         self.debug_dataset = debug_dataset
+        self.style_inject_tags = style_inject_tags
+        self.alternate_prompt_probability = alternate_prompt_probability
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 

@@ -924,11 +924,22 @@ def train(args):
         "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
     )
 
-    if args.gradient_checkpointing:
-        dit.enable_gradient_checkpointing(
-            cpu_offload=args.cpu_offload_checkpointing,
-            unsloth_offload=args.unsloth_offload_checkpointing,
-        )
+    has_gradient_checkpointing = bool(args.gradient_checkpointing or (getattr(args, "gradient_checkpointing_blocks", None) is not None and args.gradient_checkpointing_blocks > 0))
+    if has_gradient_checkpointing:
+        gc_blocks = getattr(args, "gradient_checkpointing_blocks", None)
+        if gc_blocks is not None and gc_blocks > 0:
+            logger.info(f"Enabling selective gradient checkpointing for first {gc_blocks} blocks (out of {len(dit.blocks)})...")
+            dit.enable_gradient_checkpointing(
+                cpu_offload=args.cpu_offload_checkpointing,
+                unsloth_offload=args.unsloth_offload_checkpointing,
+                max_blocks=gc_blocks,
+            )
+        else:
+            logger.info(f"Enabling gradient checkpointing for all {len(dit.blocks)} blocks...")
+            dit.enable_gradient_checkpointing(
+                cpu_offload=args.cpu_offload_checkpointing,
+                unsloth_offload=args.unsloth_offload_checkpointing,
+            )
 
     dit.requires_grad_(False)
 
@@ -1002,7 +1013,11 @@ def train(args):
     network.to(accelerator.device)
 
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
-        qwen3_text_encoder.to(accelerator.device)
+        if getattr(args, "offload_text_encoder_to_cpu", False):
+            logger.info("Keeping Qwen3 text encoder on CPU to maximize GPU VRAM headroom.")
+            qwen3_text_encoder.to("cpu")
+        else:
+            qwen3_text_encoder.to(accelerator.device)
     if not cache_latents:
         vae.requires_grad_(False)
         vae.eval()
@@ -1135,7 +1150,7 @@ def train(args):
         current_epoch.value = epoch + 1
 
         wrapper.train()
-        accelerator.unwrap_model(wrapper).dit.train() if args.gradient_checkpointing else accelerator.unwrap_model(wrapper).dit.eval()
+        accelerator.unwrap_model(wrapper).dit.train() if has_gradient_checkpointing else accelerator.unwrap_model(wrapper).dit.eval()
 
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
@@ -1175,89 +1190,92 @@ def train(args):
                 t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
                 t5_attn_mask = t5_attn_mask.to(accelerator.device)
 
-                # sample timesteps and sigmas once for the entire batch
-                timesteps, sigmas = custom_sample_timesteps_and_sigmas(
-                    args, noise_scheduler_copy, latents, accelerator.device, dit_weight_dtype
-                )
-                timesteps_input = timesteps / 1000.0
-
                 # padding mask
                 bs = latents.shape[0]
                 h_latent, w_latent = latents.shape[-2], latents.shape[-1]
                 padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
-
-                weighting = anima_train_utils.compute_loss_weighting_for_anima(
-                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
-                )
-                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps_input, None)
                 loss_weights = batch["loss_weights"]
 
-                # determine noise evaluations (antithetic sampling when antithetic_noise_k > 0)
+                # determine multi-timestep and antithetic noise counts
+                num_timesteps_per_batch = getattr(args, "timesteps_per_batch", 1) or 1
                 antithetic_k = getattr(args, "antithetic_noise_k", 0) or 0
-                if antithetic_k > 0:
-                    noises_to_eval = []
-                    for _ in range(antithetic_k):
-                        base_noise = torch.randn_like(latents)
-                        noises_to_eval.append(base_noise)
-                        noises_to_eval.append(-base_noise)
-                else:
-                    noises_to_eval = [torch.randn_like(latents)]
-
-                num_noises = len(noises_to_eval)
+                num_noises_per_t = (2 * antithetic_k) if antithetic_k > 0 else 1
+                total_subpasses = num_timesteps_per_batch * num_noises_per_t
                 batch_loss_total = 0.0
 
-                for noise in noises_to_eval:
-                    noisy_model_input = custom_get_noisy_model_input(
-                        args, latents, noise, sigmas, dit_weight_dtype
+                for _ in range(num_timesteps_per_batch):
+                    # sample timesteps and sigmas following configured arguments
+                    timesteps, sigmas = custom_sample_timesteps_and_sigmas(
+                        args, noise_scheduler_copy, latents, accelerator.device, dit_weight_dtype
                     )
-                    if torch.any(torch.isnan(noisy_model_input)):
-                        accelerator.print("NaN found in noisy_model_input, replacing with zeros")
-                        noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+                    timesteps_input = timesteps / 1000.0
 
-                    # 5D input for Anima DiT
-                    noisy_model_input = noisy_model_input.unsqueeze(2)  # (B, C, 1, H, W)
+                    weighting = anima_train_utils.compute_loss_weighting_for_anima(
+                        weighting_scheme=args.weighting_scheme, sigmas=sigmas
+                    )
+                    huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps_input, None)
 
-                    with accelerator.autocast():
-                        model_pred = wrapper(
-                            noisy_model_input,
-                            timesteps_input,
-                            prompt_embeds,
-                            padding_mask=padding_mask,
-                            source_attention_mask=attn_mask,
-                            t5_input_ids=t5_input_ids,
-                            t5_attn_mask=t5_attn_mask,
+                    if antithetic_k > 0:
+                        noises_to_eval = []
+                        for _ in range(antithetic_k):
+                            base_noise = torch.randn_like(latents)
+                            noises_to_eval.append(base_noise)
+                            noises_to_eval.append(-base_noise)
+                    else:
+                        noises_to_eval = [torch.randn_like(latents)]
+
+                    for noise in noises_to_eval:
+                        noisy_model_input = custom_get_noisy_model_input(
+                            args, latents, noise, sigmas, dit_weight_dtype
                         )
-                    model_pred = model_pred.squeeze(2)
+                        if torch.any(torch.isnan(noisy_model_input)):
+                            accelerator.print("NaN found in noisy_model_input, replacing with zeros")
+                            noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
 
-                    target = noise - latents
+                        # 5D input for Anima DiT
+                        noisy_model_input = noisy_model_input.unsqueeze(2)  # (B, C, 1, H, W)
 
-                    loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                        loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3])
+                        with accelerator.autocast():
+                            model_pred = wrapper(
+                                noisy_model_input,
+                                timesteps_input,
+                                prompt_embeds,
+                                padding_mask=padding_mask,
+                                source_attention_mask=attn_mask,
+                                t5_input_ids=t5_input_ids,
+                                t5_attn_mask=t5_attn_mask,
+                            )
+                        model_pred = model_pred.squeeze(2)
 
-                    if weighting is not None:
-                        loss = loss * weighting
+                        target = noise - latents
 
-                    loss = (loss * loss_weights).mean()
+                        loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                            loss = apply_masked_loss(loss, batch)
+                        loss = loss.mean([1, 2, 3])
 
-                    scaled_loss = loss / num_noises
+                        if weighting is not None:
+                            loss = loss * weighting
 
-                    try:
-                        accelerator.backward(scaled_loss)
-                    except torch.cuda.OutOfMemoryError:
-                        logger.error(
-                            f"OOM at step={global_step} epoch={epoch} "
-                            f"latents={tuple(latents.shape)} "
-                            f"prompt_embeds={tuple(prompt_embeds.shape)}"
-                        )
+                        loss = (loss * loss_weights).mean()
+
+                        scaled_loss = loss / total_subpasses
+
                         try:
-                            logger.error(torch.cuda.memory_summary(abbreviated=False))
-                        except Exception as e:
-                            logger.error(f"failed to dump memory_summary: {e}")
-                        raise
+                            accelerator.backward(scaled_loss)
+                        except torch.cuda.OutOfMemoryError:
+                            logger.error(
+                                f"OOM at step={global_step} epoch={epoch} "
+                                f"latents={tuple(latents.shape)} "
+                                f"prompt_embeds={tuple(prompt_embeds.shape)}"
+                            )
+                            try:
+                                logger.error(torch.cuda.memory_summary(abbreviated=False))
+                            except Exception as e:
+                                logger.error(f"failed to dump memory_summary: {e}")
+                            raise
 
-                    batch_loss_total += loss.detach()
+                        batch_loss_total += loss.detach()
 
                 if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                     params_to_clip = list(accelerator.unwrap_model(wrapper).network.parameters())
@@ -1276,7 +1294,7 @@ def train(args):
                     _save_step(global_step, epoch)
                 optimizer_train_fn()
 
-            current_loss = (batch_loss_total / num_noises).item()
+            current_loss = (batch_loss_total / total_subpasses).item()
             if len(accelerator.trackers) > 0:
                 logs = {"loss": current_loss, "lr": lr_scheduler.get_last_lr()[0]}
                 accelerator.log(logs, step=global_step)
@@ -1424,6 +1442,23 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Number of antithetic noise pairs (+eps, -eps) to evaluate and accumulate per batch step (default: 0, disabled). e.g. 1 runs 2 passes.",
+    )
+    parser.add_argument(
+        "--timesteps_per_batch",
+        type=int,
+        default=1,
+        help="Number of independent timesteps to sample and accumulate per batch step (default: 1).",
+    )
+    parser.add_argument(
+        "--offload_text_encoder_to_cpu",
+        action="store_true",
+        help="Keep the Qwen3 text encoder in CPU RAM during training to free ~3GB of GPU VRAM for the DiT.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing_blocks",
+        type=int,
+        default=None,
+        help="Number of initial DiT blocks to enable gradient checkpointing for (e.g. 14 for first half). If None and --gradient_checkpointing is set, checkpoints all blocks.",
     )
 
     return parser

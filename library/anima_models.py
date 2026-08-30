@@ -1169,9 +1169,17 @@ class Anima(nn.Module):
         self.final_layer.init_weights()
         self.t_embedding_norm.reset_parameters()
 
-    def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
-        for block in self.blocks:
-            block.enable_gradient_checkpointing(cpu_offload=cpu_offload, unsloth_offload=unsloth_offload)
+    def enable_gradient_checkpointing(
+        self,
+        cpu_offload: bool = False,
+        unsloth_offload: bool = False,
+        max_blocks: Optional[int] = None,
+    ):
+        for idx, block in enumerate(self.blocks):
+            if max_blocks is not None and idx >= max_blocks:
+                block.disable_gradient_checkpointing()
+            else:
+                block.enable_gradient_checkpointing(cpu_offload=cpu_offload, unsloth_offload=unsloth_offload)
 
     def disable_gradient_checkpointing(self):
         for block in self.blocks:

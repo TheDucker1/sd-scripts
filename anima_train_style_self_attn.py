@@ -743,6 +743,11 @@ def train(args):
     assert not args.fused_backward_pass, (
         "fused_backward_pass is not supported in Anima Style Self-Attention training"
     )
+    assert not (
+        getattr(args, "fp8_base", False)
+        or getattr(args, "fp8_base_unet", False)
+        or getattr(args, "fp8_scaled", False)
+    ), "FP8 precision (fp8_base, fp8_base_unet, fp8_scaled) is not supported in Anima Style Self-Attention training"
 
     if args.compile:
         assert not args.torch_compile, (
@@ -917,6 +922,7 @@ def train(args):
         vae.to("cpu")
         clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
+        logger.info(f"[VRAM] After VAE latent caching: {torch.cuda.memory_allocated(accelerator.device)/1024**2:.2f} MB allocated, {torch.cuda.memory_reserved(accelerator.device)/1024**2:.2f} MB reserved")
 
     # DiT (frozen)
     logger.info("Loading Anima DiT...")
@@ -1013,7 +1019,7 @@ def train(args):
     network.to(accelerator.device)
 
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
-        if getattr(args, "offload_text_encoder_to_cpu", False):
+        if getattr(args, "offload_text_encoder_to_cpu", False) or getattr(args, "precompute_epoch_text_embeds", True):
             logger.info("Keeping Qwen3 text encoder on CPU to maximize GPU VRAM headroom.")
             qwen3_text_encoder.to("cpu")
         else:
@@ -1024,6 +1030,7 @@ def train(args):
         vae.to(accelerator.device, dtype=weight_dtype)
 
     clean_memory_on_device(accelerator.device)
+    logger.info(f"[VRAM] DiT + Style Network ready on GPU: {torch.cuda.memory_allocated(accelerator.device)/1024**2:.2f} MB allocated, {torch.cuda.memory_reserved(accelerator.device)/1024**2:.2f} MB reserved")
 
     wrapper, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         wrapper, optimizer, train_dataloader, lr_scheduler
@@ -1152,6 +1159,53 @@ def train(args):
         wrapper.train()
         accelerator.unwrap_model(wrapper).dit.train() if has_gradient_checkpointing else accelerator.unwrap_model(wrapper).dit.eval()
 
+        epoch_crossattn_cache = []
+        should_precompute = getattr(args, "precompute_epoch_text_embeds", True) and not args.cache_text_encoder_outputs and qwen3_text_encoder is not None
+
+        if should_precompute:
+            dit_unwrapped = accelerator.unwrap_model(wrapper).dit
+            qwen3_text_encoder.to(accelerator.device)
+            chunk_size = getattr(args, "precompute_chunk_size", 64)
+
+            # Extract input_ids for the epoch directly from dataset items
+            num_samples = len(train_dataloader)
+            temp_input_ids = []
+            for batch in train_dataloader:
+                temp_input_ids.append(batch["input_ids_list"])
+
+            for i in range(0, len(temp_input_ids), chunk_size):
+                chunk_ids = temp_input_ids[i : i + chunk_size]
+                for input_ids_list in chunk_ids:
+                    with torch.no_grad():
+                        p_embeds, a_mask, t_ids, t_mask = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy, [qwen3_text_encoder], input_ids_list
+                        )
+                        p_embeds = p_embeds.to(accelerator.device, dtype=dit_weight_dtype)
+                        a_mask = a_mask.to(accelerator.device)
+                        t_ids = t_ids.to(accelerator.device, dtype=torch.long)
+                        t_mask = t_mask.to(accelerator.device)
+
+                        if hasattr(dit_unwrapped, "llm_adapter") and dit_unwrapped.llm_adapter is not None:
+                            c_emb = dit_unwrapped.llm_adapter(
+                                source_hidden_states=p_embeds,
+                                target_input_ids=t_ids,
+                                target_attention_mask=t_mask,
+                                source_attention_mask=a_mask,
+                            )
+                            if t_mask is not None:
+                                c_emb[~t_mask.bool()] = 0
+                        else:
+                            c_emb = p_embeds
+
+                        epoch_crossattn_cache.append(c_emb.cpu())
+            del temp_input_ids
+
+            # Offload text encoder back to CPU and clean GPU VRAM before starting training steps
+            qwen3_text_encoder.to("cpu")
+            clean_memory_on_device(accelerator.device)
+            gc.collect()
+            logger.info(f"Epoch text precomputation done. Text encoder offloaded to CPU! Active GPU VRAM: {torch.cuda.memory_allocated(accelerator.device) / 1024**2:.2f} MB")
+
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
 
@@ -1170,25 +1224,33 @@ def train(args):
                         latents = torch.nan_to_num(latents, 0, out=latents)
 
                 # text encoder outputs
-                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-                if text_encoder_outputs_list is not None:
-                    caption_dropout_rates = text_encoder_outputs_list[-1]
-                    text_encoder_outputs_list = text_encoder_outputs_list[:-1]
-                    text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
-                        *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
-                    )
-                    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
+                if should_precompute and step < len(epoch_crossattn_cache):
+                    crossattn_emb = epoch_crossattn_cache[step].to(accelerator.device, dtype=dit_weight_dtype)
+                    epoch_crossattn_cache[step] = None  # Release RAM
+                    prompt_embeds = crossattn_emb
+                    attn_mask = None
+                    t5_input_ids = None
+                    t5_attn_mask = None
                 else:
-                    input_ids_list = batch["input_ids_list"]
-                    with torch.no_grad():
-                        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
-                            tokenize_strategy, [qwen3_text_encoder], input_ids_list
+                    text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+                    if text_encoder_outputs_list is not None:
+                        caption_dropout_rates = text_encoder_outputs_list[-1]
+                        text_encoder_outputs_list = text_encoder_outputs_list[:-1]
+                        text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
+                            *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
                         )
+                        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
+                    else:
+                        input_ids_list = batch["input_ids_list"]
+                        with torch.no_grad():
+                            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
+                                tokenize_strategy, [qwen3_text_encoder], input_ids_list
+                            )
 
-                prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
-                attn_mask = attn_mask.to(accelerator.device)
-                t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
-                t5_attn_mask = t5_attn_mask.to(accelerator.device)
+                    prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit_weight_dtype)
+                    attn_mask = attn_mask.to(accelerator.device) if attn_mask is not None else None
+                    t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long) if t5_input_ids is not None else None
+                    t5_attn_mask = t5_attn_mask.to(accelerator.device) if t5_attn_mask is not None else None
 
                 # padding mask
                 bs = latents.shape[0]
@@ -1276,6 +1338,7 @@ def train(args):
                             raise
 
                         batch_loss_total += loss.detach()
+                        del model_pred, target, loss, scaled_loss, noisy_model_input
 
                 if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                     params_to_clip = list(accelerator.unwrap_model(wrapper).network.parameters())
@@ -1293,6 +1356,9 @@ def train(args):
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     _save_step(global_step, epoch)
                 optimizer_train_fn()
+
+            if global_step == 0 or global_step == 1 or global_step % 100 == 0:
+                logger.info(f"[VRAM Step {global_step}] Active: {torch.cuda.memory_allocated(accelerator.device)/1024**2:.2f} MB, Peak: {torch.cuda.max_memory_allocated(accelerator.device)/1024**2:.2f} MB, Reserved: {torch.cuda.memory_reserved(accelerator.device)/1024**2:.2f} MB")
 
             current_loss = (batch_loss_total / total_subpasses).item()
             if len(accelerator.trackers) > 0:
@@ -1358,6 +1424,23 @@ def setup_parser() -> argparse.ArgumentParser:
     anima_train_utils.add_anima_training_arguments(parser)
     sai_model_spec.add_model_spec_arguments(parser)
 
+    parser.add_argument(
+        "--fp8_scaled",
+        action="store_true",
+        help="Enable scaled FP8 precision for Anima DiT (unsupported).",
+    )
+    parser.add_argument(
+        "--precompute_epoch_text_embeds",
+        action="store_true",
+        default=False,
+        help="Precompute post-adapter text embeddings into CPU RAM at the start of each epoch, freeing GPU VRAM for the DiT.",
+    )
+    parser.add_argument(
+        "--precompute_chunk_size",
+        type=int,
+        default=1024,
+        help="Chunk limit for epoch text precomputation to prevent memory spikes on massive datasets (default: 1024).",
+    )
     parser.add_argument(
         "--cpu_offload_checkpointing",
         action="store_true",

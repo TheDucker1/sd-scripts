@@ -17,7 +17,7 @@ import toml
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from einops import rearrange
+from einops import rearrange, repeat
 
 import torch
 import torch.nn as nn
@@ -229,305 +229,383 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 
-class StyleSelfAttnModule(nn.Module):
+def compute_2d_rope_emb(H: int, W: int, head_dim: int, device: torch.device) -> torch.Tensor:
+    dim = head_dim
+    dim_h = (dim // 4) * 2
+    dim_w = dim - dim_h
+
+    h_range = torch.arange(0, dim_h, 2, dtype=torch.float32, device=device)[: dim_h // 2] / dim_h
+    w_range = torch.arange(0, dim_w, 2, dtype=torch.float32, device=device)[: dim_w // 2] / dim_w
+
+    h_spatial_freqs = 1.0 / (10000.0 ** h_range)
+    w_spatial_freqs = 1.0 / (10000.0 ** w_range)
+
+    seq_h = torch.arange(H, device=device, dtype=torch.float32)
+    seq_w = torch.arange(W, device=device, dtype=torch.float32)
+
+    half_emb_h = torch.outer(seq_h, h_spatial_freqs)
+    half_emb_w = torch.outer(seq_w, w_spatial_freqs)
+
+    emb_h = repeat(half_emb_h, "h d -> h w d", w=W)
+    emb_w = repeat(half_emb_w, "w d -> h w d", h=H)
+
+    em_H_W_D = torch.cat([emb_h, emb_w] * 2, dim=-1)
+    rope_emb = rearrange(em_H_W_D, "h w d -> (h w) 1 1 d").float()
+    return rope_emb
+
+
+class StyleCorrectionBlock(nn.Module):
     """
-    Parallel Bottleneck Self-Attention Style Module.
-    - Evaluates bottleneck Self-Attention in parallel on the block's clean spatial input x (normalized_x_self).
-    - Base Cross-Attention runs clean without style interference.
-    - Injects the style residual directly AFTER Cross-Attention (before MLP).
+    Strap-on Style Correction Block:
+      latent (2048) -> bottleneck self-attn (D) -> mlp (4D -> 2048) -> residual + latent -> next_block
+    Modulated by timestep embedding via AdaLN.
     """
     def __init__(
         self,
         name: str,
-        block: nn.Module,
         model_dim: int = 2048,
         rank: int = 32,
         num_heads: int = 2,
+        mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        use_rope: bool = True,
+        adaln_rank: int = 32,
     ):
         super().__init__()
-        self.module_name = name
-        self.block = [block]
+        self.block_name = name
         self.model_dim = model_dim
         self.rank = rank
         self.num_heads = num_heads
         self.head_dim = rank // num_heads if rank % num_heads == 0 else rank
         self.inner_dim = self.num_heads * self.head_dim
-        self.multiplier = 1.0
         self.dropout = dropout
+        self.use_rope = use_rope
+        self.adaln_rank = adaln_rank
 
-        # Q, K, V projections strictly matching native Attention structure in bottleneck dimension
+        # LayerNorm for bottleneck self-attention
+        self.layer_norm_self_attn = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
+
+        # Q, K, V projections: model_dim (2048) -> inner_dim (bottleneck D)
         self.q_proj = nn.Linear(model_dim, self.inner_dim, bias=False)
         self.k_proj = nn.Linear(model_dim, self.inner_dim, bias=False)
         self.v_proj = nn.Linear(model_dim, self.inner_dim, bias=False)
 
-        # Per-head QK-norm strictly matching native Attention
+        # Per-head QK-norm
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.v_norm = nn.Identity()
 
-        # Output projection back to model_dim (zero-initialized) & dropout
-        self.output_proj = nn.Linear(self.inner_dim, model_dim, bias=False)
-        self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
+        # Bottleneck MLP: inner_dim (D) -> 4D -> model_dim (2048)
+        mlp_hidden_dim = int(self.inner_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.inner_dim, mlp_hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity(),
+            nn.Linear(mlp_hidden_dim, model_dim, bias=False),
+        )
+
+        # Low-rank AdaLN modulation (adaLN-LoRA): model_dim -> adaln_rank -> 3 * model_dim
+        # Produces shift_self, scale_self, gate_mlp from emb_B_T_D
+        self.adaln_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(model_dim, adaln_rank, bias=False),
+            nn.Linear(adaln_rank, 3 * model_dim, bias=False),
+        )
 
         self.init_weights()
 
     def init_weights(self):
-        std = 1.0 / math.sqrt(self.model_dim)
-        torch.nn.init.trunc_normal_(self.q_proj.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.trunc_normal_(self.k_proj.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.trunc_normal_(self.v_proj.weight, std=std, a=-3 * std, b=3 * std)
+        std_q = 1.0 / math.sqrt(self.model_dim)
+        torch.nn.init.trunc_normal_(self.q_proj.weight, std=std_q, a=-3 * std_q, b=3 * std_q)
+        torch.nn.init.trunc_normal_(self.k_proj.weight, std=std_q, a=-3 * std_q, b=3 * std_q)
+        torch.nn.init.trunc_normal_(self.v_proj.weight, std=std_q, a=-3 * std_q, b=3 * std_q)
 
-        # Zero-initialize final output projection so step 0 is exact identity
-        torch.nn.init.zeros_(self.output_proj.weight)
+        # MLP weights
+        torch.nn.init.trunc_normal_(self.mlp[0].weight, std=1.0 / math.sqrt(self.inner_dim))
+        # Zero-initialize the final projection so the block is identity at step 0
+        torch.nn.init.zeros_(self.mlp[3].weight)
 
-    def compute_qkv(self, x: torch.Tensor) -> tuple:
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # Low-rank AdaLN weights
+        std_adaln = 1.0 / math.sqrt(self.model_dim)
+        torch.nn.init.trunc_normal_(self.adaln_modulation[1].weight, std=std_adaln, a=-3 * std_adaln, b=3 * std_adaln)
+        # Zero-initialize the AdaLN final projection so modulation starts as identity (shift=0, scale=0, gate=0)
+        torch.nn.init.zeros_(self.adaln_modulation[2].weight)
+
+    def forward(
+        self,
+        x_B_T_H_W_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        attn_params: attention.AttentionParams,
+        H: Optional[int] = None,
+        W: Optional[int] = None,
+        T: Optional[int] = None,
+        rope_emb: Optional[torch.Tensor] = None,
+        multiplier: float = 1.0,
+    ) -> torch.Tensor:
+        B, t_dim, h_dim, w_dim, D = x_B_T_H_W_D.shape
+        T = T or t_dim
+        H = H or h_dim
+        W = W or w_dim
+
+        # AdaLN modulation parameters
+        shift_self, scale_self, gate_mlp = self.adaln_modulation(emb_B_T_D).chunk(3, dim=-1)
+        shift_self = rearrange(shift_self, "b t d -> b t 1 1 d")
+        scale_self = rearrange(scale_self, "b t d -> b t 1 1 d")
+        gate_mlp = rearrange(gate_mlp, "b t d -> b t 1 1 d")
+
+        # 1. Bottleneck Self-Attention (2048 -> D)
+        norm_x = self.layer_norm_self_attn(x_B_T_H_W_D) * (1 + scale_self) + shift_self
+        norm_x_seq = rearrange(norm_x, "b t h w d -> b (t h w) d")
+
+        q = self.q_proj(norm_x_seq)
+        k = self.k_proj(norm_x_seq)
+        v = self.v_proj(norm_x_seq)
+
         q, k, v = map(
             lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.num_heads, d=self.head_dim),
             (q, k, v),
         )
-
         q = self.q_norm(q)
         k = self.k_norm(k)
         v = self.v_norm(v)
-        return q, k, v
 
-    def forward_style(
-        self,
-        x: torch.Tensor,
-        attn_params: attention.AttentionParams,
-    ) -> torch.Tensor:
-        q, k, v = self.compute_qkv(x)
+        if self.use_rope and self.head_dim >= 4 and self.head_dim % 2 == 0:
+            if rope_emb is None:
+                rope_emb = compute_2d_rope_emb(H, W, self.head_dim, q.device)
+                if T > 1:
+                    rope_emb = repeat(rope_emb, "s 1 1 d -> (t s) 1 1 d", t=T)
+            q = anima_models.apply_rotary_pos_emb(q, rope_emb, tensor_format="bshd", fused=False)
+            k = anima_models.apply_rotary_pos_emb(k, rope_emb, tensor_format="bshd", fused=False)
 
-        # Autocast and FlashAttention dtype alignment
-        if not attn_params.supports_fp32 and q.dtype == torch.float32:
-            target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            q = q.to(target_dtype)
-            k = k.to(target_dtype)
-            v = v.to(target_dtype)
-        elif q.dtype != v.dtype:
-            target_dtype = v.dtype
-            q = q.to(target_dtype)
-            k = k.to(target_dtype)
+        if q.dtype != v.dtype:
+            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                target_dtype = v.dtype
+                q = q.to(target_dtype)
+                k = k.to(target_dtype)
 
         qkv = [q, k, v]
         del q, k, v
-        result = attention.attention(qkv, attn_params=attn_params, drop_rate=self.dropout if self.training else 0.0)
-        result = result.to(self.output_proj.weight.dtype)
-        return self.output_dropout(self.output_proj(result))
+        attn_result = attention.attention(qkv, attn_params=attn_params, drop_rate=self.dropout if self.training else 0.0)
 
-    def apply_to(self):
-        block = self.block[0]
-        self.org_forward = block._forward
+        # 2. MLP: D -> 4D -> 2048
+        mlp_result = self.mlp(attn_result)
+        mlp_result = rearrange(mlp_result, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
 
-        def hooked_forward(
-            x_B_T_H_W_D,
-            emb_B_T_D,
-            crossattn_emb,
-            attn_params,
-            use_fp32=False,
-            rope_emb_L_1_1_D=None,
-            adaln_lora_B_T_3D=None,
-            extra_per_block_pos_emb=None,
-        ):
-            if use_fp32:
-                x_B_T_H_W_D = x_B_T_H_W_D.float()
+        # 3. Residual addition back to latent tokens: latent + gate * mlp_result
+        x_B_T_H_W_D = x_B_T_H_W_D + (1 + gate_mlp) * (mlp_result * multiplier)
 
-            if extra_per_block_pos_emb is not None:
-                x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
-
-            with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
-                if block.use_adaln_lora:
-                    shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                        block.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
-                    ).chunk(3, dim=-1)
-                    shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                        block.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
-                    ).chunk(3, dim=-1)
-                    shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                        block.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
-                    ).chunk(3, dim=-1)
-                else:
-                    shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                        block.adaln_modulation_self_attn(emb_B_T_D)
-                    ).chunk(3, dim=-1)
-                    shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                        block.adaln_modulation_cross_attn(emb_B_T_D)
-                    ).chunk(3, dim=-1)
-                    shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                        block.adaln_modulation_mlp(emb_B_T_D)
-                    ).chunk(3, dim=-1)
-
-            shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
-            scale_self_attn_B_T_1_1_D = rearrange(scale_self_attn_B_T_D, "b t d -> b t 1 1 d")
-            gate_self_attn_B_T_1_1_D = rearrange(gate_self_attn_B_T_D, "b t d -> b t 1 1 d")
-
-            shift_cross_attn_B_T_1_1_D = rearrange(shift_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-            scale_cross_attn_B_T_1_1_D = rearrange(scale_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-            gate_cross_attn_B_T_1_1_D = rearrange(gate_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-
-            shift_mlp_B_T_1_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 1 d")
-            scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d")
-            gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d")
-
-            B, T, H, W, D = x_B_T_H_W_D.shape
-
-            def _adaln_fn(_x, _norm_layer, _scale, _shift):
-                return _norm_layer(_x) * (1 + _scale) + _shift
-
-            # 1. Base Self-Attention & Parallel Style Bottleneck Self-Attention
-            normalized_x = _adaln_fn(x_B_T_H_W_D, block.layer_norm_self_attn, scale_self_attn_B_T_1_1_D, shift_self_attn_B_T_1_1_D)
-            rearranged_normalized_x = rearrange(normalized_x, "b t h w d -> b (t h w) d")
-
-            # Base Self-Attn output
-            result = rearrange(
-                block.self_attn(
-                    rearranged_normalized_x,
-                    attn_params,
-                    None,
-                    rope_emb=rope_emb_L_1_1_D,
-                ),
-                "b (t h w) d -> b t h w d",
-                t=T,
-                h=H,
-                w=W,
-            )
-
-            # Parallel Style Bottleneck Self-Attn (computed on the clean spatial input, no RoPE)
-            if self.multiplier != 0.0:
-                style_result = rearrange(
-                    self.forward_style(
-                        rearranged_normalized_x,
-                        attn_params,
-                    ),
-                    "b (t h w) d -> b t h w d",
-                    t=T,
-                    h=H,
-                    w=W,
-                )
-            else:
-                style_result = None
-
-            # Base Self-Attn residual update (clean, before style is added)
-            x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result
-
-            # 2. Base Cross-Attention (queries text prompt cleanly)
-            normalized_x = _adaln_fn(x_B_T_H_W_D, block.layer_norm_cross_attn, scale_cross_attn_B_T_1_1_D, shift_cross_attn_B_T_1_1_D)
-            result = rearrange(
-                block.cross_attn(
-                    rearrange(normalized_x, "b t h w d -> b (t h w) d"),
-                    attn_params,
-                    crossattn_emb,
-                    rope_emb=rope_emb_L_1_1_D,
-                ),
-                "b (t h w) d -> b t h w d",
-                t=T,
-                h=H,
-                w=W,
-            )
-            x_B_T_H_W_D = result * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
-
-            # ⚡ 3. Add Parallel Style Residual AFTER Cross-Attention (before MLP) ⚡
-            if style_result is not None:
-                x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D.to(x_B_T_H_W_D.dtype) * (style_result * self.multiplier).to(x_B_T_H_W_D.dtype)
-
-            # 4. Base MLP
-            normalized_x = _adaln_fn(x_B_T_H_W_D, block.layer_norm_mlp, scale_mlp_B_T_1_1_D, shift_mlp_B_T_1_1_D)
-            result = block.mlp(normalized_x)
-            x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result
-
-            return x_B_T_H_W_D
-
-        block._forward = hooked_forward
-
-
-def parse_block_selection(selection_str: Optional[str]) -> Optional[set[int]]:
-    if not selection_str:
-        return None
-    selection_str = str(selection_str).strip()
-    if selection_str.lower() in ("all", "none", ""):
-        return None
-    blocks = set()
-    parts = selection_str.split(",")
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            try:
-                start_str, end_str = part.split("-")
-                start = int(start_str.strip())
-                end = int(end_str.strip())
-                for i in range(start, end + 1):
-                    blocks.add(i)
-            except ValueError:
-                pass
-        else:
-            try:
-                blocks.add(int(part))
-            except ValueError:
-                pass
-    return blocks
+        return x_B_T_H_W_D
 
 
 class StyleSelfAttnNetwork(nn.Module):
-    """Network containing StyleSelfAttnModule instances for DiT blocks."""
+    """Network containing strap-on StyleCorrectionBlock instances hooked after DiT blocks across stages."""
 
     def __init__(
         self,
         dit: nn.Module,
         rank: int = 32,
         num_heads: int = 2,
-        dropout: float = 0.0,
+        num_groups: int = 4,
+        custom_blocks_per_group: int = 1,
         target_blocks: Optional[str] = None,
+        num_blocks: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        use_rope: bool = True,
+        adaln_rank: int = 32,
+        **kwargs,
     ):
         super().__init__()
+        self.dit = [dit]
         self.rank = rank
         self.num_heads = num_heads
+        self.head_dim = rank // num_heads if rank % num_heads == 0 else rank
         self.dropout = dropout
-        self.target_blocks = target_blocks
+        self.use_rope = use_rope
+        self.adaln_rank = adaln_rank
+        self.multiplier = 1.0
 
-        parsed_blocks = parse_block_selection(target_blocks)
         model_dim = getattr(dit, "model_channels", 2048)
+        total_dit_blocks = len(dit.blocks) if hasattr(dit, "blocks") else 28
 
-        modules: List[StyleSelfAttnModule] = []
-        if hasattr(dit, "blocks"):
-            for idx, block in enumerate(dit.blocks):
-                if parsed_blocks is not None and idx not in parsed_blocks:
-                    continue
-                full_name = f"style_self_attn_block_{idx}"
-                modules.append(
-                    StyleSelfAttnModule(
-                        name=full_name,
-                        block=block,
-                        model_dim=model_dim,
-                        rank=rank,
-                        num_heads=num_heads,
-                        dropout=dropout,
-                    )
+        # Determine block routing: list of (base_block_idx, num_custom_blocks)
+        # Supports both:
+        # 1) Explicit target_blocks (e.g. "6,6" -> 2 blocks after block 6, or "6,13,20,27")
+        # 2) Automatic group division: N blocks divided into M groups, K custom blocks each
+        target_routing: List[Tuple[int, int]] = []
+
+        if target_blocks is not None and str(target_blocks).strip():
+            raw_indices = [int(x.strip()) for x in str(target_blocks).split(",") if x.strip()]
+            from collections import OrderedDict
+            counts = OrderedDict()
+            for idx in raw_indices:
+                idx = idx if idx >= 0 else total_dit_blocks + idx
+                if not (0 <= idx < total_dit_blocks):
+                    raise ValueError(f"Block index {idx} out of range for DiT with {total_dit_blocks} blocks.")
+                counts[idx] = counts.get(idx, 0) + 1
+            target_routing = [(idx, count) for idx, count in counts.items()]
+            self.num_groups = len(target_routing)
+            self.custom_blocks_per_group = max(count for _, count in target_routing) if target_routing else 1
+            self.target_blocks_str = ",".join(str(x) for x in raw_indices)
+        else:
+            M = num_groups or 4
+            K = custom_blocks_per_group or 1
+            if num_blocks is not None and num_groups == 4 and custom_blocks_per_group == 1:
+                # Compatibility: if legacy num_blocks was explicitly passed
+                pass
+
+            # Divide total_dit_blocks into M groups, checkpoint at end of each group
+            target_indices = [
+                min(int(math.ceil((i + 1) * total_dit_blocks / M)) - 1, total_dit_blocks - 1)
+                for i in range(M)
+            ]
+            seen = set()
+            unique_indices = []
+            for idx in target_indices:
+                if idx not in seen:
+                    seen.add(idx)
+                    unique_indices.append(idx)
+
+            target_routing = [(idx, K) for idx in unique_indices]
+            self.num_groups = len(target_routing)
+            self.custom_blocks_per_group = K
+
+            expanded = []
+            for idx, count in target_routing:
+                expanded.extend([idx] * count)
+            self.target_blocks_str = ",".join(str(x) for x in expanded)
+
+        self.target_routing = target_routing
+
+        # Instantiate StyleCorrectionBlock instances
+        self.blocks = nn.ModuleList()
+        self.block_index_mapping: List[Tuple[int, List[int]]] = []
+
+        block_counter = 0
+        for base_idx, count in self.target_routing:
+            indices = []
+            for k in range(count):
+                b = StyleCorrectionBlock(
+                    name=f"style_correction_b{base_idx}_k{k}",
+                    model_dim=model_dim,
+                    rank=rank,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    use_rope=use_rope,
+                    adaln_rank=adaln_rank,
                 )
+                self.blocks.append(b)
+                indices.append(block_counter)
+                block_counter += 1
+            self.block_index_mapping.append((base_idx, indices))
 
-        self.style_modules = nn.ModuleList(modules)
         logger.info(
-            f"StyleSelfAttnNetwork: created {len(self.style_modules)} modules "
-            f"(rank={rank}, num_heads={num_heads}, target_blocks={target_blocks!r})"
+            f"StyleSelfAttnNetwork: created {len(self.blocks)} strap-on correction blocks across "
+            f"{len(self.block_index_mapping)} checkpoints (targets={self.target_blocks_str}, rank={rank}, "
+            f"adaln_rank={adaln_rank}, num_heads={num_heads}, mlp_ratio={mlp_ratio}, use_rope={use_rope})"
         )
 
+    @property
+    def block_mapping(self) -> List[Tuple[int, List[StyleCorrectionBlock]]]:
+        return [(base_idx, [self.blocks[i] for i in indices]) for base_idx, indices in self.block_index_mapping]
+
+    def get_custom_blocks_map(self) -> dict:
+        return {base_idx: [self.blocks[i] for i in indices] for base_idx, indices in self.block_index_mapping}
+
     def apply_to(self):
-        for m in self.style_modules:
-            m.apply_to()
+        dit = self.dit[0]
+        network_ref = self
+
+        if hasattr(dit, "_orig_forward_mini_train_dit"):
+            logger.warning("Anima DiT forward_mini_train_dit already hooked, skipping re-hooking")
+            return
+
+        dit._orig_forward_mini_train_dit = dit.forward_mini_train_dit
+
+        def hooked_forward_mini_train_dit(
+            x_B_C_T_H_W: torch.Tensor,
+            timesteps_B_T: torch.Tensor,
+            crossattn_emb: torch.Tensor,
+            fps: Optional[torch.Tensor] = None,
+            padding_mask: Optional[torch.Tensor] = None,
+            source_attention_mask: Optional[torch.Tensor] = None,
+            t5_input_ids: Optional[torch.Tensor] = None,
+            t5_attn_mask: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            if t5_input_ids is not None and dit.use_llm_adapter and hasattr(dit, "llm_adapter"):
+                crossattn_emb = dit.llm_adapter(
+                    source_hidden_states=crossattn_emb,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=source_attention_mask,
+                )
+                if t5_attn_mask is not None:
+                    crossattn_emb[~t5_attn_mask.bool()] = 0
+
+            x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = dit.prepare_embedded_sequence(
+                x_B_C_T_H_W,
+                fps=fps,
+                padding_mask=padding_mask,
+            )
+
+            if timesteps_B_T.ndim == 1:
+                timesteps_B_T = timesteps_B_T.unsqueeze(1)
+            t_embedding_B_T_D, adaln_lora_B_T_3D = dit.t_embedder(timesteps_B_T)
+            t_embedding_B_T_D = dit.t_embedding_norm(t_embedding_B_T_D)
+
+            block_kwargs = {
+                "rope_emb_L_1_1_D": rope_emb_L_1_1_D,
+                "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
+                "extra_per_block_pos_emb": extra_pos_emb,
+            }
+
+            attn_params = attention.AttentionParams.create_attention_params(dit.attn_mode, dit.split_attn)
+            use_fp32 = x_B_T_H_W_D.dtype == torch.float16
+
+            # Compute style RoPE embedding ONCE per forward pass if needed (no global cache!)
+            style_rope_emb = None
+            if network_ref.use_rope and network_ref.head_dim >= 4 and network_ref.head_dim % 2 == 0:
+                B, T, H, W, D = x_B_T_H_W_D.shape
+                style_rope_emb = compute_2d_rope_emb(H, W, network_ref.head_dim, x_B_T_H_W_D.device)
+                if T > 1:
+                    style_rope_emb = repeat(style_rope_emb, "s 1 1 d -> (t s) 1 1 d", t=T)
+
+            custom_blocks_map = network_ref.get_custom_blocks_map()
+
+            for block_idx, block in enumerate(dit.blocks):
+                if dit.blocks_to_swap:
+                    dit.offloader.wait_for_block(block_idx)
+
+                x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
+
+                if dit.blocks_to_swap:
+                    dit.offloader.submit_move_blocks(dit.blocks, block_idx)
+
+                # Intercept AFTER base block: execute custom style block(s) sequentially
+                if block_idx in custom_blocks_map and network_ref.multiplier != 0.0:
+                    for custom_block in custom_blocks_map[block_idx]:
+                        x_B_T_H_W_D = custom_block(
+                            x_B_T_H_W_D,
+                            t_embedding_B_T_D,
+                            attn_params,
+                            rope_emb=style_rope_emb,
+                            multiplier=network_ref.multiplier,
+                        )
+
+            x_B_T_H_W_O = dit.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
+            x_B_C_Tt_Hp_Wp = dit.unpatchify(x_B_T_H_W_O)
+            return x_B_C_Tt_Hp_Wp
+
+        dit.forward_mini_train_dit = hooked_forward_mini_train_dit
+        logger.info(
+            f"Hooked StyleSelfAttnNetwork into DiT forward loop across {len(self.block_index_mapping)} checkpoint(s): "
+            f"{self.target_blocks_str}"
+        )
 
     def set_multiplier(self, multiplier: float):
-        for m in self.style_modules:
-            m.multiplier = multiplier
+        self.multiplier = multiplier
 
-
-# ---------------------------------------------------------------------------
-# Save / Load Helpers
-# ---------------------------------------------------------------------------
 
 def save_style_model(
     file: str,
@@ -536,24 +614,15 @@ def save_style_model(
     metadata: Optional[dict] = None,
 ):
     state_dict = network.state_dict()
-    names = [m.module_name for m in network.style_modules]
     out = {}
-
     for k, v in state_dict.items():
-        if k.startswith("style_modules."):
-            rest = k[len("style_modules."):]
-            idx_str, _, suffix = rest.partition(".")
-            idx = int(idx_str)
-            out[f"{names[idx]}.{suffix}"] = v
-            continue
-        out[k] = v
-
-    if dtype is not None:
-        for k in list(out.keys()):
-            out[k] = out[k].detach().clone().to("cpu").to(dtype)
-    else:
-        for k in list(out.keys()):
-            out[k] = out[k].detach().clone().to("cpu")
+        k = k.replace("._orig_mod.", ".")
+        if k.startswith("_orig_mod."):
+            k = k[len("_orig_mod."):]
+        if dtype is not None:
+            out[k] = v.detach().clone().to("cpu").to(dtype)
+        else:
+            out[k] = v.detach().clone().to("cpu")
 
     if metadata is not None and len(metadata) == 0:
         metadata = None
@@ -572,17 +641,7 @@ def load_style_weights(network: StyleSelfAttnNetwork, file: str, strict: bool = 
     else:
         weights_sd = torch.load(file, map_location="cpu")
 
-    name_to_idx = {m.module_name: i for i, m in enumerate(network.style_modules)}
-    converted = {}
-
-    for k, v in weights_sd.items():
-        head, dot, tail = k.partition(".")
-        if dot and head in name_to_idx:
-            converted[f"style_modules.{name_to_idx[head]}.{tail}"] = v
-            continue
-        converted[k] = v
-
-    info = network.load_state_dict(converted, strict=strict)
+    info = network.load_state_dict(weights_sd, strict=strict)
     logger.info(f"loaded StyleSelfAttnNetwork weights from {file}: {info}")
     return info
 
@@ -858,6 +917,10 @@ def train(args):
     logger.info("prepare accelerator")
     accelerator = accelerator_setup.prepare_accelerator(args)
     weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
+    if args.mixed_precision == "bf16" or getattr(args, "full_bf16", False):
+        weight_dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16" or getattr(args, "full_fp16", False):
+        weight_dtype = torch.float16
 
     # Tokenizers and strategies
     logger.info("Loading tokenizers...")
@@ -927,7 +990,7 @@ def train(args):
     # DiT (frozen)
     logger.info("Loading Anima DiT...")
     dit = anima_utils.load_anima_model(
-        "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=None
+        "cpu", args.pretrained_model_name_or_path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=weight_dtype
     )
 
     has_gradient_checkpointing = bool(args.gradient_checkpointing or (getattr(args, "gradient_checkpointing_blocks", None) is not None and args.gradient_checkpointing_blocks > 0))
@@ -950,13 +1013,27 @@ def train(args):
     dit.requires_grad_(False)
 
     # Build Style Self-Attention Network
-    logger.info("Building Style Self-Attention Network...")
+    logger.info("Building Strap-On Style Correction Network...")
+    use_rope = not getattr(args, "no_rope", False)
+    num_blocks = getattr(args, "num_blocks", None)
+    mlp_ratio = getattr(args, "mlp_ratio", 4.0) or 4.0
+    num_groups = getattr(args, "num_groups", 4) or 4
+    custom_blocks_per_group = getattr(args, "custom_blocks_per_group", 1) or 1
+    target_blocks = getattr(args, "target_blocks", None)
+    adaln_rank = getattr(args, "adaln_rank", 32) or 32
+
     network = StyleSelfAttnNetwork(
         dit=dit,
         rank=args.network_dim,
         num_heads=args.num_heads,
+        num_groups=num_groups,
+        custom_blocks_per_group=custom_blocks_per_group,
+        target_blocks=target_blocks,
+        num_blocks=num_blocks,
+        mlp_ratio=mlp_ratio,
         dropout=args.dropout,
-        target_blocks=args.target_blocks,
+        use_rope=use_rope,
+        adaln_rank=adaln_rank,
     )
     if hasattr(args, "style_multiplier") and args.style_multiplier is not None:
         network.set_multiplier(args.style_multiplier)
@@ -965,6 +1042,24 @@ def train(args):
         logger.info(f"Loading network weights from {args.network_weights}")
         load_style_weights(network, args.network_weights, strict=False)
 
+    # dtype setup
+    dit_weight_dtype = weight_dtype
+    if args.full_fp16:
+        assert args.mixed_precision == "fp16", "full_fp16 requires mixed_precision='fp16'"
+        accelerator.print("enable full fp16 training.")
+    elif args.full_bf16:
+        assert args.mixed_precision == "bf16", "full_bf16 requires mixed_precision='bf16'"
+        accelerator.print("enable full bf16 training.")
+    else:
+        dit_weight_dtype = weight_dtype
+
+    dit.to(dit_weight_dtype)
+    dit.to(accelerator.device)
+
+    network_dtype = weight_dtype if (args.mixed_precision != "no" or args.full_fp16 or args.full_bf16) else torch.float32
+    network.to(network_dtype)
+    network.to(accelerator.device)
+
     network.apply_to()
     wrapper = AnimaStyleWrapper(dit, network)
 
@@ -972,7 +1067,7 @@ def train(args):
     num_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
     logger.info(f"Total trainable parameters: {num_trainable:,} ({num_trainable * 2 / 1024 / 1024:.2f} MB in fp16)")
 
-    # Optimizer & LR Scheduler
+    # Optimizer & LR Scheduler (bound to actual GPU parameters)
     _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=trainable_params)
     optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
@@ -998,28 +1093,8 @@ def train(args):
     train_dataset_group.set_max_train_steps(args.max_train_steps)
     lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
-    # dtype setup
-    dit_weight_dtype = weight_dtype
-    if args.full_fp16:
-        assert args.mixed_precision == "fp16", "full_fp16 requires mixed_precision='fp16'"
-        accelerator.print("enable full fp16 training.")
-    elif args.full_bf16:
-        assert args.mixed_precision == "bf16", "full_bf16 requires mixed_precision='bf16'"
-        accelerator.print("enable full bf16 training.")
-    else:
-        dit_weight_dtype = weight_dtype
-
-    dit.to(dit_weight_dtype)
-    dit.to(accelerator.device)
-
-    network_dtype = torch.float32
-    if args.full_fp16 or args.full_bf16:
-        network_dtype = weight_dtype
-    network.to(network_dtype)
-    network.to(accelerator.device)
-
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
-        if getattr(args, "offload_text_encoder_to_cpu", False) or getattr(args, "precompute_epoch_text_embeds", True):
+        if getattr(args, "offload_text_encoder_to_cpu", False) or getattr(args, "precompute_epoch_text_embeds", False):
             logger.info("Keeping Qwen3 text encoder on CPU to maximize GPU VRAM headroom.")
             qwen3_text_encoder.to("cpu")
         else:
@@ -1039,8 +1114,11 @@ def train(args):
     compile_utils.apply_cuda_optimizations(args)
 
     if args.compile:
-        dit_to_compile = accelerator.unwrap_model(wrapper).dit
+        unwrapped = accelerator.unwrap_model(wrapper)
+        dit_to_compile = unwrapped.dit
+        network_to_compile = unwrapped.network
         compile_utils.compile_transformer(args, dit_to_compile, [dit_to_compile.blocks], disable_linear=False)
+        compile_utils.compile_transformer(args, network_to_compile, [network_to_compile.blocks], disable_linear=False)
 
     if args.full_fp16:
         accelerator_setup.patch_accelerator_for_fp16_training(accelerator)
@@ -1104,12 +1182,16 @@ def train(args):
         sai_metadata = model_io.get_sai_model_spec_dataclass(
             None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
         ).to_metadata_dict()
-        sai_metadata["modelspec.architecture"] = "anima-preview/style-self-attn-network"
-        sai_metadata["style_self_attn.version"] = "1.0"
+        sai_metadata["modelspec.architecture"] = "anima-preview/style-correction-network"
+        sai_metadata["style_self_attn.version"] = "2.0"
         sai_metadata["style_self_attn.rank"] = str(args.network_dim)
         sai_metadata["style_self_attn.num_heads"] = str(args.num_heads)
-        if args.target_blocks is not None:
-            sai_metadata["style_self_attn.target_blocks"] = str(args.target_blocks)
+        sai_metadata["style_self_attn.num_blocks"] = str(len(network.blocks))
+        sai_metadata["style_self_attn.num_groups"] = str(network.num_groups)
+        sai_metadata["style_self_attn.custom_blocks_per_group"] = str(network.custom_blocks_per_group)
+        sai_metadata["style_self_attn.target_blocks"] = network.target_blocks_str
+        sai_metadata["style_self_attn.adaln_rank"] = str(network.adaln_rank)
+        sai_metadata["style_self_attn.mlp_ratio"] = str(getattr(args, "mlp_ratio", 4.0))
         unwrapped = accelerator.unwrap_model(wrapper).network
         save_style_model(ckpt_file, unwrapped, dtype=save_dtype, metadata=sai_metadata)
 
@@ -1491,10 +1573,45 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Dropout rate for style self-attention (default: 0.0).",
     )
     parser.add_argument(
+        "--num_groups",
+        type=int,
+        default=4,
+        help="Number of block groups to divide the DiT into for multi-stage style correction (default: 4).",
+    )
+    parser.add_argument(
+        "--custom_blocks_per_group",
+        type=int,
+        default=1,
+        help="Number of custom style correction blocks to inject after each group (default: 1).",
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=int,
+        default=None,
+        help="[Legacy/compatibility] Number of strap-on style correction transformer blocks.",
+    )
+    parser.add_argument(
+        "--mlp_ratio",
+        type=float,
+        default=4.0,
+        help="MLP hidden dimension multiplier ratio (default: 4.0).",
+    )
+    parser.add_argument(
+        "--adaln_rank",
+        type=int,
+        default=32,
+        help="Bottleneck rank for low-rank AdaLN modulation (default: 32).",
+    )
+    parser.add_argument(
         "--target_blocks",
         type=str,
         default=None,
-        help="Comma-separated block indices or ranges to target (e.g. '0-27' or '5,6,7'). Default is all blocks.",
+        help="Explicit comma-separated block indices to hook after (e.g. '6,13,20,27', or '6,6' to add 2 blocks after block 6). Overrides num_groups.",
+    )
+    parser.add_argument(
+        "--no_rope",
+        action="store_true",
+        help="Disable 2D RoPE positional embeddings in the style self-attention bottleneck.",
     )
     parser.add_argument(
         "--style_multiplier",

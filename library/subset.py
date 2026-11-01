@@ -87,6 +87,15 @@ class BaseSubset:
         self.resize_interpolation = resize_interpolation
 
 
+class StreamingSubset(BaseSubset):
+    """Sequential archive source; shares the standard augmentation/caption options."""
+
+    def __init__(self, shards, max_member_bytes=64 * 1024 * 1024, **kwargs):
+        super().__init__(alpha_mask=False, **kwargs)
+        self.shards = list(shards)
+        self.max_member_bytes = max_member_bytes
+
+
 class DreamBoothSubset(BaseSubset):
     def __init__(
         self,

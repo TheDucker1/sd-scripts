@@ -1,0 +1,29 @@
+# Standard dataset configuration; use with --dataset_config on the Colab host.
+# This is a full-resolution data example, not the tiny test preset.
+[general]
+resolution = [768, 768]
+resize_interpolation = "area"
+shuffle_caption = true
+keep_tokens = 0
+caption_dropout_rate = 0.0
+caption_tag_dropout_rate = 0.0
+
+[[datasets]]
+batch_size = 1
+enable_bucket = true
+max_pixels = 589824 # 768*768; use 1000000 for a decimal 1 MP per image.
+min_bucket_reso = 256
+max_bucket_reso = 1536
+bucket_reso_steps = 64
+bucket_no_upscale = false
+max_aspect_ratio = 3.0
+repeat = true
+shuffle_buffer = 0 # Required: no decoded-image look-ahead or shuffle queue.
+
+[[datasets.subsets]]
+shards = ["https://huggingface.co/datasets/nyanko7/danbooru2023/resolve/main/original/data-0000.tar"]
+max_member_bytes = 67108864
+random_crop = false
+flip_aug = false
+color_aug = false
+# Additional subsets inherit general/dataset options and run in declared order.

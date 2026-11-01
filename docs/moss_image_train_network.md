@@ -2,6 +2,9 @@
 
 This document explains how to train LoRA (Low-Rank Adaptation) models for MOSS-Image using `moss_image_train_network.py` in the `sd-scripts` repository.
 
+For the separate single-reference content/style objective and small random-weight development runs, see [MOSS style training](moss_image_style_training.md).
+For remote-only environment and asset preparation, see [Colab setup](moss_colab_setup.md).
+
 <details>
 <summary>日本語</summary>
 

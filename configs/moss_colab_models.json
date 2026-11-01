@@ -1,0 +1,69 @@
+{
+  "models": [
+    {
+      "name": "moss",
+      "repo_id": "OpenMOSS-Team/MOSS-Image-SFT",
+      "revision": "main",
+      "allow_patterns": ["transformer/*", "text_encoder/config.json", "vae/*", "tokenizer/*", "scheduler/*", "model_index.json", "pipeline_moss_image.py", "LICENSE", "README.md"],
+      "required_patterns": ["transformer/*.safetensors", "vae/*.safetensors", "tokenizer/tokenizer_config.json"]
+    },
+    {
+      "name": "edit_adapter",
+      "repo_id": "chinoll/Moss-Image-Edit",
+      "revision": "main",
+      "allow_patterns": ["adapter_config.json", "adapter_model.safetensors", "README.md"]
+    },
+    {
+      "name": "tagger",
+      "repo_id": "Bedovyy/pixai-tagger-v1.0-timm",
+      "revision": "main",
+      "load_dtype": "bfloat16",
+      "allow_patterns": ["*.json", "*.csv", "*.py", "model.safetensors", "README.md", "LICENSE*"]
+    },
+    {
+      "name": "content_encoder",
+      "repo_id": "facebook/dinov3-vitb16-pretrain-lvd1689m",
+      "revision": "main",
+      "allow_patterns": ["config.json", "preprocessor_config.json", "model.safetensors", "README.md", "LICENSE*"]
+    },
+    {
+      "name": "style_encoder",
+      "repo_id": "Gaojunyao/MegaStyle",
+      "revision": "main",
+      "allow_patterns": ["megastyle_encoder.pth", "README.md"]
+    },
+    {
+      "name": "style_architecture",
+      "repo_id": "google/siglip-so400m-patch14-384",
+      "revision": "main",
+      "allow_patterns": ["config.json", "preprocessor_config.json"]
+    }
+  ],
+  "text_encoder_profiles": {
+    "int8_convrot": {
+      "name": "text_encoder",
+      "repo_id": "Comfy-Org/MOSS-Image",
+      "revision": "main",
+      "format": "convrot_int8",
+      "loader": "library.moss_image_utils.load_text_encoder",
+      "loader_kwargs": {"convrot_int8": true},
+      "allow_patterns": ["text_encoders/qwen3.5_9b_int8_convrot.safetensors"],
+      "required_patterns": ["text_encoders/qwen3.5_9b_int8_convrot.safetensors"]
+    },
+    "bf16": {
+      "name": "text_encoder",
+      "repo_id": "OpenMOSS-Team/MOSS-Image-SFT",
+      "revision": "main",
+      "format": "bf16",
+      "loader": "library.moss_image_utils.load_text_encoder",
+      "loader_kwargs": {"convrot_int8": false},
+      "allow_patterns": ["text_encoder/*"],
+      "required_patterns": ["text_encoder/model*.safetensors"]
+    }
+  },
+  "dataset": {
+    "repo_id": "nyanko7/danbooru2023",
+    "revision": "main",
+    "directory": "original"
+  }
+}

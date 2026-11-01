@@ -318,6 +318,7 @@ class MossImage(nn.Module):
         rope_base: float = 10000.0,
         attn_mode: str = "torch",
         split_attn: bool = False,
+        block_class: type[nn.Module] = MossImageBlock,
     ):
         super().__init__()
         if dim % num_heads or (dim // num_heads) % 8 or freq_dim % 2:
@@ -337,7 +338,7 @@ class MossImage(nn.Module):
         self.rope = MossImageRoPE(dim // num_heads, rope_base)
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.shared_block_modulation = nn.Linear(dim, 6 * dim)
-        self.layers = nn.ModuleList([MossImageBlock(dim, ffn_dim, num_heads) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([block_class(dim, ffn_dim, num_heads) for _ in range(num_layers)])
         self.final_norm_video = MossImageRMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)

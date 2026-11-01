@@ -1387,9 +1387,9 @@ def expand_unet_to_inpainting(unet) -> None:
     unet.in_channels = 9
 
 
-def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64):
+def make_bucket_resolutions(max_reso, min_size=256, max_size=1024, divisible=64, max_area=None):
     max_width, max_height = max_reso
-    max_area = max_width * max_height
+    max_area = max_width * max_height if max_area is None else max_area
 
     resos = set()
 

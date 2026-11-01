@@ -2,6 +2,7 @@ import argparse
 from dataclasses import (
     asdict,
     dataclass,
+    field,
 )
 import functools
 import random
@@ -146,16 +147,35 @@ class ControlNetDatasetParams(BaseDatasetParams):
 
 
 @dataclass
+class StreamingSubsetParams(BaseSubsetParams):
+    shards: List[str] = field(default_factory=list)
+    max_member_bytes: int = 64 * 1024 * 1024
+
+
+@dataclass
+class StreamingDatasetParams(DreamBoothDatasetParams):
+    repeat: bool = True
+    max_pixels: Optional[int] = None
+    max_megapixels: Optional[float] = None
+    max_aspect_ratio: float = 3.0
+    bucket_sizes: Optional[List[List[int]]] = None
+    shuffle_buffer: int = 0
+    rank: int = 0
+    world_size: int = 1
+
+
+@dataclass
 class SubsetBlueprint:
-    params: Union[DreamBoothSubsetParams, FineTuningSubsetParams]
+    params: Union[DreamBoothSubsetParams, FineTuningSubsetParams, StreamingSubsetParams]
 
 
 @dataclass
 class DatasetBlueprint:
     is_dreambooth: bool
     is_controlnet: bool
-    params: Union[DreamBoothDatasetParams, FineTuningDatasetParams]
+    params: Union[DreamBoothDatasetParams, FineTuningDatasetParams, StreamingDatasetParams]
     subsets: Sequence[SubsetBlueprint]
+    is_streaming: bool = False
 
 
 @dataclass
@@ -481,7 +501,90 @@ class BlueprintGenerator:
 
         return default_value
 
+def generate_streaming_blueprint(user_config: dict, batch_size=1) -> DatasetBlueprint:
+    """Reuse general/dataset/subset schemas and fallbacks without a filesystem scan.
+
+    One sequential dataset may have multiple tar subsets. Multi-dataset stream
+    mixing is not implemented; do not route an iterable through DatasetGroup's
+    indexed schedule or silently ignore additional datasets.
+    """
+    common = {
+        **ConfigSanitizer.DATASET_ASCENDABLE_SCHEMA,
+        **ConfigSanitizer.SUBSET_ASCENDABLE_SCHEMA,
+        **ConfigSanitizer.DO_SUBSET_ASCENDABLE_SCHEMA,
+        "repeat": bool,
+        "max_pixels": int,
+        "max_megapixels": Any(float, int),
+        "max_aspect_ratio": Any(float, int),
+        "bucket_sizes": [ExactSequence([int, int])],
+        "shuffle_buffer": int,
+        "rank": int,
+        "world_size": int,
+        "max_member_bytes": int,
+        "train_inpainting": bool,
+        "debug_dataset": bool,
+        "prior_loss_weight": Any(float, int),
+        "image_dir": str,
+        "metadata_file": str,
+        "conditioning_data_dir": str,
+        "cache_info": bool,
+        "alpha_mask": bool,
+    }
+    subset_schema = {
+        **ConfigSanitizer.SUBSET_ASCENDABLE_SCHEMA,
+        **ConfigSanitizer.DO_SUBSET_ASCENDABLE_SCHEMA,
+        Required("shards"): [str],
+        "max_member_bytes": int,
+        "image_dir": str,
+        "metadata_file": str,
+        "conditioning_data_dir": str,
+        "cache_info": bool,
+        "alpha_mask": bool,
+        "validation_seed": int,
+        "validation_split": float,
+    }
+    dataset_schema = {**common, Required("subsets"): [subset_schema]}
+    sanitized = Schema({"general": common, Required("datasets"): [dataset_schema]})(user_config)
+    datasets = sanitized["datasets"]
+    if len(datasets) != 1 or not datasets[0]["subsets"]:
+        raise ValueError("Strict streaming requires one dataset with one or more sequential tar subsets")
+    general = sanitized.get("general", {})
+    dataset = datasets[0]
+    disabled = {
+        "image_dir": None, "metadata_file": None, "conditioning_data_dir": None,
+        "cache_info": False, "alpha_mask": False, "face_crop_aug_range": None,
+        "caption_dropout_every_n_epochs": 0, "validation_split": 0.0,
+        "num_repeats": 1, "network_multiplier": 1.0, "prior_loss_weight": 1.0,
+        "train_inpainting": False, "debug_dataset": False, "shuffle_buffer": 0,
+    }
+    for scope in (general, dataset, *dataset["subsets"]):
+        for name, required in disabled.items():
+            if name in scope and scope[name] != required:
+                raise ValueError(f"{name}={scope[name]!r} is unavailable in strict streaming; required value is {required!r}")
+    fallbacks = [dataset, general, {"batch_size": batch_size, "resolution": (256, 256)}]
+    params = BlueprintGenerator.generate_params_by_fallbacks(StreamingDatasetParams, fallbacks)
+    if params.batch_size < 1 or params.shuffle_buffer != 0 or not 0 <= params.rank < params.world_size:
+        raise ValueError("Invalid streaming batch size, shuffle buffer, or rank/world_size")
+    subsets = []
+    for subset in dataset["subsets"]:
+        values = BlueprintGenerator.generate_params_by_fallbacks(StreamingSubsetParams, [subset, dataset, general])
+        if not values.shards or values.max_member_bytes < 1:
+            raise ValueError("Streaming subsets require nonempty shards and a positive max_member_bytes")
+        subsets.append(SubsetBlueprint(values))
+    return DatasetBlueprint(False, False, params, subsets, is_streaming=True)
+
+
+def generate_streaming_dataset_by_blueprint(blueprint: DatasetBlueprint, seed=42):
+    if not blueprint.is_streaming:
+        raise ValueError("Expected a streaming dataset blueprint")
+    from library.streaming_dataset import StreamingDataset
+
+    return StreamingDataset(blueprint.params, [subset.params for subset in blueprint.subsets], seed=seed)
+
+
 def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
+    if any(blueprint.is_streaming for blueprint in dataset_group_blueprint.datasets):
+        raise ValueError("Streaming blueprints use generate_streaming_dataset_by_blueprint; DatasetGroup requires an index/length")
     datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:

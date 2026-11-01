@@ -254,7 +254,7 @@ class ImageInfo:
 
 
 class BucketManager:
-    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps) -> None:
+    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps, max_area=None) -> None:
         if max_size is not None:
             if max_reso is not None:
                 assert max_size >= max_reso[0], "the max_size should be larger than the width of max_reso"
@@ -263,12 +263,17 @@ class BucketManager:
                 assert max_size >= min_size, "the max_size should be larger than the min_size"
 
         self.no_upscale = no_upscale
+        self._max_area_override = max_area
         if max_reso is None:
             self.max_reso = None
             self.max_area = None
         else:
             self.max_reso = max_reso
             self.max_area = max_reso[0] * max_reso[1]
+        if max_area is not None:
+            if not isinstance(max_area, int) or max_area < 1:
+                raise ValueError("max_area must be a positive integer")
+            self.max_area = max_area
         self.min_size = min_size
         self.max_size = max_size
         self.reso_steps = reso_steps
@@ -302,7 +307,12 @@ class BucketManager:
         self.reso_to_id = sorted_reso_to_id
 
     def make_buckets(self):
-        resos = model_util.make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps)
+        if self._max_area_override is None:
+            resos = model_util.make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps)
+        else:
+            resos = model_util.make_bucket_resolutions(
+                self.max_reso, self.min_size, self.max_size, self.reso_steps, max_area=self.max_area
+            )
         self.set_predefined_resos(resos)
 
     def set_predefined_resos(self, resos):
@@ -323,7 +333,7 @@ class BucketManager:
         x = int(x + 0.5)
         return x - x % self.reso_steps
 
-    def select_bucket(self, image_width, image_height):
+    def select_bucket(self, image_width, image_height, register=True):
         aspect_ratio = image_width / image_height
         if not self.no_upscale:
             # 拡大および縮小を行う
@@ -380,7 +390,10 @@ class BucketManager:
 
             reso = (bucket_width, bucket_height)
 
-        self.add_if_new_reso(reso)
+        # Streaming callers need geometry only; do not accumulate arbitrary
+        # no-upscale resolutions or per-image bookkeeping over an endless stream.
+        if register:
+            self.add_if_new_reso(reso)
 
         ar_error = (reso[0] / reso[1]) - aspect_ratio
         return reso, resized_size, ar_error

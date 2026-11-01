@@ -168,7 +168,7 @@ def build_pretrained_components(config, device):
     from transformers import DINOv3ViTModel, SiglipVisionConfig, SiglipVisionModel
 
     device = torch.device(device)
-    offload_text = config.get("offload_text_encoder", True) and device.type == "cuda"
+    offload_text = config.get("offload_text_encoder", False) and device.type == "cuda"
     assets = read_asset_manifest(config["assets_manifest"])
     roots = {name: Path(entry["local_dir"]) for name, entry in assets.items()}
     config["pretrained_assets"] = assets
@@ -244,6 +244,8 @@ def build_pretrained_components(config, device):
         text_encoder.register_forward_hook(stage_text_out, always_call=True)
         text_encoder._moss_cpu_offload = True
         logger.info("Qwen weights stay in CPU RAM between GPU prompt encodings")
+    else:
+        logger.info("Qwen weights remain resident on %s; text encoder offloading is disabled", device)
     if text_encoder.config.hidden_size != dit.text_dim or vae.latent_channels * 4 != dit.latent_channels:
         raise ValueError("Pretrained text/VAE dimensions disagree with MOSS")
     factor = 2 ** (len(vae.params.ch_mult) - 1) * 2

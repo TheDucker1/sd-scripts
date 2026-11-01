@@ -4,7 +4,7 @@
   "dtype": "bfloat16",
   "gradient_checkpointing": true,
   "max_prompt_length": 512,
-  "offload_text_encoder": true,
+  "offload_text_encoder": false,
   "assets_manifest": "/content/moss-models/resolved_models.json",
   "tagger": {
     "dtype": "bfloat16", "max_tags": 256,

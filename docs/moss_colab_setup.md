@@ -104,11 +104,12 @@ encoder implementation and numerical checks. A smaller Qwen model is also not
 a drop-in replacement for MOSS's learned 4096-dimensional conditioning.
 
 The style trainer reuses the repository's established MOSS and text loaders.
-By default `offload_text_encoder=true` keeps Qwen weights in CPU RAM, stages them
+By default `offload_text_encoder=false` keeps Qwen weights and computation on
+the training GPU. If explicitly enabled, `offload_text_encoder=true` keeps weights in CPU RAM, stages them
 onto the training GPU for each prompt forward, and returns them to CPU afterward,
 including when forward raises. Text embeddings stay on the training GPU. Keep
 Qwen eager when offloaded; the default `--compile_modules dit` does this.
-Set `offload_text_encoder=false` for fully resident text weights. This saves
+That optional offloading mode saves
 allocated GPU memory during training at the cost of CPU RAM and transfer time;
 CUDA reserved memory can remain high because the allocator reuses it. The other
 components remain on the selected training device. Online tag
@@ -217,6 +218,17 @@ values with the step, consumed batches and prompt.
 
 No installation, training, model download, or tests were run locally for these
 notebook and training-control changes.
+
+With PyTorch 2.10 and the Inductor backend, MOSS disables
+`triton.coalesce_tiling_analysis`. The observed compiler failure occurs in that
+optional optimization's SymPy constant analysis of symbolic slice expressions.
+The workaround skips that heuristic while retaining per-block Inductor
+compilation and dynamic shapes; it does not suppress compiler errors or silently
+fall back to eager execution. See the
+[PyTorch scheduling guard](https://github.com/pytorch/pytorch/blob/v2.10.0/torch/_inductor/codegen/simd.py)
+and [configuration](https://github.com/pytorch/pytorch/blob/v2.10.0/torch/_inductor/config.py).
+This workaround was reviewed against source and the supplied traceback; it has
+not been executed locally.
 
 The notebook exposes `SHUFFLE_BUFFER=16`, measured in individual images before
 A/B pairing. Images are resized and normalized before entering the bounded local

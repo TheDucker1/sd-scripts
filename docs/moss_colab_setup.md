@@ -30,8 +30,8 @@ override. Do not run its commands on the Windows workstation.
 4. Run the setup cell. Leave `DOWNLOAD_MODELS=True` for the requested assets;
    set it to false for environment-only preparation. Optional Drive storage
    persists assets across VM resets; the environment itself stays under `/content`.
-   Leave `TEXT_ENCODER='int8_convrot'` for the supported quantized encoder;
-   choosing `bf16` explicitly downloads the full-precision encoder instead.
+   Leave `TEXT_ENCODER='bf16'` for the larger GPU runtime; choosing
+   `int8_convrot` explicitly selects the lower-memory quantized encoder instead.
 
 The script uses a separate bootstrap venv to install uv, then uv to create the
 training venv with Python 3.12. It pins the tested torch 2.10.0 / torchvision
@@ -55,7 +55,7 @@ The selection is declared in `configs/moss_colab_models.json`:
 | Directory | Source | Files |
 | --- | --- | --- |
 | `moss` | OpenMOSS-Team/MOSS-Image-SFT | DiT, VAE, tokenizer, scheduler/config; full text-encoder weights excluded |
-| `text_encoder` | Comfy-Org/MOSS-Image (default) | `text_encoders/qwen3.5_9b_int8_convrot.safetensors` |
+| `text_encoder` | OpenMOSS-Team/MOSS-Image-SFT (default) | BF16 `text_encoder/` shards; optional Comfy-Org ConvRot INT8 profile |
 | `edit_adapter` | chinoll/Moss-Image-Edit | Adapter weights and settings |
 | `tagger` | Bedovyy/pixai-tagger-v1.0-timm | Weights, custom architecture, labels, preprocessing/config |
 | `content_encoder` | facebook/dinov3-vitb16-pretrain-lvd1689m | DINOv3 weights and processor/config |
@@ -78,9 +78,11 @@ subprocess, use the notebook's hidden input cell instead. Authentication remains
 available for retries within the same Colab runtime; a fresh runtime asks again
 unless Colab Secrets supplies it. No login or access check was executed locally.
 The selected text-encoder profile is included in that plan, with its intended
-format and existing-loader arguments. Default INT8 setup never requests the
-BF16 text-encoder shards. If an older setup already downloaded BF16 files, these
-are left untouched; they are not selected by the new INT8 profile.
+format and existing-loader arguments. The BF16 profile selects the original
+Qwen checkpoint shards; the INT8 profile selects only the pre-quantized file.
+Changing profiles updates the text-encoder manifest entry while reusing the
+other pinned assets. Files from the previous profile remain on disk and are not
+loaded by the newly selected profile. Rerun setup after changing this setting.
 
 ## Qwen3.5-9B quantization support
 
@@ -90,11 +92,25 @@ It loads the text model only and drops the vision tower. INT8 weight storage is
 retained, rather than converting the entire encoder back to BF16. Non-quantized
 parameters/operations still use floating point.
 
-The default download is
+The default is now the BF16 Qwen checkpoint from MOSS SFT. This removes ConvRot
+activation quantization and its per-matrix-shape Triton GEMM autotuning from text
+encoding, at the cost of additional GPU weight memory. The supplied stage log
+showed four different prompt lengths and 21.789 seconds in Qwen; the existing
+INT8 GEMM autotuner keys on exact `(m, n, k)`, so changing prompt lengths can
+repeatedly benchmark launch configurations even without `torch.compile`.
+No speedup is assumed until measured on the Colab GPU.
+
+The optional lower-memory INT8 download is
 [`qwen3.5_9b_int8_convrot.safetensors`](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_int8_convrot.safetensors).
 The Comfy-Org listing reports 9.75 GB for this file versus 19.3 GB for its BF16
 file. Those are download sizes, not GPU-memory measurements; the existing loader
 does not load all components present in a multimodal checkpoint.
+
+For an already-uploaded notebook, set `TEXT_ENCODER='bf16'`, rerun the setup cell
+to fetch the Qwen shards and update `resolved_models.json`, then restart the
+training subprocess. No other models need to be downloaded again when their
+cached files are complete. If the old run has saved INT8 checkpoints, use a new
+run name: strict resume checks intentionally reject changing frozen model assets.
 
 W4A8/GPTQ and GGUF are **not supported by this loader**, even though such files
 may work in ComfyUI. They are deliberately not offered as setup profiles.

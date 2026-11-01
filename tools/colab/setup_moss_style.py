@@ -246,7 +246,7 @@ def main():
     parser.add_argument("--models-dir", default="/content/moss-models")
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--torch-backend", default="auto", help="uv PyTorch wheel backend, e.g. auto or cu128")
-    parser.add_argument("--text-encoder", choices=["int8_convrot", "bf16"], default="int8_convrot")
+    parser.add_argument("--text-encoder", choices=["int8_convrot", "bf16"], default="bf16")
     parser.add_argument("--skip-models", action="store_true", help="Prepare only the isolated environment")
     parser.add_argument("--assets-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()

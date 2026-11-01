@@ -15,9 +15,10 @@ override. Do not run its commands on the Windows workstation.
 1. Upload the notebook to Colab and select a GPU runtime.
 2. The source cell defaults to cloning `https://github.com/TheDucker1/sd-scripts`,
    branch `style_loss`. Commit and push all current MOSS/streaming/Colab changes
-   there first. Reruns reuse
-   the existing checkout without resetting/pulling it, validate origin/branch,
-   and record its commit in `moss-source.json`. Upload/existing source modes
+   there first. Notebook reruns fetch and fast-forward
+   the existing checkout after checking origin, branch and tracked-file edits,
+   and record its commit in `moss-source.json`. Local edits or diverged history
+   stop the update without discarding work. Upload/existing source modes
    remain optional. A source ZIP must exclude weights, datasets, environments,
    `.git`, and credentials.
 3. Run the token cell. It reuses `HF_TOKEN` from this runtime or Colab Secrets;
@@ -103,8 +104,14 @@ encoder implementation and numerical checks. A smaller Qwen model is also not
 a drop-in replacement for MOSS's learned 4096-dimensional conditioning.
 
 The style trainer reuses the repository's established MOSS and text loaders.
-Its default placement keeps components resident on the selected training device;
-automatic component offload is not implemented. Online tag
+By default `offload_text_encoder=true` keeps Qwen weights in CPU RAM, stages them
+onto the training GPU for each prompt forward, and returns them to CPU afterward,
+including when forward raises. Text embeddings stay on the training GPU. Keep
+Qwen eager when offloaded; the default `--compile_modules dit` does this.
+Set `offload_text_encoder=false` for fully resident text weights. This saves
+allocated GPU memory during training at the cost of CPU RAM and transfer time;
+CUDA reserved memory can remain high because the allocator reuses it. The other
+components remain on the selected training device. Online tag
 shuffling requires encoding each new prompt, so text-output caching cannot
 simply remove Qwen from the runtime. INT8 alone does not establish that the DiT,
 text encoder, VAE, tagger, and differentiable loss encoders all fit together on a

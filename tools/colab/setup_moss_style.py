@@ -89,10 +89,10 @@ def prepare_source(args):
 def prepare_environment(args, repo):
     bootstrap = Path("/content/.moss-uv-bootstrap")
     if not (bootstrap / "bin/python").exists():
-        run([sys.executable, "-m", "venv", bootstrap])
+        run([sys.executable, "-m", "venv", "--without-pip", bootstrap])
     uv = bootstrap / "bin/uv"
     if not uv.exists():
-        run([bootstrap / "bin/python", "-m", "pip", "install", "uv"])
+        run([sys.executable, "-m", "pip", "--python", bootstrap / "bin/python", "install", "uv"])
     run([uv, "--version"])
     environment = content_path(args.venv)
     python = environment / "bin/python"

@@ -242,6 +242,8 @@ def configure_style_compile(components, args):
     compile_utils.apply_cuda_optimizations(args)
     if not args.compile:
         return
+    if "text" in args.compile_modules and getattr(components.text_encoder, "_moss_cpu_offload", False):
+        raise ValueError("Offloaded Qwen must remain eager; use --compile_modules dit or disable offload_text_encoder")
     if args.compile_cache_size_limit is not None:
         torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
     options = dict(

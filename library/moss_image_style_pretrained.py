@@ -165,8 +165,10 @@ def image_preprocessing(directory):
 
 
 def build_pretrained_components(config, device):
-    from transformers import DINOv3ViTModel, SiglipConfig, SiglipVisionModel
+    from transformers import DINOv3ViTModel, SiglipVisionConfig, SiglipVisionModel
 
+    device = torch.device(device)
+    offload_text = config.get("offload_text_encoder", True) and device.type == "cuda"
     assets = read_asset_manifest(config["assets_manifest"])
     roots = {name: Path(entry["local_dir"]) for name, entry in assets.items()}
     config["pretrained_assets"] = assets
@@ -190,7 +192,7 @@ def build_pretrained_components(config, device):
         text_path = first_weight(roots["text_encoder"] / "text_encoder", "model")
     else:
         raise ValueError("Supported text encoder formats: convrot_int8 or bf16")
-    text_encoder = moss_image_utils.load_text_encoder(str(text_path), dtype=dtype, device=device,
+    text_encoder = moss_image_utils.load_text_encoder(str(text_path), dtype=dtype, device="cpu" if offload_text else device,
                                                      convrot_int8=text_options["format"] == "convrot_int8")
     tokenizer = MossPromptTokenizer(roots["moss"] / "tokenizer", config.get("max_prompt_length", 512))
     tagger = load_prompt_tagger(roots["tagger"], config.get("tagger", {}), device)
@@ -200,19 +202,48 @@ def build_pretrained_components(config, device):
     if any(loading.get(name) for name in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise ValueError(f"DINOv3 checkpoint does not match its architecture: {loading}")
     with init_empty_weights():
-        siglip_config = SiglipConfig.from_pretrained(str(roots["style_architecture"]), local_files_only=True).vision_config
+        siglip_options = json.loads((roots["style_architecture"] / "config.json").read_text(encoding="utf-8"))
+        siglip_config = SiglipVisionConfig(**siglip_options.get("vision_config", siglip_options))
         siglip = SiglipVisionModel(siglip_config)
     state = torch.load(roots["style_encoder"] / "megastyle_encoder.pth", map_location="cpu", weights_only=True)
     state = state["model"] if isinstance(state, dict) and "model" in state else state
     state = {name.removeprefix("module."): value.to(dtype) if value.is_floating_point() else value
              for name, value in state.items()}
+    expected = set(siglip.state_dict())
+    if set(state) != expected:
+        # Transformers 5 flattened the vision-only model's vision_model prefix.
+        # Normalize only when every key matches, retaining strict weight loading.
+        converted = {name.removeprefix("vision_model."): value for name, value in state.items()}
+        if all(name.startswith("vision_model.") for name in expected):
+            converted = {"vision_model." + name: value for name, value in converted.items()}
+        if len(converted) != len(state) or set(converted) != expected:
+            raise ValueError(
+                f"MegaStyle key mismatch: missing={sorted(expected - set(converted))[:8]}, "
+                f"unexpected={sorted(set(converted) - expected)[:8]}"
+            )
+        state = converted
     siglip.load_state_dict(state, strict=True, assign=True)
     del state
     content = FrozenImageFeatures(dino, output="cls", **image_preprocessing(roots["content_encoder"]))
     style = FrozenImageFeatures(siglip, output="pooler", **image_preprocessing(roots["style_architecture"]))
     components = MossStyleComponents(dit, vae, text_encoder, tokenizer, tagger, content, style)
     for module in components.frozen_modules():
-        module.requires_grad_(False).eval().to(device=device)
+        placement = "cpu" if offload_text and module is text_encoder else device
+        module.requires_grad_(False).eval().to(device=placement)
+    if offload_text:
+        # Prompt encoding runs under no_grad, including full-denoising previews.
+        # Inputs/outputs remain on the training device; weights return to CPU
+        # before the differentiable MOSS/VAE/feature pass begins.
+        def stage_text_in(module, inputs):
+            module.to(device=device)
+
+        def stage_text_out(module, inputs, output):
+            module.to(device="cpu")
+
+        text_encoder.register_forward_pre_hook(stage_text_in)
+        text_encoder.register_forward_hook(stage_text_out, always_call=True)
+        text_encoder._moss_cpu_offload = True
+        logger.info("Qwen weights stay in CPU RAM between GPU prompt encodings")
     if text_encoder.config.hidden_size != dit.text_dim or vae.latent_channels * 4 != dit.latent_channels:
         raise ValueError("Pretrained text/VAE dimensions disagree with MOSS")
     factor = 2 ** (len(vae.params.ch_mult) - 1) * 2

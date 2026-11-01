@@ -158,6 +158,75 @@ class RemoteRangeReader(io.RawIOBase):
         return len(data)
 
 
+class RemoteMetadataReader(RemoteRangeReader):
+    """One sequential HTTP response for metadata, reconnecting only on failure/seek."""
+
+    def __init__(self, url, size, retries=5, timeout=60):
+        super().__init__(url, size, retries=retries, timeout=timeout)
+        self.response = None
+
+    def disconnect(self):
+        if self.response is not None:
+            self.response.close()
+            self.response = None
+
+    def close(self):
+        self.disconnect()
+        super().close()
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        position = super().seek(offset, whence)
+        self.disconnect()
+        return position
+
+    def connect(self):
+        end = self.size - 1
+        request = Request(self.url, headers={"Range": f"bytes={self.position}-{end}", "Accept-Encoding": "identity"})
+        response = urlopen(request, timeout=self.timeout)
+        try:
+            expected = f"bytes {self.position}-{end}/{self.size}"
+            if response.status != 206 or response.headers.get("Content-Range") != expected:
+                raise ValueError("Server did not honor the metadata resume range/pinned file size")
+            if response.headers.get("Content-Encoding", "identity") != "identity":
+                raise ValueError("Unexpected compressed metadata response")
+        except BaseException:
+            response.close()
+            raise
+        self.response = response
+        self.requests += 1
+
+    def read(self, size=-1):
+        if self.closed:
+            raise ValueError("Read from closed metadata response")
+        if size < 0:
+            raise ValueError("Unbounded in-memory metadata reads are disabled")
+        size = min(size, max(0, self.size - self.position))
+        if not size:
+            return b""
+        for attempt in range(self.retries + 1):
+            try:
+                if self.response is None:
+                    self.connect()
+                payload = self.response.read(size)
+                if not payload:
+                    raise OSError("Metadata response ended before its pinned size")
+                self.position += len(payload)
+                self.bytes_read += len(payload)
+                return payload
+            except (OSError, URLError, http.client.HTTPException) as error:
+                self.disconnect()
+                partial = getattr(error, "partial", b"")
+                if isinstance(partial, bytes) and partial:
+                    self.position += len(partial)
+                    self.bytes_read += len(partial)
+                    return partial
+                if attempt == self.retries:
+                    raise
+                delay = min(30, 2 ** attempt)
+                logger.warning("Metadata read retry %d/%d in %ss: %s", attempt + 1, self.retries, delay, type(error).__name__)
+                time.sleep(delay)
+
+
 def load_artist_index(directory):
     """Load a completed snapshot into RAM, validating its version and payload."""
     root = Path(directory)

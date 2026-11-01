@@ -62,7 +62,10 @@ under `MyDrive/moss-training/dataset-index/`. It does not load model weights.
 All original, recent and update `.tar` archives at a pinned Hub revision are
 indexed before training; this is not a lazy index.
 
-The JSON Lines metadata is parsed incrementally. Exactly one non-placeholder
+The JSON Lines metadata uses one long HTTP response, parsed incrementally rather
+than separate requests per chunk. Interrupted connections resume at the byte
+offset already consumed, and reruns resume the last committed complete line.
+Exactly one non-placeholder
 artist is required. ISO timestamps become UTC Unix seconds. Defaults require
 short side >=512 and area >=768*768; banned/deleted posts and unsupported formats
 are excluded. Files must actually occur in a scanned archive. Exact MD5 duplicates

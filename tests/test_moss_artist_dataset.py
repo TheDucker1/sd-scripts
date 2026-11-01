@@ -13,7 +13,7 @@ from unittest import mock
 
 import numpy as np
 
-from library.danbooru_index import RemoteRangeReader, load_artist_index
+from library.danbooru_index import RemoteMetadataReader, RemoteRangeReader, load_artist_index
 from tools.colab.build_moss_artist_dataset import build_archive, build_metadata, merge_index
 
 
@@ -29,6 +29,25 @@ class RangeResponse(io.BytesIO):
 
 
 class TestArtistIndex(unittest.TestCase):
+    def test_metadata_uses_one_response_for_many_reads_and_resumes_from_offset(self):
+        payload = b'{"id":1}\n{"id":2}\n'
+        starts = []
+
+        def respond(request, timeout):
+            match = re.fullmatch(r"bytes=(\d+)-(\d+)", request.get_header("Range"))
+            start, end = int(match[1]), int(match[2])
+            starts.append(start)
+            return RangeResponse(payload, start, end)
+
+        with mock.patch("library.danbooru_index.urlopen", side_effect=respond):
+            with RemoteMetadataReader("https://example.invalid/posts", len(payload)) as reader:
+                chunks = [reader.read(3) for _ in range(len(payload) // 3)]
+                self.assertEqual(b"".join(chunks), payload)
+                self.assertEqual(starts, [0])
+                reader.seek(9)
+                self.assertEqual(reader.read(9), payload[9:])
+                self.assertEqual(starts, [0, 9])
+
     def test_range_reader_seeks_and_rejects_full_responses(self):
         payload = bytes(range(256)) * 64
 
@@ -84,7 +103,7 @@ class TestArtistIndex(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            with mock.patch("tools.colab.build_moss_artist_dataset.RemoteRangeReader", side_effect=metadata_reader):
+            with mock.patch("tools.colab.build_moss_artist_dataset.RemoteMetadataReader", side_effect=metadata_reader):
                 build_metadata(root, manifest, checkpoint_records=2)
             with mock.patch("tools.colab.build_moss_artist_dataset.RemoteRangeReader") as reader_type:
                 remote = io.BytesIO(archive_data)
@@ -92,7 +111,8 @@ class TestArtistIndex(unittest.TestCase):
                 reader_type.return_value = remote
                 build_archive(root, archive, checkpoint_records=1)
             # Completed phases must perform no further remote reads.
-            with mock.patch("tools.colab.build_moss_artist_dataset.RemoteRangeReader", side_effect=AssertionError("Unexpected remote read")):
+            with mock.patch("tools.colab.build_moss_artist_dataset.RemoteRangeReader", side_effect=AssertionError("Unexpected remote read")), \
+                    mock.patch("tools.colab.build_moss_artist_dataset.RemoteMetadataReader", side_effect=AssertionError("Unexpected metadata read")):
                 build_metadata(root, manifest, checkpoint_records=2)
                 build_archive(root, archive, checkpoint_records=1)
             merge_index(root, manifest)

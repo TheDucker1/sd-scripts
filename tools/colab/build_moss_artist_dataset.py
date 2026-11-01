@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from library.danbooru_index import (
-    IMAGE_DTYPE, INDEX_VERSION, MEMBER_DTYPE, POST_DTYPE, RemoteRangeReader,
+    IMAGE_DTYPE, INDEX_VERSION, MEMBER_DTYPE, POST_DTYPE, RemoteMetadataReader, RemoteRangeReader,
     file_sha256, index_path, write_index_arrays, write_index_json,
 )
 
@@ -57,11 +57,11 @@ def build_metadata(root, manifest, checkpoint_records):
         rows, names, artist_ids, lines = [], [], {}, 0
         last_checkpoint = time.monotonic()
 
-    # Read bounded sequential blocks, retaining only filtered compact records.
+    # One long HTTP response, retaining only filtered compact records.
     # Resume offsets always refer to the first byte after a complete JSON line.
     import io
 
-    with RemoteRangeReader(source["url"], source["size"], block_size=8 * 1024 * 1024) as remote:
+    with RemoteMetadataReader(source["url"], source["size"]) as remote:
         remote.seek(state["offset"])
         with io.BufferedReader(remote, buffer_size=1024 * 1024) as stream:
             while line := stream.readline(8 * 1024 * 1024):

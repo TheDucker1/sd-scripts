@@ -1,0 +1,118 @@
+"""Artist/date pairs fetched by exact byte range from a completed RAM index."""
+
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import io
+import logging
+import random
+import threading
+
+import numpy as np
+from PIL import Image, ImageOps, UnidentifiedImageError
+import torch
+
+from library.danbooru_index import RemoteRangeReader, load_artist_index
+
+
+logger = logging.getLogger(__name__)
+
+
+class MossArtistPairs:
+    """Reuse StreamingDataset's image/caption settings, replacing only pairing/I/O."""
+
+    def __init__(self, directory, processor, seed=42, fetch_workers=2, cache_bytes=256 * 1024 * 1024):
+        self.manifest, self.rows, self.artists = load_artist_index(directory)
+        self.processor, self.seed = processor, seed
+        if len(processor.subsets) != 1 or processor.params.world_size != 1:
+            raise ValueError("Artist-index training currently requires one subset and world_size=1")
+        if not isinstance(fetch_workers, int) or not 1 <= fetch_workers <= 8:
+            raise ValueError("index_fetch_workers must be in [1, 8]")
+        if not isinstance(cache_bytes, int) or cache_bytes < 0:
+            raise ValueError("index_cache_bytes must be nonnegative")
+        self.fetch_workers, self.cache_bytes = fetch_workers, cache_bytes
+        self.cache, self.cached_bytes, self.cache_lock = OrderedDict(), 0, threading.Lock()
+        count = len(self.rows)
+        self.left, self.right = np.empty(count, dtype=np.int64), np.empty(count, dtype=np.int64)
+        groups = np.r_[0, np.flatnonzero(np.diff(self.rows["artist"])) + 1, count]
+        window = self.manifest["pair_max_days"] * 86400
+        for start, end in zip(groups[:-1], groups[1:]):
+            times = self.rows["timestamp"][start:end]
+            if np.any(times[1:] < times[:-1]):
+                raise ValueError("Artist timestamps must be sorted")
+            self.left[start:end] = start + np.searchsorted(times, times - window, side="left")
+            self.right[start:end] = start + np.searchsorted(times, times + window, side="right")
+        if np.any(self.right - self.left < 2):
+            raise ValueError("Index contains posts without an eligible reference")
+        self.readers = [RemoteRangeReader(item["url"], item["size"]) for item in self.manifest["archives"]]
+        logger.info("Loaded artist index into RAM: %d images, %d artists, revision=%s", count,
+                    self.manifest["artist_count"], self.manifest["revision"])
+
+    def fetch(self, index):
+        row = self.rows[index]
+        key = int(row["id"])
+        with self.cache_lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+        subset = self.processor.subsets[0]
+        if not 0 < row["size"] <= subset.max_member_bytes:
+            raise ValueError(f"Post {key} exceeds max_member_bytes")
+        reader = self.readers[int(row["archive"])]
+        payload = reader.fetch(int(row["offset"]), int(row["size"]))
+        if hashlib.md5(payload, usedforsecurity=False).hexdigest().encode("ascii") != row["md5"]:
+            raise ValueError(f"Post {key}: archive payload does not match metadata MD5")
+        with self.cache_lock:
+            if key not in self.cache and len(payload) <= self.cache_bytes:
+                while self.cache and self.cached_bytes + len(payload) > self.cache_bytes:
+                    _, removed = self.cache.popitem(last=False)
+                    self.cached_bytes -= len(removed)
+                self.cache[key] = payload
+                self.cached_bytes += len(payload)
+        return payload
+
+    def process(self, payload, rng):
+        with Image.open(io.BytesIO(payload)) as image:
+            return self.processor._process_image(ImageOps.exif_transpose(image).convert("RGB"), self.processor.subsets[0], rng)
+
+    def __iter__(self):
+        if torch.utils.data.get_worker_info() is not None:
+            raise ValueError("Artist-index loading requires num_workers=0")
+        rng = random.Random(self.seed)
+        count, failures = 0, 0
+        # Sampling already randomizes across the complete eligible RAM table;
+        # the sequential loader's shuffle window is not needed for this backend.
+        with ThreadPoolExecutor(max_workers=self.fetch_workers, thread_name_prefix="artist-image") as pool:
+            while self.processor.params.repeat or count < len(self.rows):
+                a = rng.randrange(len(self.rows))
+                left, right = int(self.left[a]), int(self.right[a])
+                b = rng.randrange(left, right - 1)
+                if b >= a:
+                    b += 1
+                futures = [pool.submit(self.fetch, index) for index in (a, b)]
+                try:
+                    payloads = [future.result() for future in futures]
+                    processed = [self.process(payload, rng) for payload in payloads]
+                    if any(value is None for value in processed):
+                        raise ValueError("Pair rejected by shared image processing settings")
+                except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError) as error:
+                    # Drain both requests before rerolling, preserving bounded I/O.
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+                    failures += 1
+                    logger.warning("Skipping artist pair A=%d B=%d: %s", self.rows[a]["id"], self.rows[b]["id"], error)
+                    if failures >= 100:
+                        raise RuntimeError("100 consecutive artist-pair failures; check connectivity, index and image filters") from error
+                    continue
+                failures = 0
+                count += 1
+                image_a, image_b = processed
+                yield dict(
+                    image_a=image_a["image"], image_b=image_b["image"],
+                    id_a=str(self.rows[a]["id"]), id_b=str(self.rows[b]["id"]),
+                    subsets_a=image_a["subset"], subsets_b=image_b["subset"],
+                    original_sizes_a=image_a["original_size"], original_sizes_b=image_b["original_size"],
+                )

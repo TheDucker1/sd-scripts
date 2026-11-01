@@ -57,7 +57,7 @@ def ensure_hf_token():
             raise SystemExit("HF_TOKEN is required. Run the notebook's hidden token-input cell before setup.")
         token = getpass.getpass("Hugging Face read token (hidden, runtime only): ").strip()
     if not token:
-        raise SystemExit("An authorized HF token is required for DINOv3")
+        raise SystemExit("A Hugging Face read token is required for model setup")
     os.environ["HF_TOKEN"] = token
     return token
 
@@ -153,10 +153,11 @@ def prepare_assets(args):
     api = HfApi(token=token)
     # model_info can expose public metadata for a gated repo. auth_check checks
     # actual read permission, before any large checkpoint transfer is attempted.
-    content_model = next(spec for spec in model_specs if spec["name"] == "content_encoder")
+    content_model = next((spec for spec in model_specs if spec["name"] == "content_encoder"), None)
     try:
         api.whoami()
-        api.auth_check(repo_id=content_model["repo_id"], repo_type="model")
+        if content_model is not None:
+            api.auth_check(repo_id=content_model["repo_id"], repo_type="model")
     except GatedRepoError:
         raise SystemExit(
             "DINOv3 access is not approved for this token's account. Request/accept access on the model page, "
@@ -165,10 +166,10 @@ def prepare_assets(args):
     except HfHubHTTPError as error:
         status = getattr(error.response, "status_code", "unknown")
         raise SystemExit(
-            f"HF authentication/access check failed (HTTP {status}). Check token validity, read scope, and DINOv3 approval. "
+            f"HF authentication/access check failed (HTTP {status}). Check token validity and read scope. "
             "Replace it through the hidden notebook prompt; no model weights have been downloaded."
         ) from None
-    print("Hugging Face authentication and DINOv3 read access confirmed.")
+    print("Hugging Face authentication confirmed; flow-L2 training does not require DINOv3.")
     plan = []
     missing_bytes = 0
     for spec in model_specs:

@@ -21,12 +21,6 @@
       "allow_patterns": ["*.json", "*.csv", "*.py", "model.safetensors", "README.md", "LICENSE*"]
     },
     {
-      "name": "content_encoder",
-      "repo_id": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-      "revision": "main",
-      "allow_patterns": ["config.json", "preprocessor_config.json", "model.safetensors", "README.md", "LICENSE*"]
-    },
-    {
       "name": "style_encoder",
       "repo_id": "Gaojunyao/MegaStyle",
       "revision": "main",

@@ -216,11 +216,11 @@ class MossStyleComponents:
     text_encoder: nn.Module
     tokenizer: object
     tagger: StylePromptTagger
-    content: FrozenImageFeatures
+    content: FrozenImageFeatures | None
     style: FrozenImageFeatures
 
     def frozen_modules(self):
-        return (self.vae, self.text_encoder, self.tagger, self.content, self.style)
+        return tuple(module for module in (self.vae, self.text_encoder, self.tagger, self.content, self.style) if module is not None)
 
 
 def build_random_components(config, device):
@@ -259,9 +259,11 @@ def build_random_components(config, device):
         tag_config.get("prompt_categories", ["general", "character", "copyright"]),
         tag_config.get("max_tags", 64),
     )
-    dino = DINOv3ViTModel(DINOv3ViTConfig(**config["content"]["model"]))
+    content = None
+    if config.get("content_loss", "dino") == "dino":
+        dino = DINOv3ViTModel(DINOv3ViTConfig(**config["content"]["model"]))
+        content = FrozenImageFeatures(dino, output="cls", **config["content"]["preprocessing"])
     siglip = SiglipVisionModel(SiglipVisionConfig(**config["style"]["model"]))
-    content = FrozenImageFeatures(dino, output="cls", **config["content"]["preprocessing"])
     style = FrozenImageFeatures(siglip, output="pooler", **config["style"]["preprocessing"])
     inject_edit_lora(dit, **config["adapter"])
     dtype = DTYPES[config.get("dtype", "float32")]
@@ -327,11 +329,13 @@ def configure_style_compile(components, args):
         "vae": components.vae,
         "text": components.text_encoder,
         "tagger": components.tagger.model,
-        "content": components.content.model,
+        "content": components.content.model if components.content is not None else None,
         "style": components.style.model,
     }
     for name in args.compile_modules:
         module = modules[name]
+        if module is None:
+            raise ValueError(f"Cannot compile absent module {name}; flow L2 does not load DINO")
         if name == "dit" and args.compile_scope == "blocks":
             # Unlike the standard MOSS blocks these accept both reference and body modulation.
             for block in components.dit.layers:
@@ -407,8 +411,10 @@ def prepare_style_batch(components, batch, device, rng, current_step=0, max_trai
         latents = encode_style_images(components.vae, a)
     with timer.measure("vae_encode_B"):
         reference = encode_style_images(components.vae, b)
-    with timer.measure("dino_target"):
-        content_target = components.content(a)
+    content_target = None
+    if components.content is not None:
+        with timer.measure("dino_target"):
+            content_target = components.content(a)
     with timer.measure("style_target"):
         style_target = components.style(b)
     return dict(
@@ -457,8 +463,18 @@ def style_objective(
             return checkpoint(lambda *values: module(list(values)), *pixels, use_reentrant=False)
         return checkpoint(module, pixels, use_reentrant=False) if checkpoint_features else module(pixels)
 
-    with timer.measure("dino_prediction"):
-        content_loss = (1 - (extract(components.content) * prepared["content_target"]).sum(dim=-1)).mean()
+    if components.content is None:
+        with timer.measure("flow_l2"):
+            if ragged:
+                content_loss = torch.stack([
+                    F.mse_loss(prediction.float(), n.float() - z.float())
+                    for prediction, n, z in zip(velocity, noise, prepared["latents"])
+                ]).mean()
+            else:
+                content_loss = F.mse_loss(velocity.float(), noise.float() - prepared["latents"].float())
+    else:
+        with timer.measure("dino_prediction"):
+            content_loss = (1 - (extract(components.content) * prepared["content_target"]).sum(dim=-1)).mean()
     with timer.measure("style_prediction"):
         style_loss = (1 - (extract(components.style) * prepared["style_target"]).sum(dim=-1)).mean()
     loss = content_weight * content_loss + style_weight * style_loss
@@ -471,6 +487,8 @@ def style_objective(
 
 
 def validate_style_config(config):
+    if config.get("content_loss", "dino") not in ("dino", "flow_l2"):
+        raise ValueError("content_loss must be dino or flow_l2")
     if config.get("initialization") not in ("random", "pretrained"):
         raise ValueError("initialization must be random or pretrained")
     if config["initialization"] == "pretrained" and not config.get("assets_manifest"):

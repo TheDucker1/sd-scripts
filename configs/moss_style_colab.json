@@ -1,5 +1,6 @@
 {
   "initialization": "pretrained",
+  "content_loss": "flow_l2",
   "seed": 42,
   "dtype": "bfloat16",
   "gradient_checkpointing": false,

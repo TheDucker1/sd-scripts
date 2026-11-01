@@ -1,6 +1,8 @@
-"""MOSS A/B pairing over the shared, strictly sequential dataset backend."""
+"""MOSS A/B pairing over shared image processing and stream/index backends."""
 
 import copy
+import json
+from pathlib import Path
 
 import torch
 from torch.utils.data import IterableDataset
@@ -9,9 +11,21 @@ from library import config_util
 from library.streaming_dataset import make_stream_bucket_manager
 
 
+ARTIST_INDEX_OPTIONS = ("artist_index", "index_fetch_workers", "index_cache_bytes")
+
+
 def style_stream_user_config(settings):
     """Accept the standard general/datasets/subsets form or legacy inline data."""
     settings = copy.deepcopy(settings)
+    indexed = bool(settings.get("artist_index"))
+    for name in ARTIST_INDEX_OPTIONS:
+        settings.pop(name, None)
+    if indexed:
+        scopes = settings["datasets"] if "datasets" in settings else [settings]
+        for scope in scopes:
+            scope.setdefault("subsets", [{}])
+            for subset in scope["subsets"]:
+                subset.setdefault("shards", ["<artist-index>"])
     if "datasets" in settings:
         return settings
     settings.setdefault("resolution", 256)
@@ -39,6 +53,12 @@ def resolve_style_dataset_config(config):
     config["training"]["batch_size"] = blueprint.params.batch_size
     user_config["datasets"][0]["batch_size"] = blueprint.params.batch_size
     config["data"] = user_config
+    config["data"].update({name: settings[name] for name in ARTIST_INDEX_OPTIONS if name in settings})
+    if config["data"].get("artist_index"):
+        manifest = json.loads((Path(config["data"]["artist_index"]) / "manifest.json").read_text(encoding="utf-8"))
+        if not manifest.get("complete"):
+            raise ValueError("Artist index is unfinished; complete the dataset builder before training")
+        config["dataset_index"] = dict(revision=manifest["revision"], sha256=manifest["index_sha256"])
     for name in ("cache_latents", "cache_latents_to_disk", "cache_text_encoder_outputs", "cache_text_encoder_outputs_to_disk"):
         if config.get(name) or config["training"].get(name):
             raise ValueError(f"{name} is unavailable for strict streaming and on-the-fly prompts")
@@ -92,17 +112,26 @@ def iter_image_pairs_batch(batch):
 
 
 class MossStylePairDataset(IterableDataset):
-    """The only MOSS-specific operation is pairing two consecutive source images."""
+    """Pair consecutive stream images or sample from a persisted artist index."""
 
-    def __init__(self, shards=None, seed=42, **settings):
+    def __init__(self, shards=None, seed=42, artist_index=None, index_fetch_workers=2,
+                 index_cache_bytes=256 * 1024 * 1024, **settings):
         super().__init__()
         if shards is not None:
             settings["shards"] = [str(shard) for shard in shards]
-        blueprint = config_util.generate_streaming_blueprint(style_stream_user_config(settings))
+        blueprint = config_util.generate_streaming_blueprint(style_stream_user_config(dict(settings, artist_index=artist_index)))
         self.dataset = config_util.generate_streaming_dataset_by_blueprint(blueprint, seed=seed)
         self.bucket_sizes = self.dataset.bucket_manager.predefined_resos
+        self.artist_pairs = None
+        if artist_index:
+            from library.moss_image_artist_dataset import MossArtistPairs
+
+            self.artist_pairs = MossArtistPairs(artist_index, self.dataset, seed, index_fetch_workers, index_cache_bytes)
 
     def __iter__(self):
+        if self.artist_pairs is not None:
+            yield from self.artist_pairs
+            return
         pending = None
         for image in self.dataset:
             if pending is None:

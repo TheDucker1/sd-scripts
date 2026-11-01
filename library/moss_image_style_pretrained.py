@@ -35,9 +35,11 @@ class MossPromptTokenizer:
         return moss_image_utils.tokenize_prompts(self.tokenizer, prompts, self.max_length)
 
 
-def read_asset_manifest(path):
+def read_asset_manifest(path, require_content=True):
     assets = json.loads(Path(path).read_text(encoding="utf-8"))
     for name in ("moss", "text_encoder", "edit_adapter", "tagger", "content_encoder", "style_encoder", "style_architecture"):
+        if name == "content_encoder" and not require_content:
+            continue
         entry = assets[name]
         root = Path(entry["local_dir"])
         if not entry.get("revision") or not root.is_dir():
@@ -169,7 +171,10 @@ def build_pretrained_components(config, device):
 
     device = torch.device(device)
     offload_text = config.get("offload_text_encoder", False) and device.type == "cuda"
-    assets = read_asset_manifest(config["assets_manifest"])
+    use_dino = config.get("content_loss", "dino") == "dino"
+    assets = read_asset_manifest(config["assets_manifest"], require_content=use_dino)
+    if not use_dino:
+        assets.pop("content_encoder", None)
     roots = {name: Path(entry["local_dir"]) for name, entry in assets.items()}
     config["pretrained_assets"] = assets
     adapter_options = json.loads((roots["edit_adapter"] / "adapter_config.json").read_text(encoding="utf-8"))
@@ -196,11 +201,14 @@ def build_pretrained_components(config, device):
                                                      convrot_int8=text_options["format"] == "convrot_int8")
     tokenizer = MossPromptTokenizer(roots["moss"] / "tokenizer", config.get("max_prompt_length", 512))
     tagger = load_prompt_tagger(roots["tagger"], config.get("tagger", {}), device)
-    dino, loading = DINOv3ViTModel.from_pretrained(
-        str(roots["content_encoder"]), local_files_only=True, dtype=dtype, output_loading_info=True,
-    )
-    if any(loading.get(name) for name in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
-        raise ValueError(f"DINOv3 checkpoint does not match its architecture: {loading}")
+    content = None
+    if use_dino:
+        dino, loading = DINOv3ViTModel.from_pretrained(
+            str(roots["content_encoder"]), local_files_only=True, dtype=dtype, output_loading_info=True,
+        )
+        if any(loading.get(name) for name in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
+            raise ValueError(f"DINOv3 checkpoint does not match its architecture: {loading}")
+        content = FrozenImageFeatures(dino, output="cls", **image_preprocessing(roots["content_encoder"]))
     with init_empty_weights():
         siglip_options = json.loads((roots["style_architecture"] / "config.json").read_text(encoding="utf-8"))
         siglip_config = SiglipVisionConfig(**siglip_options.get("vision_config", siglip_options))
@@ -224,7 +232,6 @@ def build_pretrained_components(config, device):
         state = converted
     siglip.load_state_dict(state, strict=True, assign=True)
     del state
-    content = FrozenImageFeatures(dino, output="cls", **image_preprocessing(roots["content_encoder"]))
     style = FrozenImageFeatures(siglip, output="pooler", **image_preprocessing(roots["style_architecture"]))
     components = MossStyleComponents(dit, vae, text_encoder, tokenizer, tagger, content, style)
     for module in components.frozen_modules():

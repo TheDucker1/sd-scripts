@@ -26,7 +26,7 @@ override. Do not run its commands on the Windows workstation.
    environment memory and inherited by the downloader, not written into the
    notebook source, output, Git credentials, manifests, or Hugging Face's login
    token cache. Set `FORCE_TOKEN_PROMPT=True` to replace a rejected/expired token.
-   Obtain DINOv3 access on Hugging Face using the token's account first.
+   The default flow-L2 preset no longer downloads or loads DINOv3.
 4. Run the setup cell. Leave `DOWNLOAD_MODELS=True` for the requested assets;
    set it to false for environment-only preparation. Optional Drive storage
    persists assets across VM resets; the environment itself stays under `/content`.
@@ -58,7 +58,6 @@ The selection is declared in `configs/moss_colab_models.json`:
 | `text_encoder` | OpenMOSS-Team/MOSS-Image-SFT (default) | BF16 `text_encoder/` shards; optional Comfy-Org ConvRot INT8 profile |
 | `edit_adapter` | chinoll/Moss-Image-Edit | Adapter weights and settings |
 | `tagger` | Bedovyy/pixai-tagger-v1.0-timm | Weights, custom architecture, labels, preprocessing/config |
-| `content_encoder` | facebook/dinov3-vitb16-pretrain-lvd1689m | DINOv3 weights and processor/config |
 | `style_encoder` | Gaojunyao/MegaStyle | `megastyle_encoder.pth` only, excluding the FLUX adapter |
 | `style_architecture` | google/siglip-so400m-patch14-384 | Architecture/processor config only, excluding duplicate base weights |
 
@@ -69,10 +68,9 @@ plus headroom, and checks completed file sizes. Hugging Face handles the actual
 transfers and resume state. Plan for several tens of GB of storage; the exact
 selected size is printed before transfers. A token does not grant model access
 unless its account is authorized for the gated repository.
-Before any model checkpoint downloads, setup validates the token with `whoami`
-and checks actual DINOv3 read permission with `HfApi.auth_check`. Invalid tokens,
-missing token scope, or unapproved gated access stop the download phase with an
-actionable message. A token alone cannot approve a gated-model access request.
+Before any model checkpoint downloads, setup validates the token with `whoami`.
+A custom manifest containing a DINOv3 content encoder still receives an explicit
+gated-access check; the default manifest omits that encoder.
 The standalone script prompts only in an interactive terminal; from a notebook
 subprocess, use the notebook's hidden input cell instead. Authentication remains
 available for retries within the same Colab runtime; a fresh runtime asks again
@@ -155,7 +153,8 @@ The real MOSS chat template/tokenizer replaces the toy byte tokenizer. PixAI's
 downloaded `timm_arch.py` registers its custom architecture during training;
 its local config/notes and CSV supply preprocessing and label thresholds. FP32
 tagger weights are cast to BF16 as they are read before loading onto the GPU.
-DINOv3 uses its final CLS embedding; MegaStyle loads its vision checkpoint into
+The default main objective is flow-matching L2 and does not load DINOv3.
+MegaStyle loads its vision checkpoint into
 SigLIP and uses normalized pooled features, following
 [the upstream style score implementation](https://github.com/Tencent/MegaStyle/blob/main/style_score.py).
 Loss-image preprocessing stays in differentiable PyTorch operations with the
@@ -173,7 +172,7 @@ test. Running the final training cell explicitly launches training.
 The notebook now includes a Drive mount, editable run settings, a TensorBoard
 dashboard, and a foreground training command that streams output to both the
 notebook and `console.log` on Drive. `configs/moss_style_colab.json` supplies the
-pretrained run preset; the notebook adds pinned dataset URLs and the current
+pretrained run preset; the notebook adds the persistent artist index and current
 manifest path. Model architecture and editing LoRA dimensions come from the
 downloaded configuration, rather than the tiny development preset.
 
@@ -182,11 +181,18 @@ budget for each A/B image, and aspect buckets in 64-pixel increments. They train
 for 100000 optimizer updates, generate five fresh A/B/result JPEG triptychs with
 50 denoising steps every 1000 updates, and save every 1000 updates. Each pair
 contains two images, so the effective batch is four pairs per optimizer update.
-The larger-GPU preset disables DiT, decoder and feature activation checkpointing
-to avoid forward recomputation during backward. This uses more activation memory.
+The preset checkpoints the first eight main DiT blocks; decoder and feature
+checkpointing remain disabled. Set CHECKPOINT_BLOCKS=0 to disable main-block
+checkpointing, or None to use GRADIENT_CHECKPOINTING's all-or-none behavior.
 If needed, batch 1 with accumulation 4 retains four pairs per optimizer update.
 Backward still computes input gradients through the frozen base, decoder and
 loss encoders; freezing their weights does not remove those operations.
+
+Before training, run the notebook's dataset preparation cell. It fully indexes
+metadata and all original/recent/update archive headers to Drive, with resumable
+compressed checkpoints. Later sessions load the completed numeric index into
+RAM. See [artist dataset format and preparation](moss_image_style_training.md#persistent-artistdate-dataset)
+for filters, pairing, exact-range fetching and a tiny offline test command.
 
 AdamW8bit uses LR 1e-4, weight decay 0.01, betas (0.9, 0.999), epsilon 1e-8 and
 gradient clipping at 1.0. After 1000 warmup updates, five cosine cycles rise and

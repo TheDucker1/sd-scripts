@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class MossImageStyleTrainer:
-    """Single-reference MOSS trainer with streamed pairs and embedding losses."""
+    """Single-reference MOSS trainer with stream/index pairs and configurable losses."""
 
     def train(self, args: argparse.Namespace):
         setup_logging(args, reset=True)
@@ -183,7 +183,8 @@ class MossImageStyleTrainer:
                         len(components.dit.layers))
             logger.info("Component weight dtypes: DiT=%s VAE=%s Qwen=%s tagger=%s DINO=%s style=%s",
                         components.dit.dtype, components.vae.dtype, next(components.text_encoder.parameters()).dtype,
-                        next(components.tagger.parameters()).dtype, next(components.content.parameters()).dtype,
+                        next(components.tagger.parameters()).dtype,
+                        next(components.content.parameters()).dtype if components.content is not None else "disabled (flow L2)",
                         next(components.style.parameters()).dtype)
         parameters = [parameter for parameter in components.dit.parameters() if parameter.requires_grad]
         optimizer = self.get_optimizer(config, parameters)

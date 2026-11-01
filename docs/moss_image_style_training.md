@@ -48,6 +48,90 @@ worker counts so background worker prefetch cannot read future images.
 
 ## Data and objective
 
+The Colab preset now uses `content_loss="flow_l2"`: velocity MSE against
+`noise - latent_A`, plus the MegaStyle cosine auxiliary against B. It does not
+instantiate DINO. The VAE decode remains differentiable for the style objective.
+Existing toy configurations retain the legacy DINO objective unless explicitly
+switched. `content_weight` weights the flow objective in the new preset.
+
+### Persistent artist/date dataset
+
+The Colab notebook contains a full preparation cell before training. It runs
+`tools/colab/build_moss_artist_dataset.py` under the isolated venv, with output
+under `MyDrive/moss-training/dataset-index/`. It does not load model weights.
+All original, recent and update `.tar` archives at a pinned Hub revision are
+indexed before training; this is not a lazy index.
+
+The JSON Lines metadata is parsed incrementally. Exactly one non-placeholder
+artist is required. ISO timestamps become UTC Unix seconds. Defaults require
+short side >=512 and area >=768*768; banned/deleted posts and unsupported formats
+are excluded. Files must actually occur in a scanned archive. Exact MD5 duplicates
+are removed, then posts without another same-artist image within 365 days are
+removed. This uses upload time, not necessarily artwork creation time. Metadata
+coverage may exclude images from newer update archives.
+
+Uncompressed tar is opened in seekable `r:` mode over a strict HTTP range reader.
+Python's tar parser handles extended headers and supplies member payload offsets.
+Image payloads are skipped during indexing, although small range buffers may
+include adjacent payload bytes. Each archive needs many dependent header requests;
+the first full preparation can take a long time. Four archives are scanned
+concurrently by default. Retries use bounded backoff and honor numeric Retry-After.
+An ignored range or changed total file size causes a visible failure.
+
+The format is versioned, compressed NumPy arrays (`allow_pickle=False`) plus JSON:
+
+```text
+manifest.json                 # pinned revision, filters, archives, completed-index checksum
+metadata/state.json           # next JSON-line byte offset and committed segments
+metadata/part-*.npz            # compact posts and per-segment artist string tables
+archives/00000/state.json      # next tar offset, PAX state, committed segments, completion
+archives/00000/part-*.npz       # post ID, payload offset, payload size
+artist-index.npz               # joined numeric image table and artist string table
+```
+
+Progress is committed every 5,000 records or after 60 seconds of processing.
+Rerunning resumes from the last
+committed metadata line/archive header; completed work is reused. The manifest is
+marked complete only after the final index is written and hashed. Use one builder
+per directory. Changed filters/revisions need a different directory. No SQLite
+or full-dataset image storage is used. A completed snapshot loads into RAM.
+
+Select this backend by adding `data.artist_index` to the ordinary data config:
+
+```json
+{
+  "artist_index": "/content/drive/MyDrive/moss-training/dataset-index/danbooru2023-768-v1",
+  "index_fetch_workers": 2,
+  "index_cache_bytes": 268435456,
+  "datasets": [{
+    "batch_size": 2, "resolution": [768, 768], "enable_bucket": true,
+    "max_pixels": 589824, "repeat": true, "shuffle_caption": true,
+    "caption_tag_dropout_rate": 0.15, "subsets": [{}]
+  }]
+}
+```
+
+The adapter inserts an internal shard placeholder only to reuse the shared
+geometry/caption configuration; it never opens that placeholder. One dataset,
+one subset, one process (`world_size=1`), and `num_workers=0` are supported.
+Same-artist time windows are computed once in RAM; A is sampled uniformly among
+eligible images, and B uniformly from its window excluding A. Exact archive ranges
+are fetched with up to two image I/O threads by default, and verified against
+metadata MD5. A bounded LRU caches compressed image bytes, not GPU tensors.
+The standard resize/crop, buckets, augmentation and caption code processes each
+image independently. `shuffle_buffer` is unused for this random-access backend;
+`training.prefetch_batches` still overlaps bounded pair fetching with training.
+One hundred consecutive unusable pairs abort visibly instead of looping forever.
+Use a new training RUN_NAME when switching datasets/objectives.
+
+Tiny offline checks can be run in Colab without weights or GPU:
+
+```bash
+/content/moss-venv/bin/python -m unittest discover -s tests -p test_moss_artist_dataset.py -v
+```
+
+### Legacy sequential stream
+
 The iterable loader reads local paths or HTTP(S) tar streams sequentially, including
 gzip tar archives. It does not extract archives, seek, or cache full shards.
 Images are decoded, EXIF-oriented, converted to RGB, and resized/cropped into

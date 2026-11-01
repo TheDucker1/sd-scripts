@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import json
+import logging
 import math
 import random
 import re
@@ -22,6 +23,10 @@ from library import compile_utils, flux2_vae, moss_image_train_utils, moss_image
 from library.moss_image_edit import LoRALinear, MossImageEdit, adapter_state_dict, inject_edit_lora
 from library.moss_image_style_dataset import make_style_buckets
 from library.streaming_dataset import process_stream_caption
+from library.utils import setup_logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 

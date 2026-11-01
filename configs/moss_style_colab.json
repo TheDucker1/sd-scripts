@@ -3,7 +3,13 @@
   "seed": 42,
   "dtype": "bfloat16",
   "gradient_checkpointing": true,
+  "max_prompt_length": 512,
   "assets_manifest": "/content/moss-models/resolved_models.json",
+  "tagger": {
+    "dtype": "bfloat16", "max_tags": 256,
+    "prompt_categories": ["general", "character", "copyright"],
+    "thresholds": {"general": 0.17, "character": 0.27, "style": 0.15, "copyright": 0.24, "meta": 0.17, "rating": 0.41}
+  },
   "noise": {"minimum": 0.05, "maximum": 0.7, "mean": -0.5, "std": 0.9, "tail_probability": 0.05, "tail_maximum": 0.95},
   "sampling": {
     "enabled": true, "every_n_steps": 1000, "at_end": true,

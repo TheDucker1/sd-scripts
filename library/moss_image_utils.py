@@ -117,6 +117,8 @@ def load_moss_image_model(
     disable_mmap: bool = False,
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
+    model_class=None,
+    model_config: Optional[dict] = None,
 ) -> moss_image_models.MossImage:
     """Load the MOSS-Image DiT.
 
@@ -138,6 +140,8 @@ def load_moss_image_model(
             ConvRot INT8, the dtype of the layers which are not quantized
         convrot_int8: quantize the base weights to ConvRot INT8
         convrot_int8_bwd: backward mode of the ConvRot INT8 layers, "bf16" (transient dequantization) or "int8"
+        model_class: optional compatible MOSS subclass, e.g. the single-reference editing model
+        model_config: architecture settings; defaults to the published MOSS configuration
     """
     # imported here: lora_utils depends on the `networks` package, which is not importable from tools/ scripts
     from library.lora_utils import load_safetensors_with_lora_and_fp8
@@ -151,8 +155,10 @@ def load_moss_image_model(
         logger.info("Pre-quantized ConvRot INT8 checkpoint detected: the quantized layers are used as they are")
     use_convrot_int8 = convrot_int8 or prequantized
 
+    architecture = model_config or moss_image_models.MOSS_IMAGE_CONFIG
     with init_empty_weights():
-        model = moss_image_models.MossImage(**moss_image_models.MOSS_IMAGE_CONFIG, attn_mode=attn_mode, split_attn=split_attn)
+        model_type = model_class or moss_image_models.MossImage
+        model = model_type(**architecture, attn_mode=attn_mode, split_attn=split_attn)
         if dit_weight_dtype is not None:
             model.to(dit_weight_dtype)
 
@@ -163,7 +169,7 @@ def load_moss_image_model(
 
     hooks = WeightTransformHooks()
     hooks.rename_hook = _strip_dit_prefix
-    hooks.split_hook = split_fused_qkv
+    hooks.split_hook = lambda key, tensor: split_fused_qkv(key, tensor, dim=architecture["dim"])
 
     quantizer = None
     if use_convrot_int8:

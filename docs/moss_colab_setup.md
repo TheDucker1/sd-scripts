@@ -2,8 +2,8 @@
 
 Open `tools/colab/moss_style_setup.ipynb` using Colab's Upload notebook action.
 Select a GPU runtime. Setup prepares the environment and assets without loading
-pretrained tensors. Later cells provide a training command, run settings, and
-monitoring; pretrained training remains blocked by the deferred loader task.
+pretrained tensors. Later cells load the local pretrained components and provide
+a training command, run settings, monitoring, and persistent checkpoints.
 
 This setup was authored without executing it locally. It has not been tested on
 a Colab VM. The installer refuses non-Linux/non-Colab execution before creating
@@ -102,9 +102,9 @@ aggressive quantization is required, that needs its own compatible frozen text
 encoder implementation and numerical checks. A smaller Qwen model is also not
 a drop-in replacement for MOSS's learned 4096-dimensional conditioning.
 
-This support exists in the repository's established MOSS loader/trainer; the
-new style trainer is still random-initialization-only. Its pending pretrained
-loader must reuse this utility and handle staged placement/offload. Online tag
+The style trainer reuses the repository's established MOSS and text loaders.
+Its default placement keeps components resident on the selected training device;
+automatic component offload is not implemented. Online tag
 shuffling requires encoding each new prompt, so text-output caching cannot
 simply remove Qwen from the runtime. INT8 alone does not establish that the DiT,
 text encoder, VAE, tagger, and differentiable loss encoders all fit together on a
@@ -122,22 +122,36 @@ downloads the dataset. The tagger's BF16 preference is recorded in the resolved
 manifest; setup does not convert or instantiate the checkpoint. Downloading a
 Python architecture file also does not import/execute it.
 
-**Remaining work:** the current trainer is random-initialization-only. These
-assets are preparation for the later pretrained-loader task, not a working
-full-size training configuration. That task still needs the real tokenizer and
-tagger architecture, strict adapter loading, and suitable memory/offload behavior.
-Do not assume all full-size components fit together on a Colab GPU. The runtime
-report shows GPU VRAM and native BF16 support; neither constitutes a memory-fit
-test. Full training is never launched automatically by this notebook.
+`initialization="pretrained"` loads the manifest's local checkpoints through
+`library/moss_image_style_pretrained.py`. The MOSS loader constructs editing
+blocks directly, expands transformer shards, and loads the base before attaching
+the published editing adapter. Rank, alpha, per-module parameter dtype, and target
+names come from `adapter_config.json`; only those adapter parameters are trained.
+The real MOSS chat template/tokenizer replaces the toy byte tokenizer. PixAI's
+downloaded `timm_arch.py` registers its custom architecture during training;
+its local config/notes and CSV supply preprocessing and label thresholds. FP32
+tagger weights are cast to BF16 as they are read before loading onto the GPU.
+DINOv3 uses its final CLS embedding; MegaStyle loads its vision checkpoint into
+SigLIP and uses normalized pooled features, following
+[the upstream style score implementation](https://github.com/Tencent/MegaStyle/blob/main/style_score.py).
+Loss-image preprocessing stays in differentiable PyTorch operations with the
+downloaded processors' size, interpolation, crop, mean and standard deviation.
 
-## Training controls and the remaining loader task
+All model loading is local after setup, including the custom timm registration;
+no model weight is silently replaced with a random initialization. Missing or
+incompatible weights raise an error. The resolved revisions are included in
+training state and adapter provenance. No full-size run was executed locally.
+GPU memory fit must be measured on Colab; the runtime report alone is not a fit
+test. Running the final training cell explicitly launches training.
+
+## Training controls
 
 The notebook now includes a Drive mount, editable run settings, a TensorBoard
 dashboard, and a foreground training command that streams output to both the
-notebook and `console.log` on Drive. `configs/moss_style_colab.json` is the planned
-pretrained run preset, not a working pretrained model configuration. The trainer
-still rejects it explicitly. Downloading assets does not implement their loading;
-do not change this preset to random initialization to bypass the check.
+notebook and `console.log` on Drive. `configs/moss_style_colab.json` supplies the
+pretrained run preset; the notebook adds pinned dataset URLs and the current
+manifest path. Model architecture and editing LoRA dimensions come from the
+downloaded configuration, rather than the tiny development preset.
 
 The defaults are batch size 1, gradient accumulation 2, a 589824-pixel area
 budget for each A/B image, and aspect buckets in 64-pixel increments. They train
@@ -172,7 +186,7 @@ Stopping the foreground cell terminates the trainer; resume starts from the last
 completed checkpoint rather than unsaved work.
 
 The notebook prints its exact command. The same controls are available as overrides,
-for example (on Colab, after the pretrained-loader task is completed):
+for example (on Colab, after setup and the run-configuration cell):
 
 ```bash
 /content/moss-venv/bin/python -u /content/sd-scripts/moss_image_train_style.py \

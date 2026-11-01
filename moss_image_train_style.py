@@ -1,4 +1,4 @@
-# MOSS single-reference style training. Random-weight experiments only.
+# MOSS single-reference style training with local pretrained or tiny random models.
 
 import argparse
 import json
@@ -62,6 +62,10 @@ class MossImageStyleTrainer:
         return self.train_config(config, args.output_dir, args.device, args, args.resume)
 
     def load_target_model(self, config, device):
+        if config["initialization"] == "pretrained":
+            from library.moss_image_style_pretrained import build_pretrained_components
+
+            return build_pretrained_components(config, device)
         return build_random_components(config, device)
 
     def get_optimizer(self, config, parameters):
@@ -293,13 +297,13 @@ class MossImageStyleTrainer:
 
 def setup_parser():
     parser = argparse.ArgumentParser(
-        description="MOSS style training with configurable random-weight models; no pretrained loading"
+        description="MOSS style training with local pretrained assets or configurable random-weight development models"
     )
     parser.add_argument("--config", required=True, help="Local JSON architecture/training/data configuration")
     config_util.add_config_arguments(parser)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--resume", help="Toy checkpoint directory from this trainer")
+    parser.add_argument("--resume", help="Completed adapter/training-state checkpoint directory from this trainer")
     for name in ("batch_size", "gradient_accumulation_steps", "max_steps", "save_every", "keep_last_checkpoints",
                  "sample_every", "sample_steps", "preview_pairs", "warmup_steps"):
         parser.add_argument(f"--{name}", type=int, default=None, help=f"Override {name} in the JSON preset")

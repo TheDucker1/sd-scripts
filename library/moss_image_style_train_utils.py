@@ -136,15 +136,29 @@ class BytePromptTokenizer:
 
 
 class FrozenImageFeatures(nn.Module):
-    def __init__(self, model, size, mean, std, output):
+    def __init__(self, model, size, mean, std, output, resize_shortest_edge=False, crop_size=None, interpolation="bicubic"):
         super().__init__()
         self.model, self.size, self.output = model, size, output
+        self.resize_shortest_edge, self.crop_size, self.interpolation = resize_shortest_edge, crop_size, interpolation
         self.register_buffer("mean", torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(std).view(1, 3, 1, 1))
 
     def forward(self, pixels):
         size = (self.size, self.size) if isinstance(self.size, int) else tuple(self.size)
-        pixels = F.interpolate((pixels.float() + 1) * 0.5, size=size, mode="bicubic", align_corners=False, antialias=True)
+        if self.resize_shortest_edge:
+            height, width = pixels.shape[-2:]
+            scale = self.size / min(height, width)
+            size = (int(height * scale), int(width * scale))
+        options = dict(mode=self.interpolation)
+        if self.interpolation in ("bilinear", "bicubic"):
+            options.update(align_corners=False, antialias=True)
+        pixels = F.interpolate((pixels.float() + 1) * 0.5, size=size, **options)
+        if self.crop_size is not None:
+            height, width = self.crop_size if not isinstance(self.crop_size, int) else (self.crop_size, self.crop_size)
+            pad_h, pad_w = max(0, height - pixels.shape[-2]), max(0, width - pixels.shape[-1])
+            pixels = F.pad(pixels, (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
+            top, left = (pixels.shape[-2] - height) // 2, (pixels.shape[-1] - width) // 2
+            pixels = pixels[:, :, top:top + height, left:left + width]
         pixels = ((pixels - self.mean.float()) / self.std.float()).to(next(self.model.parameters()).dtype)
         result = self.model(pixel_values=pixels, return_dict=True)
         features = result.last_hidden_state[:, 0] if self.output == "cls" else result.pooler_output
@@ -156,7 +170,7 @@ class MossStyleComponents:
     dit: MossImageEdit
     vae: flux2_vae.AutoEncoder
     text_encoder: nn.Module
-    tokenizer: BytePromptTokenizer
+    tokenizer: object
     tagger: StylePromptTagger
     content: FrozenImageFeatures
     style: FrozenImageFeatures
@@ -313,8 +327,10 @@ def style_objective(
 
 
 def validate_style_config(config):
-    if config.get("initialization") != "random":
-        raise ValueError("Pretrained style training is not implemented yet. Downloaded assets cannot be used by this trainer; do not switch the production preset to random initialization.")
+    if config.get("initialization") not in ("random", "pretrained"):
+        raise ValueError("initialization must be random or pretrained")
+    if config["initialization"] == "pretrained" and not config.get("assets_manifest"):
+        raise ValueError("Pretrained initialization requires the local resolved_models.json assets_manifest")
     train = config["training"]
     if train.get("resume_data_mode", "replay") not in ("replay", "restart"):
         raise ValueError("resume_data_mode must be replay or restart")
@@ -402,7 +418,9 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
         targets=list(modules),
         modules=modules,
         metadata=dict(
-            initialization="random", model_config=config["moss"], edit_contract="ref-prefix-only-t0__target-text-original-moss-v1"
+            initialization=config["initialization"], model_config=config["moss"],
+            edit_contract="ref-prefix-only-t0__target-text-original-moss-v1",
+            pretrained_revisions={name: entry["revision"] for name, entry in config.get("pretrained_assets", {}).items()},
         ),
     )
     weights_path = folder / "adapter_model.safetensors"

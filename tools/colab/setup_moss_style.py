@@ -3,7 +3,7 @@
 Run with Colab's system Python, not the Windows/local training environment.
 The script creates isolated bootstrap/training environments below /content.
 No pretrained model is instantiated, custom model code imported, or dataset
-shard downloaded. The real-weight trainer loader is a separate task.
+shard downloaded. Training is launched separately by the notebook.
 """
 
 import argparse
@@ -78,7 +78,8 @@ def prepare_source(args):
         source["commit"] = run(["git", "rev-parse", "HEAD"], cwd=repo, capture=True).strip()
         print(f"Using {args.repo_url}, branch {branch}, commit {source['commit']}. Existing checkout is not reset or pulled.")
     for relative in (
-        "requirements.txt", "moss_image_train_style.py", "library/moss_image_style_train_utils.py", "library/streaming_dataset.py"
+        "requirements.txt", "moss_image_train_style.py", "library/moss_image_style_train_utils.py", "library/streaming_dataset.py",
+        "library/moss_image_style_pretrained.py", "configs/moss_style_colab.json",
     ):
         if not (repo / relative).is_file():
             raise SystemExit(f"Missing {relative}. Commit and push the current MOSS code to {args.repo_url} on {args.branch} first.")
@@ -267,7 +268,7 @@ def main():
              "--text-encoder", args.text_encoder],
             environment=dict(os.environ, _MOSS_COLAB_PARENT_VERIFIED="1"))
     print(f"Environment Python: {python}")
-    print("Preparation complete. The current trainer remains random-initialization-only; real-weight loading is not implemented.")
+    print("Preparation complete. Use the notebook's training cells to load local assets and launch training.")
 
 
 if __name__ == "__main__":

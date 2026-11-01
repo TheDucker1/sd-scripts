@@ -1,8 +1,8 @@
-# MOSS single-reference style training (random-weight development)
+# MOSS single-reference style training
 
-`moss_image_train_style.py` exercises the complete MOSS style-training data and
-gradient path without downloading or loading pretrained weights. It targets only
-MOSS. This is separate from the existing `moss_image_train_network.py`; its model,
+`moss_image_train_style.py` trains the MOSS editing adapter using pretrained local
+components or small random-weight development models. It targets only MOSS.
+This is separate from the existing `moss_image_train_network.py`; its model,
 VAE latent conventions, text encoding helpers, logging, and compile options reuse
 the current implementation described in [the MOSS training guide](moss_image_train_network.md).
 
@@ -197,7 +197,12 @@ antialiasing, mean/std, and RGB/BGR setting. CSV labels can be supplied through
 conversion's 0=general, 1=style, 3=copyright, 4=character, 5=meta, 9=rating layout.
 Preprocessing/threshold behavior references
 [Bedovyy's implementation](https://github.com/bedovyy/ComfyUI-WD-Timm-Tagger/blob/main/nodes.py).
-Architecture registration and production asset loading are deferred.
+Pretrained runs register the downloaded `timm_arch.py`, construct the tagger from
+its local timm config and load its checkpoint in BF16. The byte tokenizer is only
+used for random experiments; pretrained runs use the existing MOSS tokenizer and
+prompt formatting helpers. See [Colab setup](moss_colab_setup.md) for the manifest
+and full training preset. DINOv3 and MegaStyle load their local trained weights
+with no randomly initialized missing parameters.
 
 Frozen Qwen processes each prompt separately, using the current MOSS
 `encode_tokens` and `pad_text_embeds` helpers. The VAE encodes A and B to packed,
@@ -251,8 +256,8 @@ must support its existing GroupNorm(32) layers. Transformer configs retain their
 respective architecture constraints.
 
 The toy adapter uses rank/alpha 4 to reduce cost. The published editing checkpoint
-uses rank/alpha 64; set those values when handling the real checkpoint in the later
-loading task. All six projections (`q`, `k`, `v`, `o`, `ffn_up_gate`, `ffn_down`)
+uses rank/alpha 64; pretrained runs read these from the downloaded checkpoint
+configuration. All six projections (`q`, `k`, `v`, `o`, `ffn_up_gate`, `ffn_down`)
 are adapted in every configured MOSS block. Saved adapters use the custom
 `moss-edit-lora` config and A/B tensor names; no PEFT dependency is introduced.
 
@@ -266,7 +271,8 @@ it requires unchanged shards and can be slow for long remote streams.
 Only `training.max_steps` may change on resume, and scheduled runs must keep
 that value unchanged as well. Existing output
 directories should be used intentionally; a fresh invocation replaces that run's
-metrics/config. No production pretrained loading path exists in this task.
+metrics/config. Pretrained runs reload their frozen components from the pinned
+local asset manifest, then restore adapter and optimizer/scheduler state.
 
 Training controls now support the shared optimizer factory (`optimizer_type`
 and `optimizer_args`), optional TensorBoard metrics, and `lr_scheduler` values

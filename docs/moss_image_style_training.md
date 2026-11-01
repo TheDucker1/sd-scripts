@@ -85,12 +85,17 @@ sources, dataset-wide validation splitting, epoch-based caption dropout,
 per-image repeats, regularization/inpainting, and indexed multi-dataset mixing.
 Weighted mixing of multiple live streams would need a separate implementation;
 it is not silently approximated by the existing indexed DatasetGroup.
-Pending bucket queues and worker prefetch are disabled; `num_workers` must be
+Pending bucket queues and multiprocess worker prefetch are disabled; `num_workers` must be
 zero. `shuffle_buffer=0` disables image look-ahead. A positive `shuffle_buffer`
 enables a bounded local window of resized images, randomly emitted before A/B
 pairing. It is synchronous and does not use PyTorch's `prefetch_factor`. The
 Colab preset uses 16 images (about 108 MiB of tensors at the 768-square pixel
 budget). Tar/gzip transport buffering remains separate from this image window.
+`training.prefetch_batches` optionally adds a single CPU producer thread with a
+bounded batch queue, overlapping download/decode with GPU computation. The Colab
+preset uses two batches; the default is zero for deterministic toy runs. Producer
+errors propagate to training. Only consumed batches enter the checkpoint counter.
+For no image look-ahead, disable both this queue and `shuffle_buffer`.
 
 The effective source configuration is saved in checkpoints, including external
 dataset-file contents. Resume can restart the stream or replay it, without seeking. Checkpoints
@@ -130,8 +135,17 @@ MOSS/FLUX.2; the tiny VAE's factor is smaller). Auxiliary tagger and loss-encode
 inputs retain their own preprocessing resolutions.
 
 The loader reads only the pairs required for the current batch. Equal shapes are
-stacked; mixed shapes are kept as lists and processed pair-by-pair with a mean
-loss. It never pads images, reorders pairs, or reads ahead to fill a bucket batch.
+stacked; mixed shapes are kept as lists. Mixed latent grids are flattened and
+padded into one batched DiT sequence, with per-image 2D RoPE coordinates. Padding
+is excluded from both body and reference-only attention. Predictions are unpacked
+to their original grids before decoding. This replaces the old serial per-pair
+DiT fallback; A and B may use independently selected bucket geometries.
+The tagger and each loss encoder preprocess every image to their own configured
+fixed resolution, then evaluate the whole batch in one model call. VAE encoding
+and differentiable decoding group images by actual spatial shape; unique VAE
+shapes still require separate VAE calls. No image is stretched or padded to make
+a transformer batch. The mean embedding loss still weights each pair equally.
+The stream does not reorder pairs or read ahead to fill a bucket batch.
 For minimum memory, use batch size 1 and gradient accumulation. Bucket geometry
 comes from the existing `BucketManager`; per-image bucket/index metadata is not
 accumulated in the stream.
@@ -204,7 +218,9 @@ prompt formatting helpers. See [Colab setup](moss_colab_setup.md) for the manife
 and full training preset. DINOv3 and MegaStyle load their local trained weights
 with no randomly initialized missing parameters.
 
-Frozen Qwen processes each prompt separately, using the current MOSS
+Frozen Qwen groups prompts of equal token length into batched forwards without
+padding, restoring their original order. Different lengths still use separate
+forwards. This uses the current MOSS
 `encode_tokens` and `pad_text_embeds` helpers. The VAE encodes A and B to packed,
 batch-normalized latent tensors. The reference remains clean and uses timestep
 zero. MOSS's editing sequence is `[text, reference, target]`. Reference queries
@@ -273,6 +289,21 @@ that value unchanged as well. Existing output
 directories should be used intentionally; a fresh invocation replaces that run's
 metrics/config. Pretrained runs reload their frozen components from the pinned
 local asset manifest, then restore adapter and optimizer/scheduler state.
+
+`training.log_timing=true` records wall-clock update time, data-loader wait time
+and pairs/second, excluding previews and checkpoint writes. The Colab preset
+enables it; it is disabled by default for reproducible toy history comparisons.
+These measurements distinguish stream stalls from training work. Compilation,
+Qwen encoding, VAE decoding, feature losses and activation recomputation all
+contribute to compute time; batching does not guarantee a particular speedup.
+
+HTTP archive streams retry network failures up to three times at the current raw
+byte offset using validated `Range`/`Content-Range` responses. This also preserves
+gzip decoder state. Partial bodies are not treated as clean EOF when the expected
+length is known. After exhausted retries, or for a genuinely corrupt tar/gzip,
+the unreadable shard remainder is logged and skipped. If all shards fail in one
+pass, training raises rather than looping indefinitely over broken sources.
+An isolated corrupt image is still skipped without abandoning a healthy archive.
 
 Training controls now support the shared optimizer factory (`optimizer_type`
 and `optimizer_args`), optional TensorBoard metrics, and `lr_scheduler` values

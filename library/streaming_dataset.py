@@ -6,15 +6,22 @@ shuffle window retains processed images; shuffle_buffer=0 disables look-ahead.
 
 import copy
 import io
+import http.client
 import logging
 import math
 import random
+import queue
+import re
 import tarfile
+import time
+import threading
+import zlib
 from itertools import islice
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import numpy as np
 import torch
@@ -26,23 +33,171 @@ from library.utils import trim_and_resize_if_required
 
 
 logger = logging.getLogger(__name__)
+_stream_random_lock = threading.RLock()
+
+
+class PrefetchIterator:
+    """One bounded producer for CPU batches; never touches training components."""
+
+    def __init__(self, iterator, capacity):
+        if not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("Prefetch capacity must be a positive integer")
+        self.iterator = iterator
+        self.items = queue.Queue(maxsize=capacity)
+        self.slots = threading.Semaphore(capacity)
+        self.stop = threading.Event()
+        self.worker = threading.Thread(target=self._produce, name="stream-prefetch", daemon=True)
+        self.worker.start()
+
+    def _produce(self):
+        try:
+            while not self.stop.is_set():
+                if not self.slots.acquire(timeout=0.1):
+                    continue
+                if self.stop.is_set():
+                    self.slots.release()
+                    break
+                try:
+                    item = ("batch", next(self.iterator))
+                except StopIteration:
+                    item = ("end", None)
+                except BaseException as error:
+                    item = ("error", error)
+                if self.stop.is_set():
+                    self.slots.release()
+                    break
+                self.items.put_nowait(item)
+                if item[0] != "batch":
+                    break
+        finally:
+            close = getattr(self.iterator, "close", None)
+            if close is not None:
+                close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.stop.is_set():
+            raise StopIteration
+        kind, value = self.items.get()
+        self.slots.release()
+        if kind == "batch":
+            return value
+        self.close()
+        if kind == "error":
+            raise value
+        raise StopIteration
+
+    def close(self):
+        self.stop.set()
+        self.worker.join(timeout=1)
+        while True:
+            try:
+                self.items.get_nowait()
+                self.slots.release()
+            except queue.Empty:
+                break
 
 
 @contextmanager
 def stream_random_state(rng):
     """Let shared augmentation/caption helpers use an isolated Python RNG."""
-    previous = random.getstate()
-    random.setstate(rng.getstate())
-    try:
-        yield
-    finally:
-        rng.setstate(random.getstate())
-        random.setstate(previous)
+    # Prefetch preprocessing and foreground caption processing can overlap.
+    # Their temporary module-global RNG scopes must not overwrite each other.
+    with _stream_random_lock:
+        previous = random.getstate()
+        random.setstate(rng.getstate())
+        try:
+            yield
+        finally:
+            rng.setstate(random.getstate())
+            random.setstate(previous)
+
+
+class HTTPRangeStream(io.RawIOBase):
+    """Resume interrupted HTTP bodies at their raw byte offset, including gzip.
+
+    Tar/gzip retain their decoder state while this reader reconnects underneath.
+    Never append a server's full response to a partially consumed archive: require
+    a matching Content-Range when resuming. No shard is cached on disk.
+    """
+
+    def __init__(self, source, retries=3, timeout=30):
+        super().__init__()
+        self.source, self.retries, self.timeout = source, retries, timeout
+        self.offset, self.total, self.response = 0, None, None
+
+    def readable(self):
+        return True
+
+    def _disconnect(self):
+        if self.response is not None:
+            self.response.close()
+            self.response = None
+
+    def _connect(self):
+        headers = {"Accept-Encoding": "identity"}
+        if self.offset:
+            headers["Range"] = f"bytes={self.offset}-"
+        response = urlopen(Request(self.source, headers=headers), timeout=self.timeout)
+        content_range = response.headers.get("Content-Range", "")
+        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+        if ((response.status == 206 and (match is None or int(match[1]) != self.offset))
+                or (self.offset and response.status != 206)):
+            response.close()
+            raise OSError("Server did not honor the archive resume range")
+        total = int(match[3]) if match else response.headers.get("Content-Length")
+        total = int(total) if total is not None else None
+        if self.total is not None and total != self.total:
+            response.close()
+            raise OSError("Archive size changed while reconnecting")
+        self.total, self.response = total, response
+
+    def read(self, size=-1):
+        if self.closed:
+            raise ValueError("read from closed archive stream")
+        if size < 0:
+            chunks = []
+            while chunk := self.read(64 * 1024):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        if size == 0 or (self.total is not None and self.offset == self.total):
+            return b""
+        for attempt in range(self.retries + 1):
+            try:
+                if self.response is None:
+                    self._connect()
+                data = self.response.read(size)
+                if not data and self.total is not None and self.offset < self.total:
+                    raise OSError(f"HTTP body ended at {self.offset} of {self.total} bytes")
+                self.offset += len(data)
+                return data
+            except (OSError, URLError, http.client.HTTPException) as error:
+                self._disconnect()
+                partial = getattr(error, "partial", b"")
+                if isinstance(partial, bytes) and partial:
+                    self.offset += len(partial)
+                    return partial
+                if attempt == self.retries:
+                    raise OSError(f"Archive download failed after {self.retries} retries at byte {self.offset}") from error
+                logger.warning("Reconnecting archive at byte %d (%d/%d): %s", self.offset, attempt + 1, self.retries, error)
+                time.sleep(min(2 ** attempt, 4))
+        raise RuntimeError("Unreachable archive retry state")
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+    def close(self):
+        self._disconnect()
+        super().close()
 
 
 @contextmanager
 def open_tar_stream(source):
-    stream = urlopen(source, timeout=30) if source.startswith(("http://", "https://")) else open(source, "rb")
+    stream = HTTPRangeStream(source) if source.startswith(("http://", "https://")) else open(source, "rb")
     with stream:
         with tarfile.open(fileobj=stream, mode="r|*") as archive:
             yield archive
@@ -219,26 +374,35 @@ class StreamingDataset(BaseDataset, torch.utils.data.IterableDataset):
         extensions = {extension.lower() for extension in IMAGE_EXTENSIONS}
         while True:
             count = 0
+            failed_shards = 0
             for subset, source in sources:
-                with open_tar_stream(source) as archive:
-                    for member in archive:
-                        archive.members.clear()
-                        if not member.isfile() or Path(member.name).suffix.lower() not in extensions:
-                            continue
-                        if not 0 < member.size <= subset.max_member_bytes:
-                            continue
-                        try:
+                try:
+                    with open_tar_stream(source) as archive:
+                        for member in archive:
+                            archive.members.clear()
+                            if not member.isfile() or Path(member.name).suffix.lower() not in extensions:
+                                continue
+                            if not 0 < member.size <= subset.max_member_bytes:
+                                continue
                             with archive.extractfile(member) as handle:
-                                payload = handle.read(subset.max_member_bytes + 1)
-                            with Image.open(io.BytesIO(payload)) as image:
-                                result = self._process_image(ImageOps.exif_transpose(image).convert("RGB"), subset, rng)
-                        except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as error:
-                            logger.warning("Skipping corrupt stream image %s in %s: %s", member.name, source, error)
-                            continue
-                        if result is not None:
-                            result["image_key"] = f"{source}::{member.name}"
-                            count += 1
-                            yield result
+                                payload = handle.read(member.size)
+                            if len(payload) != member.size:
+                                raise tarfile.ReadError(f"Incomplete member {member.name}")
+                            try:
+                                with Image.open(io.BytesIO(payload)) as image:
+                                    result = self._process_image(ImageOps.exif_transpose(image).convert("RGB"), subset, rng)
+                            except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as error:
+                                logger.warning("Skipping corrupt stream image %s in %s: %s", member.name, source, error)
+                                continue
+                            if result is not None:
+                                result["image_key"] = f"{source}::{member.name}"
+                                count += 1
+                                yield result
+                except (tarfile.TarError, OSError, EOFError, zlib.error) as error:
+                    failed_shards += 1
+                    logger.warning("Abandoning unreadable remainder of shard %s: %s", source, error)
+            if failed_shards == len(sources):
+                raise RuntimeError("All archive shards failed during this pass; check dataset connectivity and archive integrity")
             if not self.params.repeat:
                 return
             if count < 2:

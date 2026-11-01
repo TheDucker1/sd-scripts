@@ -216,6 +216,26 @@ are dataset settings in the notebook's `config['data']`, or in the shared
 shows loss components, LR and gradient norm. `metrics.jsonl` also records these
 values with the step, consumed batches and prompt.
 
+For mixed-aspect batches, the trainer now packs latent tokens into one batched
+MOSS forward, masks padding, and retains each image's own grid coordinates.
+Tagger/DINO/MegaStyle inputs are resized independently and evaluated in batches;
+VAE work groups matching spatial shapes. Increasing batch size therefore no
+longer triggers the previous serial per-pair DiT fallback. It can still increase
+memory and update time; compare pairs/second, not only seconds/update. The preset
+enables `training.log_timing` to report data wait and complete update time.
+
+`SHUFFLE_BUFFER` is measured in images: 32 images at the 589824-pixel budget
+require about 216 MiB of image tensors, plus decode temporaries and the current
+batch. `bucket_reso_steps=16` produces more possible spatial shapes than 64;
+packed DiT batching supports either, while a coarser grid can give the VAE more
+matching shapes to batch together. The 768-square area is a maximum, not an exact
+token-count constraint; rounding is handled by masked latent padding.
+
+Remote tar/gzip bodies now reconnect using validated byte ranges after an
+interrupted download. Retries are bounded, and an archive that remains unreadable
+is logged and skipped at shard level. All-shard failure remains fatal. No shards
+are downloaded to disk or scanned in advance.
+
 No installation, training, model download, or tests were run locally for these
 notebook and training-control changes.
 
@@ -236,9 +256,13 @@ window; at 589824 pixels each, 16 float32 RGB tensors use at most about 108 MiB,
 plus the current pair, decode temporaries and metadata. The window fills once,
 then randomly emits an image and replenishes one slot. Every image is emitted
 once per source pass; this is local mixing rather than a global dataset shuffle.
-Set it to zero for the earlier no-look-ahead behavior. The implementation is
-synchronous: there are no worker processes, background downloads or a PyTorch
-`prefetch_factor`. `num_workers=0` is still required. Increase the window only
+Set it to zero and `training.prefetch_batches=0` for the earlier no-look-ahead
+behavior. The Colab preset now uses a bounded CPU producer with two prefetched
+batches, overlapping download/decode with GPU work. There are no worker processes
+or PyTorch `prefetch_factor`; `num_workers=0` remains required. Queued and in-flight
+batches share the configured capacity. At batch 8 and this pixel budget, two
+queued A/B batches hold up to about 216 MiB of image tensors, in addition to the
+shuffle window, current batch and decode temporaries. Increase either buffer only
 within the Colab host RAM budget.
 
 ## Codex access

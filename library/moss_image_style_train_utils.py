@@ -104,8 +104,9 @@ class StylePromptTagger(nn.Module):
 
     @torch.no_grad()
     def forward(self, pixels):
-        logits = self.model(self.preprocess(pixels))
-        if logits.shape != (pixels.shape[0], len(self.labels)):
+        inputs = torch.cat([self.preprocess(value.unsqueeze(0)) for value in pixels]) if isinstance(pixels, list) else self.preprocess(pixels)
+        logits = self.model(inputs)
+        if logits.shape != (inputs.shape[0], len(self.labels)):
             raise ValueError("Tagger output size does not match the label table")
         return logits.float().sigmoid()
 
@@ -148,7 +149,7 @@ class FrozenImageFeatures(nn.Module):
         self.register_buffer("mean", torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(std).view(1, 3, 1, 1))
 
-    def forward(self, pixels):
+    def preprocess(self, pixels):
         size = (self.size, self.size) if isinstance(self.size, int) else tuple(self.size)
         if self.resize_shortest_edge:
             height, width = pixels.shape[-2:]
@@ -165,7 +166,11 @@ class FrozenImageFeatures(nn.Module):
             top, left = (pixels.shape[-2] - height) // 2, (pixels.shape[-1] - width) // 2
             pixels = pixels[:, :, top:top + height, left:left + width]
         pixels = ((pixels - self.mean.float()) / self.std.float()).to(next(self.model.parameters()).dtype)
-        result = self.model(pixel_values=pixels, return_dict=True)
+        return pixels
+
+    def forward(self, pixels):
+        inputs = torch.cat([self.preprocess(value.unsqueeze(0)) for value in pixels]) if isinstance(pixels, list) else self.preprocess(pixels)
+        result = self.model(pixel_values=inputs, return_dict=True)
         features = result.last_hidden_state[:, 0] if self.output == "cls" else result.pooler_output
         return F.normalize(features.float(), dim=-1)
 
@@ -289,19 +294,58 @@ def configure_style_compile(components, args):
 
 
 @torch.no_grad()
+def encode_style_images(vae, images):
+    """Batch VAE operations by actual spatial shape, preserving stream order."""
+    if not isinstance(images, list):
+        return vae.encode_for_dit(images.float())
+    groups = {}
+    for index, image in enumerate(images):
+        groups.setdefault(tuple(image.shape), []).append(index)
+    result = [None] * len(images)
+    for indices in groups.values():
+        encoded = vae.encode_for_dit(torch.stack([images[index] for index in indices]).float())
+        for index, value in zip(indices, encoded.unbind(0)):
+            result[index] = value
+    return result
+
+
+def decode_style_latents(vae, latents, checkpoint_decoder):
+    decode = vae.decode_from_dit
+    if not isinstance(latents, list):
+        return checkpoint(decode, latents, use_reentrant=False) if checkpoint_decoder else decode(latents)
+    groups = {}
+    for index, latent in enumerate(latents):
+        groups.setdefault(tuple(latent.shape), []).append(index)
+    result = [None] * len(latents)
+    for indices in groups.values():
+        packed = torch.stack([latents[index] for index in indices])
+        decoded = checkpoint(decode, packed, use_reentrant=False) if checkpoint_decoder else decode(packed)
+        for index, value in zip(indices, decoded.unbind(0)):
+            result[index] = value
+    return result
+
+
+@torch.no_grad()
 def prepare_style_batch(components, batch, device, rng, current_step=0, max_train_steps=0):
-    a, b = batch["image_a"].to(device), batch["image_b"].to(device)
+    ragged = isinstance(batch["image_a"], list) or isinstance(batch["image_b"], list)
+
+    def move(images):
+        if ragged:
+            return [value.to(device) for value in images]
+        return images.to(device)
+
+    a, b = move(batch["image_a"]), move(batch["image_b"])
     scores = components.tagger(a)
     prompts = components.tagger.prompts(scores, rng, shuffle="subsets_a" not in batch)
     if "subsets_a" in batch:
         prompts = [process_stream_caption(prompt, subset, rng, current_step, max_train_steps)
                    for prompt, subset in zip(prompts, batch["subsets_a"])]
     tokens = components.tokenizer(prompts)
-    contexts = moss_image_utils.encode_tokens(components.text_encoder, tokens, device)
+    contexts = moss_image_utils.encode_tokens(components.text_encoder, tokens, device, batch_equal_length=True)
     context, mask = moss_image_utils.pad_text_embeds(contexts)
     return dict(
-        latents=components.vae.encode_for_dit(a.float()),
-        reference=components.vae.encode_for_dit(b.float()),
+        latents=encode_style_images(components.vae, a),
+        reference=encode_style_images(components.vae, b),
         context=context,
         mask=mask,
         content_target=components.content(a),
@@ -313,21 +357,32 @@ def prepare_style_batch(components, batch, device, rng, current_step=0, max_trai
 def style_objective(
     components, prepared, sigmas, noise, content_weight=1.0, style_weight=1.0, checkpoint_decoder=False, checkpoint_features=False
 ):
-    z = prepared["latents"].float()
-    sigma = sigmas.float().view(-1, 1, 1, 1)
-    noisy = (1 - sigma) * z + sigma * noise.float()
+    ragged = isinstance(prepared["latents"], list)
+    if ragged:
+        noisy = [(1 - sigma) * z.float() + sigma * n.float()
+                 for z, n, sigma in zip(prepared["latents"], noise, sigmas.float())]
+        inputs = [value.to(components.dit.dtype) for value in noisy]
+        reference = [value.to(components.dit.dtype) for value in prepared["reference"]]
+    else:
+        z = prepared["latents"].float()
+        sigma = sigmas.float().view(-1, 1, 1, 1)
+        noisy = (1 - sigma) * z + sigma * noise.float()
+        inputs = noisy.to(components.dit.dtype)
+        reference = prepared["reference"].to(components.dit.dtype)
     velocity = components.dit(
-        noisy.to(components.dit.dtype),
+        inputs,
         sigmas * 1000,
         prepared["context"],
-        prepared["reference"].to(components.dit.dtype),
+        reference,
         prepared["mask"],
     )
-    predicted = noisy - sigma * velocity.float()
-    decode = components.vae.decode_from_dit
-    pixels = checkpoint(decode, predicted, use_reentrant=False) if checkpoint_decoder else decode(predicted)
+    predicted = ([value - sigma * prediction.float() for value, sigma, prediction in zip(noisy, sigmas.float(), velocity)]
+                 if ragged else noisy - sigma * velocity.float())
+    pixels = decode_style_latents(components.vae, predicted, checkpoint_decoder)
 
     def extract(module):
+        if isinstance(pixels, list) and checkpoint_features:
+            return checkpoint(lambda *values: module(list(values)), *pixels, use_reentrant=False)
         return checkpoint(module, pixels, use_reentrant=False) if checkpoint_features else module(pixels)
 
     content_loss = (1 - (extract(components.content) * prepared["content_target"]).sum(dim=-1)).mean()
@@ -352,7 +407,7 @@ def validate_style_config(config):
     for name in ("max_steps", "batch_size", "gradient_accumulation_steps"):
         if not isinstance(train[name], int) or train[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
-    for name in ("save_every", "keep_last_checkpoints"):
+    for name in ("save_every", "keep_last_checkpoints", "prefetch_batches"):
         value = train.get(name, 0)
         if not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer")

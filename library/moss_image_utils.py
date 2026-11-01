@@ -384,13 +384,27 @@ def tokenize_prompts(tokenizer, prompts: List[str], max_length: int = MAX_TOKEN_
     return input_ids_list
 
 
-def encode_tokens(text_encoder, input_ids_list: List[torch.Tensor], device: Optional[torch.device] = None) -> List[torch.Tensor]:
-    """Encode tokenized prompts one by one (no padding, to avoid padding effects in Qwen GDN layers).
+def encode_tokens(
+    text_encoder, input_ids_list: List[torch.Tensor], device: Optional[torch.device] = None, batch_equal_length: bool = False
+) -> List[torch.Tensor]:
+    """Encode without padding, to avoid padding effects in Qwen GDN layers.
 
     Returns a list of `last_hidden_state` tensors [L_i, hidden_size] in the text encoder dtype.
+    Optionally batch prompts with identical token lengths, restoring input order.
     """
     if device is None:
         device = next(text_encoder.parameters()).device
+    if batch_equal_length:
+        groups = {}
+        for index, input_ids in enumerate(input_ids_list):
+            groups.setdefault(input_ids.numel(), []).append(index)
+        outputs = [None] * len(input_ids_list)
+        for indices in groups.values():
+            input_ids = torch.stack([input_ids_list[index].reshape(-1) for index in indices]).to(device)
+            output = text_encoder(input_ids=input_ids, use_cache=False, return_dict=True)
+            for index, value in zip(indices, output.last_hidden_state.unbind(0)):
+                outputs[index] = value
+        return outputs
     outputs = []
     for input_ids in input_ids_list:
         input_ids = input_ids.reshape(1, -1).to(device)

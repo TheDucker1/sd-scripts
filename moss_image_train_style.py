@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import random
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from library.moss_image_style_train_utils import (
     style_objective,
     validate_style_config,
 )
+from library.streaming_dataset import PrefetchIterator
 from library.utils import setup_logging
 
 setup_logging()
@@ -142,20 +144,10 @@ class MossImageStyleTrainer:
 
     def process_batch(self, components, batch, config, device, prompt_rng, current_step=0):
         train = config["training"]
-        if isinstance(batch["image_a"], list) or isinstance(batch["image_b"], list):
-            loss, values, prepared = None, {}, None
-            count = len(batch["id_a"])
-            for pair in iter_image_pairs_batch(batch):
-                pair_loss, pair_values, prepared = self.process_batch(
-                    components, pair, config, device, prompt_rng, current_step
-                )
-                loss = pair_loss / count if loss is None else loss + pair_loss / count
-                for name, value in pair_values.items():
-                    values[name] = values.get(name, 0.0) + value / count
-            return loss, values, prepared
         prepared = prepare_style_batch(components, batch, device, prompt_rng, current_step, train["max_steps"])
-        sigmas = sample_style_sigmas(prepared["latents"].shape[0], device, **config.get("noise", {}))
-        noise = torch.randn_like(prepared["latents"])
+        latents = prepared["latents"]
+        sigmas = sample_style_sigmas(len(latents), device, **config.get("noise", {}))
+        noise = [torch.randn_like(value) for value in latents] if isinstance(latents, list) else torch.randn_like(latents)
         loss, values = style_objective(
             components,
             prepared,
@@ -215,6 +207,8 @@ class MossImageStyleTrainer:
             writer = SummaryWriter(str(folder / "tensorboard"), purge_step=start + 1 if resume else None)
         components.dit.train()
         try:
+            if train.get("prefetch_batches", 0):
+                stream = PrefetchIterator(stream, train["prefetch_batches"])
             # CPU flash-SDPA + AOT rematerialization is broken in some torch builds.
             # CPU toy runs use the portable math kernel; CUDA keeps automatic dispatch.
             backend = getattr(compile_args, "sdpa_backend", "auto")
@@ -231,15 +225,20 @@ class MossImageStyleTrainer:
             attention_context = sdpa_kernel(backends[backend]) if backend != "auto" else nullcontext()
             with attention_context, (folder / "metrics.jsonl").open("a" if resume else "w", encoding="utf-8") as metrics_file:
                 for step in range(start + 1, train["max_steps"] + 1):
+                    step_start = time.perf_counter()
+                    data_seconds, pairs_seen = 0.0, 0
                     optimizer.zero_grad(set_to_none=True)
                     metrics = {}
                     for _ in range(accumulation):
+                        data_start = time.perf_counter()
                         try:
                             batch = next(stream)
                         except StopIteration as error:
                             raise RuntimeError(
                                 "Dataset exhausted before max_steps; enable data.repeat or provide more shards"
                             ) from error
+                        data_seconds += time.perf_counter() - data_start
+                        pairs_seen += len(batch["id_a"])
                         batches_seen += 1
                         loss, values, prepared = self.process_batch(components, batch, config, device, prompt_rng, step - 1)
                         if not torch.isfinite(loss):
@@ -257,6 +256,9 @@ class MossImageStyleTrainer:
                         step=step, learning_rate=learning_rate, gradient_norm=float(gradient_norm),
                         batches_seen=batches_seen, prompt=prepared["prompts"][0]
                     )
+                    if train.get("log_timing", False):
+                        seconds = time.perf_counter() - step_start
+                        metrics.update(step_seconds=seconds, data_seconds=data_seconds, pairs_per_second=pairs_seen / seconds)
                     history.append(metrics)
                     del history[:-train.get("history_limit", 1000)]
                     if writer is not None:
@@ -274,6 +276,9 @@ class MossImageStyleTrainer:
                         metrics["style_loss"],
                         metrics["gradient_norm"],
                     )
+                    if train.get("log_timing", False):
+                        logger.info("step_time=%.2fs data_wait=%.2fs pairs/s=%.3f pairs=%d",
+                                    metrics["step_seconds"], data_seconds, metrics["pairs_per_second"], pairs_seen)
                     sampling = get_style_sampling_options(config)
                     sample_every = sampling["every_n_steps"]
                     if sampling["enabled"] and (
@@ -290,6 +295,9 @@ class MossImageStyleTrainer:
         finally:
             if writer is not None:
                 writer.close()
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
             # Close the iterator so Windows workers and network streams are released.
             del stream, loader
         return components, history

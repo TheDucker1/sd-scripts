@@ -5,6 +5,8 @@ import hashlib
 import json
 import math
 import random
+import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -312,11 +314,19 @@ def style_objective(
 
 def validate_style_config(config):
     if config.get("initialization") != "random":
-        raise ValueError("This trainer currently supports initialization='random' only; pretrained loading is deferred")
+        raise ValueError("Pretrained style training is not implemented yet. Downloaded assets cannot be used by this trainer; do not switch the production preset to random initialization.")
     train = config["training"]
+    if train.get("resume_data_mode", "replay") not in ("replay", "restart"):
+        raise ValueError("resume_data_mode must be replay or restart")
     for name in ("max_steps", "batch_size", "gradient_accumulation_steps"):
         if not isinstance(train[name], int) or train[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
+    for name in ("save_every", "keep_last_checkpoints"):
+        value = train.get(name, 0)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if not isinstance(train.get("history_limit", 1000), int) or train.get("history_limit", 1000) < 1:
+        raise ValueError("history_limit must be a positive integer")
     if not math.isfinite(train["learning_rate"]) or train["learning_rate"] <= 0:
         raise ValueError("learning_rate must be finite and positive")
     weights = [train.get("content_weight", 1.0), train.get("style_weight", 1.0)]
@@ -366,9 +376,11 @@ def get_style_sampling_options(config):
     return options
 
 
-def save_style_checkpoint(folder, components, optimizer, config, step, batches_seen, prompt_rng):
+def save_style_checkpoint(folder, components, optimizer, config, step, batches_seen, prompt_rng, scheduler=None):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
+    if (folder / "complete.json").exists():
+        raise FileExistsError(f"Refusing to overwrite a completed checkpoint: {folder}")
     weights = adapter_state_dict(components.dit)
     if any(not torch.isfinite(weight).all() for weight in weights.values()):
         raise FloatingPointError("Cannot save nonfinite adapter weights")
@@ -407,13 +419,34 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
             step=step,
             batches_seen=batches_seen,
             optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict() if scheduler is not None else None,
             torch_rng=torch.get_rng_state(),
             cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
             prompt_rng=prompt_rng.getstate(),
             config=config,
         ),
-        folder / "training_state.pt",
+        folder / "training_state.pt.tmp",
     )
+    (folder / "training_state.pt.tmp").replace(folder / "training_state.pt")
+    (folder / "complete.json.tmp").write_text(json.dumps({"step": step}) + "\n", encoding="utf-8")
+    (folder / "complete.json.tmp").replace(folder / "complete.json")
+
+
+def prune_style_checkpoints(folder, keep):
+    """Remove only completed trainer checkpoints after their replacement is saved."""
+    if not keep:
+        return
+    folder = Path(folder).resolve()
+    checkpoints = sorted(
+        (path for path in folder.iterdir()
+         if re.fullmatch(r"step-\d+", path.name) and path.is_dir() and not path.is_symlink()
+         and (path / "complete.json").is_file() and (path / "training_state.pt").is_file()),
+        key=lambda path: int(path.name.split("-")[1]),
+    )
+    for path in checkpoints[:-keep]:
+        if path.resolve().parent != folder:
+            raise ValueError("Checkpoint path escaped the output directory")
+        shutil.rmtree(path)
 
 
 def load_style_checkpoint(folder, components, optimizer, config):
@@ -421,6 +454,9 @@ def load_style_checkpoint(folder, components, optimizer, config):
     state = torch.load(folder / "training_state.pt", map_location="cpu", weights_only=True)
     saved_config = json.loads(json.dumps(state["config"]))
     current_config = json.loads(json.dumps(config))
+    if (config["training"].get("lr_scheduler", "constant") != "constant"
+            and saved_config["training"]["max_steps"] != current_config["training"]["max_steps"]):
+        raise ValueError("Keep max_steps unchanged when resuming a scheduled run; changing it changes the LR curve")
     # Extending a toy run is allowed; all architecture/data/optimizer settings must match.
     saved_config["training"].pop("max_steps")
     current_config["training"].pop("max_steps")

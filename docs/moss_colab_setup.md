@@ -1,8 +1,9 @@
 # Colab environment and model preparation
 
 Open `tools/colab/moss_style_setup.ipynb` using Colab's Upload notebook action.
-Select a GPU runtime. The notebook prepares the environment and assets; it never
-starts training or loads pretrained weights into CPU/GPU tensor memory.
+Select a GPU runtime. Setup prepares the environment and assets without loading
+pretrained tensors. Later cells provide a training command, run settings, and
+monitoring; pretrained training remains blocked by the deferred loader task.
 
 This setup was authored without executing it locally. It has not been tested on
 a Colab VM. The installer refuses non-Linux/non-Colab execution before creating
@@ -14,7 +15,7 @@ override. Do not run its commands on the Windows workstation.
 1. Upload the notebook to Colab and select a GPU runtime.
 2. The source cell defaults to cloning `https://github.com/TheDucker1/sd-scripts`,
    branch `style_loss`. Commit and push all current MOSS/streaming/Colab changes
-   there first. No local commit or push is performed by this work. Reruns reuse
+   there first. Reruns reuse
    the existing checkout without resetting/pulling it, validate origin/branch,
    and record its commit in `moss-source.json`. Upload/existing source modes
    remain optional. A source ZIP must exclude weights, datasets, environments,
@@ -128,6 +129,84 @@ tagger architecture, strict adapter loading, and suitable memory/offload behavio
 Do not assume all full-size components fit together on a Colab GPU. The runtime
 report shows GPU VRAM and native BF16 support; neither constitutes a memory-fit
 test. Full training is never launched automatically by this notebook.
+
+## Training controls and the remaining loader task
+
+The notebook now includes a Drive mount, editable run settings, a TensorBoard
+dashboard, and a foreground training command that streams output to both the
+notebook and `console.log` on Drive. `configs/moss_style_colab.json` is the planned
+pretrained run preset, not a working pretrained model configuration. The trainer
+still rejects it explicitly. Downloading assets does not implement their loading;
+do not change this preset to random initialization to bypass the check.
+
+The defaults are batch size 1, gradient accumulation 2, a 589824-pixel area
+budget for each A/B image, and aspect buckets in 64-pixel increments. They train
+for 100000 optimizer updates, generate five fresh A/B/result JPEG triptychs with
+50 denoising steps every 1000 updates, and save every 1000 updates. Each pair
+contains two images, so the effective batch is two pairs per optimizer update.
+
+AdamW8bit uses LR 1e-4, weight decay 0.01, betas (0.9, 0.999), epsilon 1e-8 and
+gradient clipping at 1.0. After 1000 warmup updates, five cosine cycles rise and
+fall beneath a linearly decreasing envelope, with a 1e-6 floor. These settings
+are an initial experiment, not validated full-model hyperparameters. The curve
+is `floor + (1-floor)*(1-progress)*(1+cos(2*pi*cycles*progress))/2` after warmup.
+Scheduling advances once per optimizer update, independently of accumulation.
+
+Run settings live in `launch_config.json`; the resolved trainer configuration is
+saved separately as `config.json`. For resume, keep the same run name and
+settings. The notebook selects the numerically latest checkpoint with a completion
+marker, adapter weights/config, and training state. Incomplete directories are
+ignored. Only the three most recent completed checkpoints remain; previews,
+TensorBoard events and console/JSONL logs are retained. Each checkpoint contains
+adapter parameters and optimizer/scheduler/RNG/stream state, excluding frozen
+model weights. Frozen weights must be available again in a new Colab runtime.
+Drive persistence does not prevent runtime disconnection or make a multi-file
+checkpoint atomic: an interrupted checkpoint is not considered completed.
+
+The Colab preset uses `resume_data_mode="restart"`: it restores training state
+but starts reading the dataset again, without replaying consumed batches or
+restoring the shuffle window. `resume_data_mode="replay"` remains available for
+exact toy comparisons. A scheduled run must retain its original total step count
+to preserve the learning-rate curve.
+Stopping the foreground cell terminates the trainer; resume starts from the last
+completed checkpoint rather than unsaved work.
+
+The notebook prints its exact command. The same controls are available as overrides,
+for example (on Colab, after the pretrained-loader task is completed):
+
+```bash
+/content/moss-venv/bin/python -u /content/sd-scripts/moss_image_train_style.py \
+  --config /content/drive/MyDrive/moss-training/moss-style-768/launch_config.json \
+  --output_dir /content/drive/MyDrive/moss-training/moss-style-768 \
+  --device cuda --compile --compile_backend inductor \
+  --compile_scope blocks --compile_modules dit --compile_dynamic true \
+  --batch_size 1 --gradient_accumulation_steps 2 --max_steps 100000 \
+  --sample_every 1000 --preview_pairs 5 --sample_steps 50 \
+  --save_every 1000 --keep_last_checkpoints 3 \
+  --optimizer_type AdamW8bit --learning_rate 0.0001 \
+  --lr_scheduler cosine_cycles --warmup_steps 1000
+```
+
+Add `--resume /content/drive/MyDrive/moss-training/moss-style-768/step-001000`
+to continue from a specific completed checkpoint. Pixel budget and bucket options
+are dataset settings in the notebook's `config['data']`, or in the shared
+`--dataset_config` TOML/JSON format; they are not fixed-square crops. TensorBoard
+shows loss components, LR and gradient norm. `metrics.jsonl` also records these
+values with the step, consumed batches and prompt.
+
+No installation, training, model download, or tests were run locally for these
+notebook and training-control changes.
+
+The notebook exposes `SHUFFLE_BUFFER=16`, measured in individual images before
+A/B pairing. Images are resized and normalized before entering the bounded local
+window; at 589824 pixels each, 16 float32 RGB tensors use at most about 108 MiB,
+plus the current pair, decode temporaries and metadata. The window fills once,
+then randomly emits an image and replenishes one slot. Every image is emitted
+once per source pass; this is local mixing rather than a global dataset shuffle.
+Set it to zero for the earlier no-look-ahead behavior. The implementation is
+synchronous: there are no worker processes, background downloads or a PyTorch
+`prefetch_factor`. `num_workers=0` is still required. Increase the window only
+within the Colab host RAM budget.
 
 ## Codex access
 

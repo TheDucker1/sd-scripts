@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import random
 from contextlib import nullcontext
 from pathlib import Path
@@ -21,6 +22,7 @@ from library.moss_image_style_train_utils import (
     get_style_sampling_options,
     load_style_checkpoint,
     prepare_style_batch,
+    prune_style_checkpoints,
     sample_style_sigmas,
     save_style_checkpoint,
     save_style_sample,
@@ -41,8 +43,22 @@ class MossImageStyleTrainer:
     def train(self, args: argparse.Namespace):
         torch.set_num_threads(args.num_threads)
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        for name in ("batch_size", "gradient_accumulation_steps", "max_steps", "save_every", "keep_last_checkpoints",
+                     "sample_every", "sample_steps", "learning_rate", "optimizer_type", "lr_scheduler", "warmup_steps"):
+            value = getattr(args, name, None)
+            if value is not None:
+                config.setdefault("training", {})[name] = value
+        if args.preview_pairs is not None:
+            config.setdefault("sampling", {})["num_pairs"] = args.preview_pairs
+        for argument, setting in (("sample_every", "every_n_steps"), ("sample_steps", "steps")):
+            if getattr(args, argument) is not None:
+                config.setdefault("sampling", {})[setting] = getattr(args, argument)
         if args.dataset_config is not None:
             config["dataset_config"] = str(args.dataset_config)
+        if args.batch_size is not None:
+            config = resolve_style_dataset_config(config)
+            config["data"]["datasets"][0]["batch_size"] = args.batch_size
+            config["training"]["batch_size"] = args.batch_size
         return self.train_config(config, args.output_dir, args.device, args, args.resume)
 
     def load_target_model(self, config, device):
@@ -52,8 +68,8 @@ class MossImageStyleTrainer:
         train = config["training"]
         # Use the current optimizer module, rather than train_util's legacy alias.
         args = argparse.Namespace(
-            optimizer_type="AdamW",
-            optimizer_args=[f"weight_decay={train.get('weight_decay', 0.0)}"],
+            optimizer_type=train.get("optimizer_type", "AdamW"),
+            optimizer_args=train.get("optimizer_args", [f"weight_decay={train.get('weight_decay', 0.0)}"]),
             learning_rate=train["learning_rate"],
             use_8bit_adam=False,
             use_lion_optimizer=False,
@@ -61,6 +77,31 @@ class MossImageStyleTrainer:
         )
         _, _, optimizer = optimizer_util.get_optimizer(args, parameters)
         return optimizer
+
+    def get_scheduler(self, config, optimizer):
+        train = config["training"]
+        name = train.get("lr_scheduler", "constant")
+        warmup = train.get("warmup_steps", 0)
+        total = train["max_steps"]
+        cycles = train.get("lr_cycles", 5)
+        floor = train.get("min_lr_ratio", 0.01)
+        if name not in ("constant", "cosine_cycles"):
+            raise ValueError("lr_scheduler must be constant or cosine_cycles")
+        if not isinstance(warmup, int) or not 0 <= warmup < total:
+            raise ValueError("warmup_steps must be an integer in [0, max_steps)")
+        if not math.isfinite(cycles) or cycles <= 0 or not math.isfinite(floor) or not 0 <= floor <= 1:
+            raise ValueError("lr_cycles must be positive and min_lr_ratio must be in [0, 1]")
+
+        def multiplier(step):
+            if step < warmup:
+                return step / warmup
+            if name == "constant":
+                return 1.0
+            progress = min(1.0, max(0.0, (step - warmup) / (total - warmup)))
+            wave = 0.5 * (1 + math.cos(2 * math.pi * cycles * progress))
+            return floor + (1 - floor) * (1 - progress) * wave
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
     def get_train_dataloader(self, config, device):
         train = config["training"]
@@ -124,8 +165,8 @@ class MossImageStyleTrainer:
         return loss, values, prepared
 
     def train_config(self, config, output_dir, device="cpu", compile_args=None, resume=None):
-        config = resolve_style_dataset_config(config)
         validate_style_config(config)
+        config = resolve_style_dataset_config(config)
         seed = config.get("seed", 42)
         torch.manual_seed(seed)
         prompt_rng = random.Random(seed)
@@ -136,15 +177,24 @@ class MossImageStyleTrainer:
         train = config["training"]
         parameters = [parameter for parameter in components.dit.parameters() if parameter.requires_grad]
         optimizer = self.get_optimizer(config, parameters)
+        scheduler = self.get_scheduler(config, optimizer)
         loader = self.get_train_dataloader(config, device)
         state = load_style_checkpoint(resume, components, optimizer, config) if resume else None
+        if state:
+            if state.get("scheduler") is not None:
+                scheduler.load_state_dict(state["scheduler"])
+            elif train.get("lr_scheduler", "constant") != "constant" or train.get("warmup_steps", 0):
+                raise ValueError("This checkpoint has no scheduler state; cannot resume a scheduled run")
         stream = iter(loader)
         start, batches_seen = (state["step"], state["batches_seen"]) if state else (0, 0)
         if state:
-            # Deterministic replay of a sequential stream avoids pretending compressed
-            # archives support random seek. Review batches are included in this count.
-            for _ in range(batches_seen):
-                next(stream)
+            if train.get("resume_data_mode", "replay") == "replay":
+                # Compatibility for deterministic toy checks. Production resumes
+                # can restart the stream without seeking/replaying compressed tar.
+                for _ in range(batches_seen):
+                    next(stream)
+            else:
+                logger.info("Restored training state at step %d; restarting dataset stream without replay", start)
             torch.set_rng_state(state["torch_rng"])
             if state["cuda_rng"]:
                 torch.cuda.set_rng_state_all(state["cuda_rng"])
@@ -154,6 +204,11 @@ class MossImageStyleTrainer:
         (folder / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         accumulation = train["gradient_accumulation_steps"]
         history = []
+        writer = None
+        if train.get("tensorboard", False):
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(str(folder / "tensorboard"), purge_step=start + 1 if resume else None)
         components.dit.train()
         try:
             # CPU flash-SDPA + AOT rematerialization is broken in some torch builds.
@@ -191,11 +246,20 @@ class MossImageStyleTrainer:
                     gradient_norm = torch.nn.utils.clip_grad_norm_(
                         parameters, train.get("max_grad_norm", 1.0), error_if_nonfinite=True
                     )
+                    learning_rate = optimizer.param_groups[0]["lr"]
                     optimizer.step()
+                    scheduler.step()
                     metrics.update(
-                        step=step, gradient_norm=float(gradient_norm), batches_seen=batches_seen, prompt=prepared["prompts"][0]
+                        step=step, learning_rate=learning_rate, gradient_norm=float(gradient_norm),
+                        batches_seen=batches_seen, prompt=prepared["prompts"][0]
                     )
                     history.append(metrics)
+                    del history[:-train.get("history_limit", 1000)]
+                    if writer is not None:
+                        for name, value in metrics.items():
+                            if isinstance(value, (int, float)):
+                                writer.add_scalar(name, value, step)
+                        writer.flush()
                     metrics_file.write(json.dumps(metrics) + "\n")
                     metrics_file.flush()
                     logger.info(
@@ -215,9 +279,13 @@ class MossImageStyleTrainer:
                     save_every = train.get("save_every", 0)
                     if step == train["max_steps"] or (save_every and step % save_every == 0):
                         save_style_checkpoint(
-                            folder / f"step-{step:06d}", components, optimizer, config, step, batches_seen, prompt_rng
+                            folder / f"step-{step:06d}", components, optimizer, config, step, batches_seen, prompt_rng,
+                            scheduler=scheduler,
                         )
+                        prune_style_checkpoints(folder, train.get("keep_last_checkpoints", 0))
         finally:
+            if writer is not None:
+                writer.close()
             # Close the iterator so Windows workers and network streams are released.
             del stream, loader
         return components, history
@@ -232,6 +300,12 @@ def setup_parser():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", help="Toy checkpoint directory from this trainer")
+    for name in ("batch_size", "gradient_accumulation_steps", "max_steps", "save_every", "keep_last_checkpoints",
+                 "sample_every", "sample_steps", "preview_pairs", "warmup_steps"):
+        parser.add_argument(f"--{name}", type=int, default=None, help=f"Override {name} in the JSON preset")
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--optimizer_type", default=None, help="Shared optimizer factory, e.g. AdamW8bit")
+    parser.add_argument("--lr_scheduler", choices=["constant", "cosine_cycles"], default=None)
     parser.add_argument("--num_threads", type=int, default=1, help="CPU thread limit for small experiments")
     parser.add_argument("--sdpa_backend", choices=["auto", "math", "flash"], default="auto")
     compile_utils.add_compile_arguments(parser)

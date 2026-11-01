@@ -85,12 +85,15 @@ sources, dataset-wide validation splitting, epoch-based caption dropout,
 per-image repeats, regularization/inpainting, and indexed multi-dataset mixing.
 Weighted mixing of multiple live streams would need a separate implementation;
 it is not silently approximated by the existing indexed DatasetGroup.
-Image shuffle buffers, pending bucket queues, and worker prefetch are disabled.
-`num_workers` and `shuffle_buffer` must be zero. Transport-level byte buffering
-for tar/gzip decoding remains bounded; it does not decode future images.
+Pending bucket queues and worker prefetch are disabled; `num_workers` must be
+zero. `shuffle_buffer=0` disables image look-ahead. A positive `shuffle_buffer`
+enables a bounded local window of resized images, randomly emitted before A/B
+pairing. It is synchronous and does not use PyTorch's `prefetch_factor`. The
+Colab preset uses 16 images (about 108 MiB of tensors at the 768-square pixel
+budget). Tar/gzip transport buffering remains separate from this image window.
 
 The effective source configuration is saved in checkpoints, including external
-dataset-file contents. Resume uses deterministic replay, not seeking. Checkpoints
+dataset-file contents. Resume can restart the stream or replay it, without seeking. Checkpoints
 from the previous buffered-loader implementation are not interchangeable with
 the new sequential ordering.
 
@@ -255,12 +258,24 @@ are adapted in every configured MOSS block. Saved adapters use the custom
 
 Checkpoints contain `adapter_model.safetensors`, `adapter_config.json`, and
 `training_state.pt`. Resume with `--resume <step-directory>`. Frozen random
-components are regenerated from the saved seed/config; sequential data is
-deterministically replayed up to the saved batch count before RNG restoration.
-This requires unchanged shards and worker settings, and may be slow for long
-remote streams. Only `training.max_steps` may change on resume. Existing output
+components are regenerated from the saved seed/config. `resume_data_mode="restart"`
+starts the stream again without recovering its old position or shuffle window.
+The Colab preset uses this mode. The default `"replay"` mode deterministically
+replays consumed batches before RNG restoration for exact toy comparisons;
+it requires unchanged shards and can be slow for long remote streams.
+Only `training.max_steps` may change on resume, and scheduled runs must keep
+that value unchanged as well. Existing output
 directories should be used intentionally; a fresh invocation replaces that run's
 metrics/config. No production pretrained loading path exists in this task.
+
+Training controls now support the shared optimizer factory (`optimizer_type`
+and `optimizer_args`), optional TensorBoard metrics, and `lr_scheduler` values
+`constant` or `cosine_cycles`. The latter combines warmup, cosine oscillation
+and a decaying envelope; see [Colab settings](moss_colab_setup.md) for defaults.
+The scheduler is advanced once per optimizer update and saved with optimizer
+state. `keep_last_checkpoints` retains only the requested number of completed
+step directories; zero disables pruning. Completion markers are written after
+the adapter and training state are saved. Logs and previews are retained.
 
 ## Compile options
 

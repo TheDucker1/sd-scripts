@@ -33,10 +33,58 @@ from library.moss_image_style_train_utils import (
     build_random_components,
     configure_style_compile,
     prepare_style_batch,
+    prune_style_checkpoints,
     sample_style_sigmas,
     style_objective,
 )
 from moss_image_train_style import MossImageStyleTrainer, setup_parser
+
+
+class TrainingControlTests(unittest.TestCase):
+    def test_cosine_cycles_resume_and_decay(self):
+        trainer = MossImageStyleTrainer()
+        config = {"training": {"max_steps": 24, "lr_scheduler": "cosine_cycles", "warmup_steps": 4,
+                               "lr_cycles": 2, "min_lr_ratio": 0.01}}
+        parameter = torch.nn.Parameter(torch.zeros(1))
+        optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+        scheduler = trainer.get_scheduler(config, optimizer)
+        rates = []
+        for step in range(24):
+            rates.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            scheduler.step()
+            if step == 10:
+                saved_optimizer = copy.deepcopy(optimizer.state_dict())
+                saved_scheduler = copy.deepcopy(scheduler.state_dict())
+        self.assertLess(rates[0], rates[3])
+        self.assertGreater(rates[4], rates[9])
+        self.assertGreater(rates[14], rates[9])
+        self.assertLess(rates[14], rates[4])
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-6)
+        resumed = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=1e-4)
+        resumed_scheduler = trainer.get_scheduler(config, resumed)
+        resumed.load_state_dict(saved_optimizer)
+        resumed_scheduler.load_state_dict(saved_scheduler)
+        for expected in rates[11:]:
+            self.assertEqual(resumed.param_groups[0]["lr"], expected)
+            resumed.step()
+            resumed_scheduler.step()
+
+    def test_retention_preserves_incomplete_and_unrelated_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for step in range(1, 6):
+                checkpoint = root / f"step-{step:06d}"
+                checkpoint.mkdir()
+                (checkpoint / "complete.json").write_text("{}")
+                (checkpoint / "training_state.pt").write_bytes(b"test")
+            (root / "step-000006").mkdir()
+            (root / "samples").mkdir()
+            prune_style_checkpoints(root, 3)
+            self.assertFalse((root / "step-000001").exists())
+            self.assertFalse((root / "step-000002").exists())
+            for name in ("step-000003", "step-000004", "step-000005", "step-000006", "samples"):
+                self.assertTrue((root / name).is_dir())
 
 
 def make_archive(path, count=8, shapes=None):
@@ -387,12 +435,29 @@ class TestMossStyleTraining(unittest.TestCase):
 
     def test_strict_streaming_rejects_lookahead_options(self):
         config = toy_config(self.path)
-        for setting in (dict(shuffle_buffer=2), dict(num_repeats=2), dict(validation_split=0.1)):
+        for setting in (dict(shuffle_buffer=-1), dict(num_repeats=2), dict(validation_split=0.1)):
             with self.assertRaises(ValueError):
                 config_util.generate_streaming_blueprint(dict(datasets=[dict(subsets=[dict(shards=["unused.tar"])], **setting)]))
         config["training"]["num_workers"] = 1
         with self.assertRaises(ValueError):
             resolve_style_dataset_config(config)
+
+    def test_bounded_local_shuffle(self):
+        archive = self.path / "window.tar"
+        make_archive(archive, count=20)
+        pairs = MossStylePairDataset([archive], resolution=32, repeat=False, shuffle_buffer=4)
+        with mock.patch.object(pairs.dataset, "_process_image", wraps=pairs.dataset._process_image) as process:
+            stream = iter(pairs.dataset)
+            first = next(stream)
+            self.assertEqual(process.call_count, 4)
+            keys = [first["image_key"]]
+            for index, image in enumerate(stream, start=1):
+                keys.append(image["image_key"])
+                self.assertLessEqual(process.call_count, index + 4)
+        self.assertEqual(len(keys), 20)
+        self.assertEqual(len(set(keys)), 20)
+        self.assertNotEqual(keys, sorted(keys))
+        self.assertEqual(keys, [image["image_key"] for image in pairs.dataset])
 
     def test_streaming_no_upscale_does_not_register_images(self):
         archive = self.path / "no-upscale.tar"

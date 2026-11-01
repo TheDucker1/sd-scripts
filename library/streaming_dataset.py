@@ -1,7 +1,7 @@
 """Sequential tar backend using the existing dataset configuration/processing.
 
-No scan, image index, image shuffle queue, worker prefetch, or future-bucket search.
-Only the image being decoded and the caller's current batch are retained.
+No scan, image index, worker prefetch, or future-bucket search. An optional bounded
+shuffle window retains processed images; shuffle_buffer=0 disables look-ahead.
 """
 
 import copy
@@ -10,6 +10,7 @@ import logging
 import math
 import random
 import tarfile
+from itertools import islice
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -192,7 +193,24 @@ class StreamingDataset(BaseDataset, torch.utils.data.IterableDataset):
 
     def __iter__(self):
         if torch.utils.data.get_worker_info() is not None:
-            raise ValueError("Strict streaming requires num_workers=0; worker prefetch is disabled")
+            raise ValueError("Streaming requires num_workers=0; use shuffle_buffer for bounded local shuffling")
+        source = self._iter_images()
+        try:
+            if self.params.shuffle_buffer == 0:
+                yield from source
+                return
+            rng = random.Random(self.seed + self.params.rank + 104729)
+            window = list(islice(source, self.params.shuffle_buffer))
+            while window:
+                yield window.pop(rng.randrange(len(window)))
+                try:
+                    window.append(next(source))
+                except StopIteration:
+                    pass
+        finally:
+            source.close()
+
+    def _iter_images(self):
         rng = random.Random(self.seed + self.params.rank)
         sources = [(subset, shard) for subset in self.subsets for shard in subset.shards]
         sources = sources[self.params.rank::self.params.world_size]

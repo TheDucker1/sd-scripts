@@ -555,7 +555,7 @@ def generate_streaming_blueprint(user_config: dict, batch_size=1) -> DatasetBlue
         "cache_info": False, "alpha_mask": False, "face_crop_aug_range": None,
         "caption_dropout_every_n_epochs": 0, "validation_split": 0.0,
         "num_repeats": 1, "network_multiplier": 1.0, "prior_loss_weight": 1.0,
-        "train_inpainting": False, "debug_dataset": False, "shuffle_buffer": 0,
+        "train_inpainting": False, "debug_dataset": False,
     }
     for scope in (general, dataset, *dataset["subsets"]):
         for name, required in disabled.items():
@@ -563,7 +563,7 @@ def generate_streaming_blueprint(user_config: dict, batch_size=1) -> DatasetBlue
                 raise ValueError(f"{name}={scope[name]!r} is unavailable in strict streaming; required value is {required!r}")
     fallbacks = [dataset, general, {"batch_size": batch_size, "resolution": (256, 256)}]
     params = BlueprintGenerator.generate_params_by_fallbacks(StreamingDatasetParams, fallbacks)
-    if params.batch_size < 1 or params.shuffle_buffer != 0 or not 0 <= params.rank < params.world_size:
+    if params.batch_size < 1 or params.shuffle_buffer < 0 or not 0 <= params.rank < params.world_size:
         raise ValueError("Invalid streaming batch size, shuffle buffer, or rank/world_size")
     subsets = []
     for subset in dataset["subsets"]:

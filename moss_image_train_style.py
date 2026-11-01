@@ -177,7 +177,7 @@ class MossImageStyleTrainer:
         log_stages = train.get("log_stage_timing", train.get("log_timing", False))
         if log_stages:
             logger.info("Stage timing enabled: CUDA synchronization at boundaries; backward includes checkpoint recomputation")
-            logger.info("Checkpointing: DiT=%s decoder=%s features=%s", config.get("gradient_checkpointing", False),
+            logger.info("Checkpointing: DiT=%s decoder=%s features=%s", any(block.gradient_checkpointing for block in components.dit.layers),
                         train.get("checkpoint_decoder", False), train.get("checkpoint_features", False))
             logger.info("Checkpointed main blocks: %d/%d", sum(block.gradient_checkpointing for block in components.dit.layers),
                         len(components.dit.layers))

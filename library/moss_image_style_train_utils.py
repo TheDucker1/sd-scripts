@@ -276,9 +276,27 @@ def build_random_components(config, device):
     vae.float()
     tag_dtype = DTYPES[tag_config.get("dtype", "bfloat16")]
     tagger._apply(lambda tensor: tensor.to(dtype=tag_dtype) if tensor.is_floating_point() else tensor)
-    if config.get("gradient_checkpointing", False):
-        dit.enable_gradient_checkpointing()
+    configure_style_checkpointing(dit, config)
     return components
+
+
+def configure_style_checkpointing(dit, config):
+    """Checkpoint an evenly spaced subset of main blocks, or all blocks."""
+    count = config.get("checkpoint_blocks")
+    if count is None:
+        if config.get("gradient_checkpointing", False):
+            dit.enable_gradient_checkpointing()
+        return
+    total = len(dit.layers)
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= total:
+        raise ValueError(f"checkpoint_blocks must be an integer in [0, {total}]")
+    dit.disable_gradient_checkpointing()
+    # Select bin centers so recomputation is spread across depth without
+    # checkpointing the text refiner or requiring a particular model size.
+    indices = [(2 * index + 1) * total // (2 * count) for index in range(count)]
+    for index in indices:
+        dit.layers[index].enable_gradient_checkpointing()
+    logger.info("MOSS checkpointed main blocks (1-based): %s; %d/%d", [index + 1 for index in indices], count, total)
 
 
 def configure_style_compile(components, args):

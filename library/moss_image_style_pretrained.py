@@ -20,7 +20,7 @@ from library import flux2_vae, moss_image_utils
 from library.moss_image_edit import LoRALinear, MossImageEdit
 from library.moss_image_style_dataset import make_style_buckets
 from library.moss_image_style_train_utils import (
-    DTYPES, FrozenImageFeatures, MossStyleComponents, StylePromptTagger, read_tag_labels,
+    DTYPES, FrozenImageFeatures, MossStyleComponents, StylePromptTagger, configure_style_checkpointing, read_tag_labels,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,6 +251,5 @@ def build_pretrained_components(config, device):
     factor = 2 ** (len(vae.params.ch_mult) - 1) * 2
     if any(width % factor or height % factor for width, height in make_style_buckets(config["data"])):
         raise ValueError(f"All image bucket dimensions must be divisible by {factor}")
-    if config.get("gradient_checkpointing", False):
-        dit.enable_gradient_checkpointing()
+    configure_style_checkpointing(dit, config)
     return components

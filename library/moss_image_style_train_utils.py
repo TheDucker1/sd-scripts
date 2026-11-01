@@ -281,7 +281,7 @@ def build_random_components(config, device):
 
 
 def configure_style_checkpointing(dit, config):
-    """Checkpoint an evenly spaced subset of main blocks, or all blocks."""
+    """Checkpoint the first N main blocks, or use all-block checkpointing."""
     count = config.get("checkpoint_blocks")
     if count is None:
         if config.get("gradient_checkpointing", False):
@@ -291,9 +291,9 @@ def configure_style_checkpointing(dit, config):
     if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= total:
         raise ValueError(f"checkpoint_blocks must be an integer in [0, {total}]")
     dit.disable_gradient_checkpointing()
-    # Select bin centers so recomputation is spread across depth without
-    # checkpointing the text refiner or requiring a particular model size.
-    indices = [(2 * index + 1) * total // (2 * count) for index in range(count)]
+    # Earlier blocks are recomputed later in backward, after later blocks'
+    # saved activations have been consumed. Keep the text refiner uncheckpointed.
+    indices = list(range(count))
     for index in indices:
         dit.layers[index].enable_gradient_checkpointing()
     logger.info("MOSS checkpointed main blocks (1-based): %s; %d/%d", [index + 1 for index in indices], count, total)

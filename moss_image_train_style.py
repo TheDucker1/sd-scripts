@@ -32,7 +32,7 @@ from library.moss_image_style_train_utils import (
     validate_style_config,
 )
 from library.streaming_dataset import PrefetchIterator
-from library.utils import setup_logging
+from library.utils import add_logging_arguments, setup_logging
 
 setup_logging()
 import logging
@@ -44,6 +44,7 @@ class MossImageStyleTrainer:
     """Single-reference MOSS trainer with streamed pairs and embedding losses."""
 
     def train(self, args: argparse.Namespace):
+        setup_logging(args, reset=True)
         torch.set_num_threads(args.num_threads)
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         for name in ("batch_size", "gradient_accumulation_steps", "max_steps", "save_every", "keep_last_checkpoints",
@@ -178,6 +179,8 @@ class MossImageStyleTrainer:
             logger.info("Stage timing enabled: CUDA synchronization at boundaries; backward includes checkpoint recomputation")
             logger.info("Checkpointing: DiT=%s decoder=%s features=%s", config.get("gradient_checkpointing", False),
                         train.get("checkpoint_decoder", False), train.get("checkpoint_features", False))
+            logger.info("Checkpointed main blocks: %d/%d", sum(block.gradient_checkpointing for block in components.dit.layers),
+                        len(components.dit.layers))
             logger.info("Component weight dtypes: DiT=%s VAE=%s Qwen=%s tagger=%s DINO=%s style=%s",
                         components.dit.dtype, components.vae.dtype, next(components.text_encoder.parameters()).dtype,
                         next(components.tagger.parameters()).dtype, next(components.content.parameters()).dtype,
@@ -241,7 +244,8 @@ class MossImageStyleTrainer:
                     optimizer.zero_grad(set_to_none=True)
                     metrics = {}
                     for microbatch in range(accumulation):
-                        stage_timer = StyleStageTimer(device, log_stages, step, microbatch + 1)
+                        stage_timer = StyleStageTimer(device, log_stages, step, microbatch + 1,
+                                                      verbose=train.get("verbose_stage_timing", False))
                         data_start = time.perf_counter()
                         try:
                             with stage_timer.measure("data_wait"):
@@ -288,17 +292,18 @@ class MossImageStyleTrainer:
                         writer.flush()
                     metrics_file.write(json.dumps(metrics) + "\n")
                     metrics_file.flush()
-                    logger.info(
-                        "step=%d loss=%.6f content=%.6f style=%.6f grad=%.6f",
-                        step,
-                        metrics["loss"],
-                        metrics["content_loss"],
-                        metrics["style_loss"],
-                        metrics["gradient_norm"],
-                    )
+                    summary = (f"step={step} loss={metrics['loss']:.6f} content={metrics['content_loss']:.6f} "
+                               f"style={metrics['style_loss']:.6f} grad={metrics['gradient_norm']:.4f}")
                     if train.get("log_timing", False):
-                        logger.info("step_time=%.2fs data_wait=%.2fs pairs/s=%.3f pairs=%d",
-                                    metrics["step_seconds"], data_seconds, metrics["pairs_per_second"], pairs_seen)
+                        summary += (f" | total={metrics['step_seconds']:.2f}s data={data_seconds:.2f}s "
+                                    f"pairs/s={metrics['pairs_per_second']:.3f} pairs={pairs_seen}")
+                    if log_stages:
+                        summary += " | " + " ".join(
+                            f"{label}={metrics.get('stage_' + name + '_seconds', 0.0):.2f}s"
+                            for label, name in (("qwen", "qwen"), ("dit", "dit_forward"),
+                                                ("decode", "vae_decode"), ("backward", "backward"))
+                        )
+                    logger.info("%s", summary)
                     sampling = get_style_sampling_options(config)
                     sample_every = sampling["every_n_steps"]
                     if sampling["enabled"] and (
@@ -329,6 +334,8 @@ def setup_parser():
     )
     parser.add_argument("--config", required=True, help="Local JSON architecture/training/data configuration")
     config_util.add_config_arguments(parser)
+    add_logging_arguments(parser)
+    parser.set_defaults(console_log_simple=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", help="Completed adapter/training-state checkpoint directory from this trainer")

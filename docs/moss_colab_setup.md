@@ -177,11 +177,16 @@ pretrained run preset; the notebook adds pinned dataset URLs and the current
 manifest path. Model architecture and editing LoRA dimensions come from the
 downloaded configuration, rather than the tiny development preset.
 
-The defaults are batch size 1, gradient accumulation 2, a 589824-pixel area
+The defaults are batch size 2, gradient accumulation 2, a 589824-pixel area
 budget for each A/B image, and aspect buckets in 64-pixel increments. They train
 for 100000 optimizer updates, generate five fresh A/B/result JPEG triptychs with
 50 denoising steps every 1000 updates, and save every 1000 updates. Each pair
-contains two images, so the effective batch is two pairs per optimizer update.
+contains two images, so the effective batch is four pairs per optimizer update.
+The larger-GPU preset disables DiT, decoder and feature activation checkpointing
+to avoid forward recomputation during backward. This uses more activation memory.
+If needed, batch 1 with accumulation 4 retains four pairs per optimizer update.
+Backward still computes input gradients through the frozen base, decoder and
+loss encoders; freezing their weights does not remove those operations.
 
 AdamW8bit uses LR 1e-4, weight decay 0.01, betas (0.9, 0.999), epsilon 1e-8 and
 gradient clipping at 1.0. After 1000 warmup updates, five cosine cycles rise and
@@ -218,7 +223,7 @@ for example (on Colab, after setup and the run-configuration cell):
   --output_dir /content/drive/MyDrive/moss-training/moss-style-768 \
   --device cuda --compile --compile_backend inductor \
   --compile_scope blocks --compile_modules dit --compile_dynamic true \
-  --batch_size 1 --gradient_accumulation_steps 2 --max_steps 100000 \
+  --batch_size 2 --gradient_accumulation_steps 2 --max_steps 100000 \
   --sample_every 1000 --preview_pairs 5 --sample_steps 50 \
   --save_every 1000 --keep_last_checkpoints 3 \
   --optimizer_type AdamW8bit --learning_rate 0.0001 \
@@ -240,11 +245,14 @@ longer triggers the previous serial per-pair DiT fallback. It can still increase
 memory and update time; compare pairs/second, not only seconds/update. The preset
 enables `training.log_timing` to report data wait and complete update time.
 Stage diagnostics follow `training.log_stage_timing` when specified, otherwise
-the existing `log_timing` setting. Each stage prints a start line and a duration
-as soon as it finishes: transfer, tagging, prompt/tokenization, Qwen, VAE A/B
-encoding, target feature encoders, DiT, decoding, predicted feature encoders,
-backward and optimizer. CUDA is synchronized at boundaries for attribution;
-this adds diagnostic overhead. Backward includes checkpoint recomputation.
+the existing `log_timing` setting. The CLI now uses the repository's simple
+console logger by default and emits one summary per update, including the
+largest stage durations. Per-stage start/end and image/token details are hidden
+unless `training.verbose_stage_timing=true`. All stages are still measured:
+transfer, tagging, tokenization, Qwen, VAE encoding, target/predicted features,
+DiT, decoding, backward and optimizer. CUDA is synchronized at boundaries for
+attribution; this adds diagnostic overhead. Backward includes any enabled
+checkpoint recomputation.
 Durations are also saved as `stage_*_seconds` in JSONL/TensorBoard, summed over
 accumulation microbatches. Set `log_stage_timing=false` to disable the barriers
 and detailed stage logs while retaining overall step/data timing.

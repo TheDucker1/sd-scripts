@@ -36,9 +36,10 @@ DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 class StyleStageTimer:
     """Diagnostic wall timings with GPU work completed at stage boundaries."""
 
-    def __init__(self, device, enabled=False, step=0, microbatch=1):
+    def __init__(self, device, enabled=False, step=0, microbatch=1, verbose=False):
         self.device = torch.device(device)
         self.enabled, self.step, self.microbatch = enabled, step, microbatch
+        self.verbose = verbose
         self.timings = {}
 
     @contextmanager
@@ -46,7 +47,8 @@ class StyleStageTimer:
         if not self.enabled:
             yield
             return
-        logger.info("stage[%d.%d] %s start", self.step, self.microbatch, name)
+        if self.verbose:
+            logger.info("stage[%d.%d] %s start", self.step, self.microbatch, name)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         start = time.perf_counter()
@@ -59,7 +61,8 @@ class StyleStageTimer:
             raise
         elapsed = time.perf_counter() - start
         self.timings[name] = self.timings.get(name, 0.0) + elapsed
-        logger.info("stage[%d.%d] %s %.3fs", self.step, self.microbatch, name, elapsed)
+        if self.verbose:
+            logger.info("stage[%d.%d] %s %.3fs", self.step, self.microbatch, name, elapsed)
 
 
 def sample_style_sigmas(
@@ -376,7 +379,7 @@ def prepare_style_batch(components, batch, device, rng, current_step=0, max_trai
             prompts = [process_stream_caption(prompt, subset, rng, current_step, max_train_steps)
                        for prompt, subset in zip(prompts, batch["subsets_a"])]
         tokens = components.tokenizer(prompts)
-    if timer.enabled:
+    if timer.enabled and timer.verbose:
         logger.info("batch grids A=%s B=%s", [tuple(image.shape[-2:]) for image in a], [tuple(image.shape[-2:]) for image in b])
         logger.info("Qwen token lengths=%s groups=%d", [value.numel() for value in tokens], len({value.numel() for value in tokens}))
     with timer.measure("qwen"):

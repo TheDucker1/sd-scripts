@@ -18,6 +18,7 @@ from library.moss_image_style_dataset import (
     MossStylePairDataset, iter_image_pairs_batch, read_image_pairs_batch, resolve_style_dataset_config,
 )
 from library.moss_image_style_train_utils import (
+    StyleStageTimer,
     build_random_components,
     configure_style_compile,
     get_style_sampling_options,
@@ -142,9 +143,9 @@ class MossImageStyleTrainer:
                     break
         return batches_seen
 
-    def process_batch(self, components, batch, config, device, prompt_rng, current_step=0):
+    def process_batch(self, components, batch, config, device, prompt_rng, current_step=0, stage_timer=None):
         train = config["training"]
-        prepared = prepare_style_batch(components, batch, device, prompt_rng, current_step, train["max_steps"])
+        prepared = prepare_style_batch(components, batch, device, prompt_rng, current_step, train["max_steps"], stage_timer)
         latents = prepared["latents"]
         sigmas = sample_style_sigmas(len(latents), device, **config.get("noise", {}))
         noise = [torch.randn_like(value) for value in latents] if isinstance(latents, list) else torch.randn_like(latents)
@@ -157,6 +158,7 @@ class MossImageStyleTrainer:
             train.get("style_weight", 1.0),
             train.get("checkpoint_decoder", False),
             train.get("checkpoint_features", False),
+            stage_timer=stage_timer,
         )
         return loss, values, prepared
 
@@ -171,6 +173,15 @@ class MossImageStyleTrainer:
         if compile_args is not None:
             configure_style_compile(components, compile_args)
         train = config["training"]
+        log_stages = train.get("log_stage_timing", train.get("log_timing", False))
+        if log_stages:
+            logger.info("Stage timing enabled: CUDA synchronization at boundaries; backward includes checkpoint recomputation")
+            logger.info("Checkpointing: DiT=%s decoder=%s features=%s", config.get("gradient_checkpointing", False),
+                        train.get("checkpoint_decoder", False), train.get("checkpoint_features", False))
+            logger.info("Component weight dtypes: DiT=%s VAE=%s Qwen=%s tagger=%s DINO=%s style=%s",
+                        components.dit.dtype, components.vae.dtype, next(components.text_encoder.parameters()).dtype,
+                        next(components.tagger.parameters()).dtype, next(components.content.parameters()).dtype,
+                        next(components.style.parameters()).dtype)
         parameters = [parameter for parameter in components.dit.parameters() if parameter.requires_grad]
         optimizer = self.get_optimizer(config, parameters)
         scheduler = self.get_scheduler(config, optimizer)
@@ -229,10 +240,12 @@ class MossImageStyleTrainer:
                     data_seconds, pairs_seen = 0.0, 0
                     optimizer.zero_grad(set_to_none=True)
                     metrics = {}
-                    for _ in range(accumulation):
+                    for microbatch in range(accumulation):
+                        stage_timer = StyleStageTimer(device, log_stages, step, microbatch + 1)
                         data_start = time.perf_counter()
                         try:
-                            batch = next(stream)
+                            with stage_timer.measure("data_wait"):
+                                batch = next(stream)
                         except StopIteration as error:
                             raise RuntimeError(
                                 "Dataset exhausted before max_steps; enable data.repeat or provide more shards"
@@ -240,18 +253,25 @@ class MossImageStyleTrainer:
                         data_seconds += time.perf_counter() - data_start
                         pairs_seen += len(batch["id_a"])
                         batches_seen += 1
-                        loss, values, prepared = self.process_batch(components, batch, config, device, prompt_rng, step - 1)
+                        loss, values, prepared = self.process_batch(components, batch, config, device, prompt_rng, step - 1, stage_timer)
                         if not torch.isfinite(loss):
                             raise FloatingPointError(f"Nonfinite loss at step {step}")
-                        (loss / accumulation).backward()
+                        with stage_timer.measure("backward"):
+                            (loss / accumulation).backward()
+                        for name, seconds in stage_timer.timings.items():
+                            key = f"stage_{name}_seconds"
+                            metrics[key] = metrics.get(key, 0.0) + seconds
                         for name, value in dict(values, loss=loss.detach()).items():
                             metrics[name] = metrics.get(name, 0.0) + float(value) / accumulation
-                    gradient_norm = torch.nn.utils.clip_grad_norm_(
-                        parameters, train.get("max_grad_norm", 1.0), error_if_nonfinite=True
-                    )
-                    learning_rate = optimizer.param_groups[0]["lr"]
-                    optimizer.step()
-                    scheduler.step()
+                    with stage_timer.measure("optimizer"):
+                        gradient_norm = torch.nn.utils.clip_grad_norm_(
+                            parameters, train.get("max_grad_norm", 1.0), error_if_nonfinite=True
+                        )
+                        learning_rate = optimizer.param_groups[0]["lr"]
+                        optimizer.step()
+                        scheduler.step()
+                    if log_stages:
+                        metrics["stage_optimizer_seconds"] = stage_timer.timings["optimizer"]
                     metrics.update(
                         step=step, learning_rate=learning_rate, gradient_norm=float(gradient_norm),
                         batches_seen=batches_seen, prompt=prepared["prompts"][0]

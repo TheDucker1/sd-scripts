@@ -223,6 +223,15 @@ VAE work groups matching spatial shapes. Increasing batch size therefore no
 longer triggers the previous serial per-pair DiT fallback. It can still increase
 memory and update time; compare pairs/second, not only seconds/update. The preset
 enables `training.log_timing` to report data wait and complete update time.
+Stage diagnostics follow `training.log_stage_timing` when specified, otherwise
+the existing `log_timing` setting. Each stage prints a start line and a duration
+as soon as it finishes: transfer, tagging, prompt/tokenization, Qwen, VAE A/B
+encoding, target feature encoders, DiT, decoding, predicted feature encoders,
+backward and optimizer. CUDA is synchronized at boundaries for attribution;
+this adds diagnostic overhead. Backward includes checkpoint recomputation.
+Durations are also saved as `stage_*_seconds` in JSONL/TensorBoard, summed over
+accumulation microbatches. Set `log_stage_timing=false` to disable the barriers
+and detailed stage logs while retaining overall step/data timing.
 
 `SHUFFLE_BUFFER` is measured in images: 32 images at the 589824-pixel budget
 require about 216 MiB of image tensors, plus decode temporaries and the current

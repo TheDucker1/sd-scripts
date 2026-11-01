@@ -8,6 +8,8 @@ import math
 import random
 import re
 import shutil
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +31,35 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+
+
+class StyleStageTimer:
+    """Diagnostic wall timings with GPU work completed at stage boundaries."""
+
+    def __init__(self, device, enabled=False, step=0, microbatch=1):
+        self.device = torch.device(device)
+        self.enabled, self.step, self.microbatch = enabled, step, microbatch
+        self.timings = {}
+
+    @contextmanager
+    def measure(self, name):
+        if not self.enabled:
+            yield
+            return
+        logger.info("stage[%d.%d] %s start", self.step, self.microbatch, name)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        start = time.perf_counter()
+        try:
+            yield
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+        except BaseException:
+            logger.exception("stage[%d.%d] %s failed", self.step, self.microbatch, name)
+            raise
+        elapsed = time.perf_counter() - start
+        self.timings[name] = self.timings.get(name, 0.0) + elapsed
+        logger.info("stage[%d.%d] %s %.3fs", self.step, self.microbatch, name, elapsed)
 
 
 def sample_style_sigmas(
@@ -326,7 +357,8 @@ def decode_style_latents(vae, latents, checkpoint_decoder):
 
 
 @torch.no_grad()
-def prepare_style_batch(components, batch, device, rng, current_step=0, max_train_steps=0):
+def prepare_style_batch(components, batch, device, rng, current_step=0, max_train_steps=0, stage_timer=None):
+    timer = stage_timer if stage_timer is not None else StyleStageTimer(device)
     ragged = isinstance(batch["image_a"], list) or isinstance(batch["image_b"], list)
 
     def move(images):
@@ -334,29 +366,46 @@ def prepare_style_batch(components, batch, device, rng, current_step=0, max_trai
             return [value.to(device) for value in images]
         return images.to(device)
 
-    a, b = move(batch["image_a"]), move(batch["image_b"])
-    scores = components.tagger(a)
-    prompts = components.tagger.prompts(scores, rng, shuffle="subsets_a" not in batch)
-    if "subsets_a" in batch:
-        prompts = [process_stream_caption(prompt, subset, rng, current_step, max_train_steps)
-                   for prompt, subset in zip(prompts, batch["subsets_a"])]
-    tokens = components.tokenizer(prompts)
-    contexts = moss_image_utils.encode_tokens(components.text_encoder, tokens, device, batch_equal_length=True)
-    context, mask = moss_image_utils.pad_text_embeds(contexts)
+    with timer.measure("image_transfer"):
+        a, b = move(batch["image_a"]), move(batch["image_b"])
+    with timer.measure("tagger"):
+        scores = components.tagger(a)
+    with timer.measure("prompt_tokenize"):
+        prompts = components.tagger.prompts(scores, rng, shuffle="subsets_a" not in batch)
+        if "subsets_a" in batch:
+            prompts = [process_stream_caption(prompt, subset, rng, current_step, max_train_steps)
+                       for prompt, subset in zip(prompts, batch["subsets_a"])]
+        tokens = components.tokenizer(prompts)
+    if timer.enabled:
+        logger.info("batch grids A=%s B=%s", [tuple(image.shape[-2:]) for image in a], [tuple(image.shape[-2:]) for image in b])
+        logger.info("Qwen token lengths=%s groups=%d", [value.numel() for value in tokens], len({value.numel() for value in tokens}))
+    with timer.measure("qwen"):
+        contexts = moss_image_utils.encode_tokens(components.text_encoder, tokens, device, batch_equal_length=True)
+        context, mask = moss_image_utils.pad_text_embeds(contexts)
+    with timer.measure("vae_encode_A"):
+        latents = encode_style_images(components.vae, a)
+    with timer.measure("vae_encode_B"):
+        reference = encode_style_images(components.vae, b)
+    with timer.measure("dino_target"):
+        content_target = components.content(a)
+    with timer.measure("style_target"):
+        style_target = components.style(b)
     return dict(
-        latents=encode_style_images(components.vae, a),
-        reference=encode_style_images(components.vae, b),
+        latents=latents,
+        reference=reference,
         context=context,
         mask=mask,
-        content_target=components.content(a),
-        style_target=components.style(b),
+        content_target=content_target,
+        style_target=style_target,
         prompts=prompts,
     )
 
 
 def style_objective(
-    components, prepared, sigmas, noise, content_weight=1.0, style_weight=1.0, checkpoint_decoder=False, checkpoint_features=False
+    components, prepared, sigmas, noise, content_weight=1.0, style_weight=1.0, checkpoint_decoder=False, checkpoint_features=False,
+    stage_timer=None,
 ):
+    timer = stage_timer if stage_timer is not None else StyleStageTimer(sigmas.device)
     ragged = isinstance(prepared["latents"], list)
     if ragged:
         noisy = [(1 - sigma) * z.float() + sigma * n.float()
@@ -369,24 +418,28 @@ def style_objective(
         noisy = (1 - sigma) * z + sigma * noise.float()
         inputs = noisy.to(components.dit.dtype)
         reference = prepared["reference"].to(components.dit.dtype)
-    velocity = components.dit(
-        inputs,
-        sigmas * 1000,
-        prepared["context"],
-        reference,
-        prepared["mask"],
-    )
+    with timer.measure("dit_forward"):
+        velocity = components.dit(
+            inputs,
+            sigmas * 1000,
+            prepared["context"],
+            reference,
+            prepared["mask"],
+        )
     predicted = ([value - sigma * prediction.float() for value, sigma, prediction in zip(noisy, sigmas.float(), velocity)]
                  if ragged else noisy - sigma * velocity.float())
-    pixels = decode_style_latents(components.vae, predicted, checkpoint_decoder)
+    with timer.measure("vae_decode"):
+        pixels = decode_style_latents(components.vae, predicted, checkpoint_decoder)
 
     def extract(module):
         if isinstance(pixels, list) and checkpoint_features:
             return checkpoint(lambda *values: module(list(values)), *pixels, use_reentrant=False)
         return checkpoint(module, pixels, use_reentrant=False) if checkpoint_features else module(pixels)
 
-    content_loss = (1 - (extract(components.content) * prepared["content_target"]).sum(dim=-1)).mean()
-    style_loss = (1 - (extract(components.style) * prepared["style_target"]).sum(dim=-1)).mean()
+    with timer.measure("dino_prediction"):
+        content_loss = (1 - (extract(components.content) * prepared["content_target"]).sum(dim=-1)).mean()
+    with timer.measure("style_prediction"):
+        style_loss = (1 - (extract(components.style) * prepared["style_target"]).sum(dim=-1)).mean()
     loss = content_weight * content_loss + style_weight * style_loss
     return loss, {
         "content_loss": content_loss.detach(),

@@ -62,8 +62,10 @@ under `MyDrive/moss-training/dataset-index/`. It does not load model weights.
 All original, recent and update `.tar` archives at a pinned Hub revision are
 indexed before training; this is not a lazy index.
 
-The JSON Lines metadata uses one long HTTP response, parsed incrementally rather
-than separate requests per chunk. Interrupted connections resume at the byte
+The JSON Lines metadata uses sequential HTTP responses capped at 10 GiB, parsed
+incrementally with a small buffer instead of retaining raw multi-GB chunks.
+Processed records are flushed into compressed Drive segments.
+Interrupted connections resume at the byte
 offset already consumed, and reruns resume the last committed complete line.
 Exactly one non-placeholder
 artist is required. ISO timestamps become UTC Unix seconds. Defaults require
@@ -73,13 +75,21 @@ are removed, then posts without another same-artist image within 365 days are
 removed. This uses upload time, not necessarily artwork creation time. Metadata
 coverage may exclude images from newer update archives.
 
-Uncompressed tar is opened in seekable `r:` mode over a strict HTTP range reader.
-Python's tar parser handles extended headers and supplies member payload offsets.
-Image payloads are skipped during indexing, although small range buffers may
-include adjacent payload bytes. Each archive needs many dependent header requests;
-the first full preparation can take a long time. Four archives are scanned
-concurrently by default. Retries use bounded backoff and honor numeric Retry-After.
-An ignored range or changed total file size causes a visible failure.
+By default (`--archive-mode ram --workers 1`) one complete uncompressed tar is
+downloaded into a BytesIO RAM buffer, scanned locally in `r:` mode, then closed
+and released before downloading the next archive. Image archives are not saved
+to Drive or local disk. Python's tar parser handles extended headers and supplies
+real member payload offsets. Download progress reports bytes and throughput.
+The first preparation transfers all archive bytes (multiple TB). A single archive
+larger than `--max-archive-gib` (default 12) is rejected before allocating its
+buffer. Only one RAM archive worker is allowed. Run before loading GPU models.
+An interrupted current archive is downloaded again on rerun; saved header progress
+is reused and completed archives are skipped entirely.
+
+Optional `--archive-mode headers --workers 4` retains the bandwidth-saving sparse
+HTTP reader. It skips payloads with many small range requests. Both modes produce
+the same index and can resume each other's progress. Changed total file size or
+an ignored range fails visibly; transient failures use bounded retries.
 
 The format is versioned, compressed NumPy arrays (`allow_pickle=False`) plus JSON:
 

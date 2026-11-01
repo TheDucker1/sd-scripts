@@ -48,6 +48,22 @@ class TestArtistIndex(unittest.TestCase):
                 self.assertEqual(reader.read(9), payload[9:])
                 self.assertEqual(starts, [0, 9])
 
+    def test_metadata_crosses_response_boundaries_without_losing_partial_lines(self):
+        payload = b'{"id":1}\n{"id":2}\n'
+        ranges = []
+
+        def respond(request, timeout):
+            match = re.fullmatch(r"bytes=(\d+)-(\d+)", request.get_header("Range"))
+            start, end = int(match[1]), int(match[2])
+            ranges.append((start, end))
+            return RangeResponse(payload, start, end)
+
+        with mock.patch("library.danbooru_index.urlopen", side_effect=respond):
+            with RemoteMetadataReader("https://example.invalid/posts", len(payload), response_bytes=7) as reader:
+                with io.BufferedReader(reader, buffer_size=4) as stream:
+                    self.assertEqual(list(stream), payload.splitlines(keepends=True))
+        self.assertEqual(ranges, [(0, 6), (7, 13), (14, 17)])
+
     def test_range_reader_seeks_and_rejects_full_responses(self):
         payload = bytes(range(256)) * 64
 
@@ -105,11 +121,12 @@ class TestArtistIndex(unittest.TestCase):
             root = Path(folder)
             with mock.patch("tools.colab.build_moss_artist_dataset.RemoteMetadataReader", side_effect=metadata_reader):
                 build_metadata(root, manifest, checkpoint_records=2)
-            with mock.patch("tools.colab.build_moss_artist_dataset.RemoteRangeReader") as reader_type:
+            with mock.patch("tools.colab.build_moss_artist_dataset.RemoteMetadataReader") as reader_type:
                 remote = io.BytesIO(archive_data)
                 remote.requests, remote.bytes_read = 0, 0
                 reader_type.return_value = remote
-                build_archive(root, archive, checkpoint_records=1)
+                build_archive(root, archive, checkpoint_records=1, mode="ram", max_ram_bytes=len(archive_data))
+            self.assertTrue(remote.closed)
             # Completed phases must perform no further remote reads.
             with mock.patch("tools.colab.build_moss_artist_dataset.RemoteRangeReader", side_effect=AssertionError("Unexpected remote read")), \
                     mock.patch("tools.colab.build_moss_artist_dataset.RemoteMetadataReader", side_effect=AssertionError("Unexpected metadata read")):

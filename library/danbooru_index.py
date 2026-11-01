@@ -159,10 +159,13 @@ class RemoteRangeReader(io.RawIOBase):
 
 
 class RemoteMetadataReader(RemoteRangeReader):
-    """One sequential HTTP response for metadata, reconnecting only on failure/seek."""
+    """Sequential HTTP responses capped at 10 GiB, with resume after interruption."""
 
-    def __init__(self, url, size, retries=5, timeout=60):
+    def __init__(self, url, size, retries=5, timeout=60, response_bytes=10 * 1024**3):
         super().__init__(url, size, retries=retries, timeout=timeout)
+        if not isinstance(response_bytes, int) or response_bytes < 1:
+            raise ValueError("response_bytes must be positive")
+        self.response_bytes, self.response_end = response_bytes, -1
         self.response = None
 
     def disconnect(self):
@@ -180,7 +183,7 @@ class RemoteMetadataReader(RemoteRangeReader):
         return position
 
     def connect(self):
-        end = self.size - 1
+        end = min(self.size, self.position + self.response_bytes) - 1
         request = Request(self.url, headers={"Range": f"bytes={self.position}-{end}", "Accept-Encoding": "identity"})
         response = urlopen(request, timeout=self.timeout)
         try:
@@ -193,6 +196,7 @@ class RemoteMetadataReader(RemoteRangeReader):
             response.close()
             raise
         self.response = response
+        self.response_end = end
         self.requests += 1
 
     def read(self, size=-1):
@@ -205,9 +209,11 @@ class RemoteMetadataReader(RemoteRangeReader):
             return b""
         for attempt in range(self.retries + 1):
             try:
+                if self.response is not None and self.position > self.response_end:
+                    self.disconnect()
                 if self.response is None:
                     self.connect()
-                payload = self.response.read(size)
+                payload = self.response.read(min(size, self.response_end + 1 - self.position))
                 if not payload:
                     raise OSError("Metadata response ended before its pinned size")
                 self.position += len(payload)

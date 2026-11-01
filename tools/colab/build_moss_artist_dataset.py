@@ -6,7 +6,9 @@ directory may be on Drive; rerunning resumes metadata and individual archives.
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
+import io
 import json
 import logging
 from pathlib import Path
@@ -57,10 +59,8 @@ def build_metadata(root, manifest, checkpoint_records):
         rows, names, artist_ids, lines = [], [], {}, 0
         last_checkpoint = time.monotonic()
 
-    # One long HTTP response, retaining only filtered compact records.
+    # Sequential responses of at most 10 GiB, retaining only compact records.
     # Resume offsets always refer to the first byte after a complete JSON line.
-    import io
-
     with RemoteMetadataReader(source["url"], source["size"]) as remote:
         remote.seek(state["offset"])
         with io.BufferedReader(remote, buffer_size=1024 * 1024) as stream:
@@ -92,7 +92,40 @@ def build_metadata(root, manifest, checkpoint_records):
             checkpoint(stream.tell(), complete=True)
 
 
-def build_archive(root, archive, checkpoint_records, stop=None):
+@contextmanager
+def open_archive_for_index(archive, mode, max_ram_bytes, stop=None):
+    if mode == "headers":
+        with RemoteRangeReader(archive["url"], archive["size"]) as remote:
+            yield remote
+        return
+    if archive["size"] > max_ram_bytes:
+        raise ValueError(f"Archive {archive['path']} exceeds --max-archive-gib; raise the limit only if RAM permits")
+    # BytesIO is the only full-archive buffer. Closing it releases its storage
+    # before the next archive is downloaded. No archive is saved onto Drive.
+    with io.BytesIO() as buffer:
+        started, last_log = time.monotonic(), 0.0
+        logger.info("Downloading one archive into RAM: %s (%.2f GiB)", archive["path"], archive["size"] / 1024**3)
+        with RemoteMetadataReader(archive["url"], archive["size"]) as source:
+            while chunk := source.read(8 * 1024 * 1024):
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("Archive download stopped")
+                buffer.write(chunk)
+                now = time.monotonic()
+                if now - last_log >= 10 or source.tell() == archive["size"]:
+                    elapsed = max(0.001, now - started)
+                    logger.info("Download %s: %.1f%% %.2f/%.2f GiB %.1f MiB/s requests=%d",
+                                archive["path"], 100 * source.tell() / archive["size"],
+                                source.tell() / 1024**3, archive["size"] / 1024**3,
+                                source.tell() / 1024**2 / elapsed, source.requests)
+                    last_log = now
+            if buffer.tell() != archive["size"]:
+                raise OSError("Incomplete in-RAM archive")
+            buffer.requests, buffer.bytes_read = source.requests, source.bytes_read
+        buffer.seek(0)
+        yield buffer
+
+
+def build_archive(root, archive, checkpoint_records, stop=None, mode="headers", max_ram_bytes=12 * 1024**3):
     directory = root / "archives" / archive["key"]
     state_path = directory / "state.json"
     state = load_state(state_path, dict(offset=0, members=0, segments=[], pax_headers={}, complete=False))
@@ -117,10 +150,10 @@ def build_archive(root, archive, checkpoint_records, stop=None):
         rows, seen = [], 0
         last_checkpoint = time.monotonic()
 
-    with RemoteRangeReader(archive["url"], archive["size"]) as remote:
+    with open_archive_for_index(archive, mode, max_ram_bytes, stop) as remote:
         remote.seek(state["offset"])
-        # r: is essential: stream mode would read all image payloads to advance.
-        # tarfile understands PAX/GNU metadata and computes real payload offsets.
+        # tarfile handles PAX/GNU metadata and preserves real archive offsets,
+        # both for the RAM buffer and the optional remote-header reader.
         with tarfile.open(fileobj=remote, mode="r:", pax_headers=state["pax_headers"]) as tar:
             for member in tar:
                 if stop is not None and stop.is_set():
@@ -215,11 +248,19 @@ def main():
     parser.add_argument("--min-pixels", type=int, default=768 * 768)
     parser.add_argument("--include-deleted", action="store_true")
     parser.add_argument("--pair-max-days", type=int, default=365)
-    parser.add_argument("--workers", type=int, default=4, help="Concurrent archives, not image downloads")
+    parser.add_argument("--archive-mode", choices=("ram", "headers"), default="ram",
+                        help="ram downloads/indexes/discards one archive at a time; headers uses sparse range reads")
+    parser.add_argument("--max-archive-gib", type=float, default=12,
+                        help="Reject archives larger than this before allocating their RAM buffer")
+    parser.add_argument("--workers", type=int, default=1, help="Must be 1 in RAM mode; concurrent archives in headers mode")
     parser.add_argument("--checkpoint-records", type=int, default=5000)
     args = parser.parse_args()
     if min(args.min_side, args.min_pixels, args.pair_max_days, args.workers, args.checkpoint_records) < 1:
         parser.error("Sizes, days, workers and checkpoint interval must be positive")
+    if not 0 < args.max_archive_gib <= 32:
+        parser.error("--max-archive-gib must be in (0, 32]")
+    if args.archive_mode == "ram" and args.workers != 1:
+        parser.error("RAM mode requires --workers 1 so only one archive is resident")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     root = args.output
     root.mkdir(parents=True, exist_ok=True)
@@ -261,19 +302,25 @@ def main():
                         metadata=dict(size=metadata.size,
                                       url=hf_hub_url(args.repo_id, metadata.path, repo_type="dataset", revision=info.sha)))
         write_index_json(manifest_path, manifest)
-    logger.info("Pinned revision %s; full scan of %d archives. No image payloads will be extracted.", manifest["revision"], len(manifest["archives"]))
+    logger.info("Pinned revision %s; full scan of %d archives; mode=%s. Archives are not saved to disk.",
+                manifest["revision"], len(manifest["archives"]), args.archive_mode)
     build_metadata(root, manifest, args.checkpoint_records)
     stop = threading.Event()
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(build_archive, root, archive, args.checkpoint_records, stop): archive for archive in manifest["archives"]}
-        try:
-            for future in as_completed(futures):
-                future.result()
-        except BaseException:
-            stop.set()
-            for future in futures:
-                future.cancel()
-            raise
+    if args.archive_mode == "ram":
+        for archive in manifest["archives"]:
+            build_archive(root, archive, args.checkpoint_records, stop, mode="ram",
+                          max_ram_bytes=int(args.max_archive_gib * 1024**3))
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(build_archive, root, archive, args.checkpoint_records, stop): archive for archive in manifest["archives"]}
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                stop.set()
+                for future in futures:
+                    future.cancel()
+                raise
     merge_index(root, manifest)
 
 

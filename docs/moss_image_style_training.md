@@ -130,7 +130,14 @@ one subset, one process (`world_size=1`), and `num_workers=0` are supported.
 Same-artist time windows are computed once in RAM; A is sampled uniformly among
 eligible images, and B uniformly from its window excluding A. Exact archive ranges
 are fetched with up to two image I/O threads by default, and verified against
-metadata MD5. A bounded LRU caches compressed image bytes, not GPU tensors.
+metadata MD5. Some archive encodings differ from their metadata checksums. On a
+checksum mismatch, the loader additionally fetches the member's 512-byte tar
+header and requires the correct post ID and file size, then fully decodes the
+image and requires the metadata dimensions. Only then is the image accepted.
+This is structural validation, not cryptographic checksum verification. Invalid
+headers, wrong posts, wrong sizes/dimensions and undecodable images are rejected.
+Accepted discrepancies are reported with throttled logs. Existing indexes work
+without rebuilding. A bounded LRU caches compressed image bytes, not GPU tensors.
 The standard resize/crop, buckets, augmentation and caption code processes each
 image independently. `shuffle_buffer` is unused for this random-access backend;
 `training.prefetch_batches` still overlaps bounded pair fetching with training.

@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import logging
+from pathlib import PurePosixPath
 import random
+import tarfile
 import threading
 
 import numpy as np
@@ -16,6 +18,28 @@ from library.danbooru_index import RemoteRangeReader, load_artist_index
 
 
 logger = logging.getLogger(__name__)
+
+
+def validate_metadata_mismatch(reader, row, payload):
+    """Validate indexed member identity when metadata describes different bytes.
+
+    This is structural validation, not a replacement archive checksum. The pinned
+    archive header is authoritative for member identity and length; metadata MD5
+    may describe an earlier image encoding. Never accept a mismatching post ID,
+    invalid tar header, wrong image dimensions, or undecodable image.
+    """
+    offset, size, post_id = int(row["offset"]), int(row["size"]), int(row["id"])
+    if offset < 512 or offset % 512 or len(payload) != size:
+        raise ValueError(f"Post {post_id}: invalid indexed member offset/length")
+    header = tarfile.TarInfo.frombuf(reader.fetch(offset - 512, 512), encoding="utf-8", errors="surrogateescape")
+    name = PurePosixPath(header.name).stem
+    if not header.isfile() or header.size != size or not name.isdecimal() or int(name) != post_id:
+        raise ValueError(f"Post {post_id}: archive member identity/size mismatch ({header.name!r}, {header.size})")
+    with Image.open(io.BytesIO(payload)) as image:
+        expected = (int(row["width"]), int(row["height"]))
+        if image.size != expected:
+            raise ValueError(f"Post {post_id}: image dimensions {image.size} differ from metadata {expected}")
+        image.load()
 
 
 class MossArtistPairs:
@@ -32,6 +56,7 @@ class MossArtistPairs:
             raise ValueError("index_cache_bytes must be nonnegative")
         self.fetch_workers, self.cache_bytes = fetch_workers, cache_bytes
         self.cache, self.cached_bytes, self.cache_lock = OrderedDict(), 0, threading.Lock()
+        self.metadata_mismatches = 0
         count = len(self.rows)
         self.left, self.right = np.empty(count, dtype=np.int64), np.empty(count, dtype=np.int64)
         groups = np.r_[0, np.flatnonzero(np.diff(self.rows["artist"])) + 1, count]
@@ -60,8 +85,18 @@ class MossArtistPairs:
             raise ValueError(f"Post {key} exceeds max_member_bytes")
         reader = self.readers[int(row["archive"])]
         payload = reader.fetch(int(row["offset"]), int(row["size"]))
-        if hashlib.md5(payload, usedforsecurity=False).hexdigest().encode("ascii") != row["md5"]:
-            raise ValueError(f"Post {key}: archive payload does not match metadata MD5")
+        actual_md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
+        if actual_md5.encode("ascii") != row["md5"]:
+            validate_metadata_mismatch(reader, row, payload)
+            with self.cache_lock:
+                self.metadata_mismatches += 1
+                mismatches = self.metadata_mismatches
+            # Report initial examples, then logarithmically spaced totals rather
+            # than flooding the training console for this dataset discrepancy.
+            if mismatches <= 3 or mismatches & (mismatches - 1) == 0:
+                logger.warning("Accepted post %d after tar-header/image validation: archive MD5=%s metadata MD5=%s; "
+                               "validated metadata discrepancies=%d", key, actual_md5,
+                               bytes(row["md5"]).decode("ascii"), mismatches)
         with self.cache_lock:
             if key not in self.cache and len(payload) <= self.cache_bytes:
                 while self.cache and self.cached_bytes + len(payload) > self.cache_bytes:
@@ -95,7 +130,7 @@ class MossArtistPairs:
                     processed = [self.process(payload, rng) for payload in payloads]
                     if any(value is None for value in processed):
                         raise ValueError("Pair rejected by shared image processing settings")
-                except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError) as error:
+                except (OSError, ValueError, tarfile.TarError, UnidentifiedImageError, Image.DecompressionBombError) as error:
                     # Drain both requests before rerolling, preserving bounded I/O.
                     for future in futures:
                         try:

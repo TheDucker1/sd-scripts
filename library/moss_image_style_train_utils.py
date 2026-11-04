@@ -66,10 +66,16 @@ class StyleStageTimer:
 
 
 def sample_style_sigmas(
-    batch_size, device, mean=-0.5, std=0.9, minimum=0.05, maximum=0.7, tail_probability=0.05, tail_maximum=0.95
+    batch_size, device, mean=-0.5, std=0.9, minimum=0.05, maximum=0.7, tail_probability=0.05, tail_maximum=0.95,
+    distribution="bounded_logit_normal",
 ):
-    """Smooth bounded logit-normal body with a small smooth high-noise tail."""
+    """Sample noise sigma; the progress distribution has no interior cutoffs."""
     values = (torch.randn(batch_size, device=device) * std + mean).sigmoid()
+    if distribution == "progress_logit_normal":
+        # values is denoising progress over the entire (0, 1) trajectory.
+        return 1 - values
+    if distribution != "bounded_logit_normal":
+        raise ValueError(f"Unknown noise distribution: {distribution}")
     tail = torch.rand(batch_size, device=device) < tail_probability
     return torch.where(tail, maximum + (tail_maximum - maximum) * values, minimum + (maximum - minimum) * values)
 
@@ -512,11 +518,18 @@ def validate_style_config(config):
     if any(not math.isfinite(weight) or weight < 0 for weight in weights) or sum(weights) == 0:
         raise ValueError("Loss weights must be finite/nonnegative with at least one positive weight")
     noise = config.get("noise", {})
-    lower, upper, tail = noise.get("minimum", 0.05), noise.get("maximum", 0.7), noise.get("tail_maximum", 0.95)
-    if not 0 < lower < upper <= 0.7 or not upper < tail < 1:
-        raise ValueError("Require 0 < minimum < maximum <= 0.7 < tail_maximum < 1")
-    if not 0 <= noise.get("tail_probability", 0.05) <= 0.1:
-        raise ValueError("High-noise tail probability must be between 0 and 0.1")
+    distribution = noise.get("distribution", "bounded_logit_normal")
+    if distribution == "progress_logit_normal":
+        if any(key in noise for key in ("minimum", "maximum", "tail_probability", "tail_maximum")):
+            raise ValueError("progress_logit_normal uses only mean/std, without cutoffs or a separate tail")
+    elif distribution == "bounded_logit_normal":
+        lower, upper, tail = noise.get("minimum", 0.05), noise.get("maximum", 0.7), noise.get("tail_maximum", 0.95)
+        if not 0 < lower < upper <= 0.7 or not upper < tail < 1:
+            raise ValueError("Require 0 < minimum < maximum <= 0.7 < tail_maximum < 1")
+        if not 0 <= noise.get("tail_probability", 0.05) <= 0.1:
+            raise ValueError("High-noise tail probability must be between 0 and 0.1")
+    else:
+        raise ValueError(f"Unknown noise distribution: {distribution}")
     if not math.isfinite(noise.get("mean", -0.5)) or not math.isfinite(noise.get("std", 0.9)) or noise.get("std", 0.9) <= 0:
         raise ValueError("Noise mean/std must be finite with std > 0")
     if config.get("dtype", "float32") not in DTYPES:

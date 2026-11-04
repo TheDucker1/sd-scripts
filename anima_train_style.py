@@ -25,10 +25,16 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
             raise ValueError("Anima style training requires architecture=anima and content_loss=flow_l2")
         noise = config.get("noise", {})
-        low, high = noise.get("minimum", 0.05), noise.get("maximum", 0.7)
-        median = low + (high - low) * (1 + math.tanh(noise.get("mean", -0.5) / 2)) / 2
-        logger.info("Noise convention: progress=1-sigma; main progress range=%.1f%%..%.1f%%, median=%.1f%%; early tail=%.1f%%",
-                    100 * (1 - high), 100 * (1 - low), 100 * (1 - median), 100 * noise.get("tail_probability", 0.05))
+        if noise.get("distribution") == "progress_logit_normal":
+            mean, std = noise.get("mean", -0.5), noise.get("std", 0.9)
+            before = (1 + math.erf((math.log(0.3 / 0.7) - mean) / (std * math.sqrt(2)))) / 2
+            logger.info("Smooth progress curve over (0,1): median=%.1f%%; %.1f%% before 30%% progress, %.1f%% after; no interior cutoffs",
+                        50 * (1 + math.tanh(mean / 2)), 100 * before, 100 * (1 - before))
+        else:
+            low, high = noise.get("minimum", 0.05), noise.get("maximum", 0.7)
+            median = low + (high - low) * (1 + math.tanh(noise.get("mean", -0.5) / 2)) / 2
+            logger.info("Legacy bounded noise sampler: progress=1-sigma; main progress range=%.1f%%..%.1f%%, median=%.1f%%",
+                        100 * (1 - high), 100 * (1 - low), 100 * (1 - median))
         return build_anima_style_components(config, device)
 
     def configure_compile(self, components, args):

@@ -188,7 +188,7 @@ class MossImageStyleTrainer:
                         components.dit.dtype, components.vae.dtype, next(components.text_encoder.parameters()).dtype,
                         next(components.tagger.parameters()).dtype,
                         next(components.content.parameters()).dtype if components.content is not None else "disabled (flow L2)",
-                        next(components.style.parameters()).dtype)
+                        next(components.style.parameters()).dtype if components.style is not None else "disabled")
         parameters = [parameter for parameter in components.dit.parameters() if parameter.requires_grad]
         optimizer = self.get_optimizer(config, parameters)
         scheduler = self.get_scheduler(config, optimizer)
@@ -296,8 +296,10 @@ class MossImageStyleTrainer:
                         writer.flush()
                     metrics_file.write(json.dumps(metrics) + "\n")
                     metrics_file.flush()
-                    summary = (f"step={step} loss={metrics['loss']:.6f} content={metrics['content_loss']:.6f} "
-                               f"style={metrics['style_loss']:.6f} grad={metrics['gradient_norm']:.4f}")
+                    summary = f"step={step} loss={metrics['loss']:.6f}"
+                    if components.style is not None:
+                        summary += f" content={metrics['content_loss']:.6f} style={metrics['style_loss']:.6f}"
+                    summary += f" grad={metrics['gradient_norm']:.4f}"
                     if train.get("log_timing", False):
                         summary += (f" | total={metrics['step_seconds']:.2f}s data={data_seconds:.2f}s "
                                     f"pairs/s={metrics['pairs_per_second']:.3f} pairs={pairs_seen}")
@@ -306,6 +308,7 @@ class MossImageStyleTrainer:
                             f"{label}={metrics.get('stage_' + name + '_seconds', 0.0):.2f}s"
                             for label, name in (("qwen", "qwen"), ("dit", "dit_forward"),
                                                 ("decode", "vae_decode"), ("backward", "backward"))
+                            if "stage_" + name + "_seconds" in metrics
                         )
                     logger.info("%s", summary)
                     sampling = get_style_sampling_options(config)

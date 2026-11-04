@@ -24,6 +24,9 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
             raise ValueError("Anima style training requires architecture=anima and content_loss=flow_l2")
+        # Old uploaded notebooks can still carry the former auxiliary weights.
+        config["training"].update(content_weight=1.0, style_weight=0.0)
+        logger.info("Training objective: velocity L2 only; no perceptual encoders or training VAE decode")
         noise = config.get("noise", {})
         if noise.get("distribution") == "progress_logit_normal":
             mean, std = noise.get("mean", -0.5), noise.get("std", 0.9)
@@ -57,8 +60,7 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
         sigmas = sample_style_sigmas(len(latents), device, **config.get("noise", {}))
         noise = [torch.randn_like(value) for value in latents] if isinstance(latents, list) else torch.randn_like(latents)
         loss, values = style_objective(components, prepared, sigmas, noise,
-            train.get("content_weight", 1), train.get("style_weight", 1),
-            train.get("checkpoint_decoder", False), train.get("checkpoint_features", False), stage_timer)
+                                      content_weight=1.0, style_weight=0.0, stage_timer=stage_timer)
         return loss, values, prepared
 
     @torch.no_grad()

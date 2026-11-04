@@ -37,24 +37,6 @@
       ]
     },
     {
-      "name": "style_encoder",
-      "repo_id": "Gaojunyao/MegaStyle",
-      "revision": "main",
-      "allow_patterns": [
-        "megastyle_encoder.pth",
-        "README.md"
-      ]
-    },
-    {
-      "name": "style_architecture",
-      "repo_id": "google/siglip-so400m-patch14-384",
-      "revision": "main",
-      "allow_patterns": [
-        "config.json",
-        "preprocessor_config.json"
-      ]
-    },
-    {
       "name": "t5_tokenizer",
       "repo_id": "google/t5-v1_1-xxl",
       "revision": "main",

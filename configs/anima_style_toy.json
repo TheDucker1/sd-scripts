@@ -100,29 +100,6 @@
       }
     ]
   },
-  "style": {
-    "model": {
-      "hidden_size": 32,
-      "intermediate_size": 64,
-      "num_hidden_layers": 2,
-      "num_attention_heads": 2,
-      "patch_size": 8,
-      "image_size": 32
-    },
-    "preprocessing": {
-      "size": 32,
-      "mean": [
-        0.5,
-        0.5,
-        0.5
-      ],
-      "std": [
-        0.5,
-        0.5,
-        0.5
-      ]
-    }
-  },
   "noise": {
     "distribution": "progress_logit_normal",
     "mean": 0.0,
@@ -150,10 +127,8 @@
     "learning_rate": 0.001,
     "num_workers": 0,
     "content_weight": 1.0,
-    "style_weight": 1.0,
+    "style_weight": 0.0,
     "max_grad_norm": 1.0,
-    "checkpoint_decoder": false,
-    "checkpoint_features": false,
     "save_every": 3,
     "sample_every": 3,
     "sample_steps": 3

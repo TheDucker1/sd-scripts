@@ -9,7 +9,7 @@ from torch import nn
 from library import anima_models, anima_utils, qwen_image_autoencoder_kl, strategy_anima
 from library.anima_reference import AnimaReference, install_reference_lora
 from library.moss_image_style_train_utils import (
-    BytePromptTokenizer, DTYPES, FrozenImageFeatures, MossStyleComponents, StylePromptTagger,
+    BytePromptTokenizer, DTYPES, MossStyleComponents, StylePromptTagger,
     StyleStageTimer, encode_style_images,
 )
 from library.streaming_dataset import process_stream_caption
@@ -32,7 +32,7 @@ class AnimaStyleVAE(nn.Module):
 
 
 def build_anima_style_components(config, device):
-    from transformers import Qwen3Config, Qwen3Model, SiglipVisionConfig, SiglipVisionModel
+    from transformers import Qwen3Config, Qwen3Model
 
     dtype = DTYPES[config.get("dtype", "float32")]
     if config["initialization"] == "random":
@@ -52,14 +52,11 @@ def build_anima_style_components(config, device):
         tagger = StylePromptTagger(timm.create_model(options["architecture"], pretrained=False, **options["model_args"]),
                                    options["labels"], options["preprocessing"], options["thresholds"],
                                    ["general", "character", "copyright"], options.get("max_tags", 64))
-        vision = SiglipVisionModel(SiglipVisionConfig(**config["style"]["model"]))
-        style = FrozenImageFeatures(vision, output="pooler", **config["style"]["preprocessing"])
     else:
-        from library.moss_image_style_pretrained import image_preprocessing, load_prompt_tagger
-        from accelerate import init_empty_weights
+        from library.moss_image_style_pretrained import load_prompt_tagger
 
         assets = json.loads(Path(config["assets_manifest"]).read_text(encoding="utf-8"))
-        for name in ("anima", "vae", "text_encoder", "t5_tokenizer", "tagger", "style_encoder", "style_architecture"):
+        for name in ("anima", "vae", "text_encoder", "t5_tokenizer", "tagger"):
             entry = assets[name]
             root = Path(entry["local_dir"]).resolve()
             for file in entry["files"]:
@@ -81,25 +78,12 @@ def build_anima_style_components(config, device):
             qwen3_max_length=config.get("max_prompt_length", 256), t5_max_length=config.get("max_prompt_length", 256),
         )
         tagger = load_prompt_tagger(Path(assets["tagger"]["local_dir"]), config["tagger"], device)
-        root = Path(assets["style_architecture"]["local_dir"])
-        options = json.loads((root / "config.json").read_text())
-        with init_empty_weights():
-            vision = SiglipVisionModel(SiglipVisionConfig(**options.get("vision_config", options)))
-        state = torch.load(Path(assets["style_encoder"]["local_dir"]) / "megastyle_encoder.pth", map_location="cpu", weights_only=True)
-        state = state.get("model", state)
-        state = {name.removeprefix("module."): value.to(dtype) for name, value in state.items()}
-        if set(state) != set(vision.state_dict()):
-            state = {name.removeprefix("vision_model."): value for name, value in state.items()}
-            if all(name.startswith("vision_model.") for name in vision.state_dict()):
-                state = {"vision_model." + name: value for name, value in state.items()}
-        vision.load_state_dict(state, strict=True, assign=True)
-        style = FrozenImageFeatures(vision, output="pooler", **image_preprocessing(root))
     install_reference_lora(model, **config["adapter"])
     count = config.get("checkpoint_blocks")
     if count is None:
         count = len(model.blocks) if config.get("gradient_checkpointing", False) else 0
     dit = AnimaReference(model, count).to(device=device, dtype=dtype)
-    components = MossStyleComponents(dit, AnimaStyleVAE(vae), text, tokenizer, tagger, None, style)
+    components = MossStyleComponents(dit, AnimaStyleVAE(vae), text, tokenizer, tagger, None, None)
     for module in components.frozen_modules():
         module.requires_grad_(False).eval().to(device=device)
         module._apply(lambda tensor: tensor.to(dtype) if tensor.is_floating_point() else tensor)
@@ -140,7 +124,5 @@ def prepare_anima_batch(components, batch, device, rng, current_step=0, max_step
         latents = encode_style_images(components.vae, a)
     with timer.measure("vae_encode_B"):
         reference = encode_style_images(components.vae, b)
-    with timer.measure("style_target"):
-        target = components.style(b)
     return dict(latents=latents, reference=reference, context=context, ref_context=ref_context, mask=None,
-                style_target=target, content_target=None, prompts=prompts)
+                prompts=prompts)

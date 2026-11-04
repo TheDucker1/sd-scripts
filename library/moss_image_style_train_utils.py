@@ -223,7 +223,7 @@ class MossStyleComponents:
     tokenizer: object
     tagger: StylePromptTagger
     content: FrozenImageFeatures | None
-    style: FrozenImageFeatures
+    style: FrozenImageFeatures | None
 
     def frozen_modules(self):
         return tuple(module for module in (self.vae, self.text_encoder, self.tagger, self.content, self.style) if module is not None)
@@ -460,10 +460,11 @@ def style_objective(
             prepared["mask"],
             **({"ref_context": prepared["ref_context"]} if "ref_context" in prepared else {}),
         )
-    predicted = ([value - sigma * prediction.float() for value, sigma, prediction in zip(noisy, sigmas.float(), velocity)]
-                 if ragged else noisy - sigma * velocity.float())
-    with timer.measure("vae_decode"):
-        pixels = decode_style_latents(components.vae, predicted, checkpoint_decoder)
+    if components.content is not None or style_weight != 0:
+        predicted = ([value - sigma * prediction.float() for value, sigma, prediction in zip(noisy, sigmas.float(), velocity)]
+                     if ragged else noisy - sigma * velocity.float())
+        with timer.measure("vae_decode"):
+            pixels = decode_style_latents(components.vae, predicted, checkpoint_decoder)
 
     def extract(module):
         if isinstance(pixels, list) and checkpoint_features:
@@ -482,8 +483,10 @@ def style_objective(
     else:
         with timer.measure("dino_prediction"):
             content_loss = (1 - (extract(components.content) * prepared["content_target"]).sum(dim=-1)).mean()
-    with timer.measure("style_prediction"):
-        style_loss = (1 - (extract(components.style) * prepared["style_target"]).sum(dim=-1)).mean()
+    style_loss = content_loss.new_zeros(())
+    if style_weight != 0:
+        with timer.measure("style_prediction"):
+            style_loss = (1 - (extract(components.style) * prepared["style_target"]).sum(dim=-1)).mean()
     loss = content_weight * content_loss + style_weight * style_loss
     return loss, {
         "content_loss": content_loss.detach(),

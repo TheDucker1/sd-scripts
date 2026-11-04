@@ -1,6 +1,6 @@
 """Generate a tiny tar and run the Anima style pipeline without pretrained weights.
 
-Run from any directory. Outputs remain under tests/test_output_anima_style.
+Run from any directory. Outputs remain under tests/test_output_anima_snapref.
 """
 
 import argparse
@@ -34,7 +34,7 @@ def main():
         default=["dit"],
     )
     options = parser.parse_args()
-    run_name = f"{options.device.replace(':', '-')}-{options.dtype}-" + (options.compile_scope if options.compile else "eager")
+    run_name = f"flow-only-{options.device.replace(':', '-')}-{options.dtype}-" + (options.compile_scope if options.compile else "eager")
     if options.compile:
         run_name += f"-{options.compile_backend}-{'-'.join(options.compile_modules)}"
     output = ROOT / "tests/test_output_anima_snapref" / run_name
@@ -67,7 +67,8 @@ def main():
     config["dtype"] = options.dtype
     config["data"]["shards"] = shards
     config["training"].update(
-        max_steps=options.steps, num_workers=options.workers, save_every=options.steps, sample_every=options.steps
+        max_steps=options.steps, num_workers=options.workers, save_every=options.steps, sample_every=options.steps,
+        log_timing=True,
     )
     arguments = [
         "--config",
@@ -85,6 +86,13 @@ def main():
     if options.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     components, history = AnimaStyleTrainer().train_config(config, output, options.device, args)
+    if components.style is not None or components.content is not None:
+        raise AssertionError("Velocity-only training loaded a perceptual encoder")
+    if any(row["loss"] != row["content_loss"] or row["style_loss"] != 0 for row in history):
+        raise AssertionError("Expected only unweighted velocity L2")
+    if any(key in row for row in history for key in
+           ("stage_vae_decode_seconds", "stage_style_target_seconds", "stage_style_prediction_seconds")):
+        raise AssertionError("Velocity-only training decoded images or extracted style features")
     if not history or not all(row["gradient_norm"] > 0 for row in history):
         raise AssertionError("Expected finite nonzero Anima adapter gradients")
     if not any(

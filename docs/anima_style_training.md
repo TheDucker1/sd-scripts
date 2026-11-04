@@ -33,9 +33,11 @@ The architecture accepts an explicit `ref_context` for that purpose.
 
 The existing persistent Danbooru artist/date index is reusable without rebuilding.
 A supplies shuffled/dropout content tags and the target latent. B is a distinct
-same-artist image within the indexed date window and supplies the reference latent
-and MegaStyle target. The main objective is flow velocity MSE against noise minus
-the target latent, with the existing MegaStyle cosine auxiliary. DINO is absent.
+same-artist image within the indexed date window and supplies the reference latent.
+The only objective is flow velocity MSE against noise minus the target latent.
+Neither DINO nor MegaStyle is loaded. Training does not decode guessed latents;
+VAE decoding is used only for previews. Both LoRA streams still receive gradients
+through the target's attention to the reference K/V.
 Buckets, image preprocessing, byte-range fetching and bounded prefetching use the
 existing dataset code. Mixed spatial shapes currently run per sample inside the
 Anima wrapper, preserving their own coordinates; equal-shaped tensors batch
@@ -46,7 +48,7 @@ normally. There is no claim that the random tests establish style quality.
 Use `C:\Users\d\.conda\envs\ml\python.exe` on the workstation. The smoke script
 forces Hugging Face offline, creates a tiny local tar, and instantiates random
 models: two 64-channel Anima blocks, small Qwen3, small genuine Qwen Image VAE,
-small timm tagger and small SigLIP. Reference/target ranks are 4/3, with one block
+small timm tagger. Reference/target ranks are 4/3, with one block
 checkpointed. No pretrained weights are downloaded or loaded.
 
 ```powershell
@@ -67,8 +69,8 @@ and saving/restoring both branches.
 Upload `tools/colab/anima_style_setup.ipynb` after pushing the branch. Its setup
 cell explicitly selects `configs/anima_colab_models.json` while reusing the existing
 isolated environment installer. The manifest downloads Anima **base v1.0** (not
-turbo), Qwen3-0.6B-Base, Qwen Image VAE, T5 tokenizer files only, PixAI and
-MegaStyle. It excludes MOSS, Qwen3.5-9B and DINO. Downloads pin model revisions;
+turbo), Qwen3-0.6B-Base, Qwen Image VAE, T5 tokenizer files only and PixAI.
+It excludes MOSS, Qwen3.5-9B, DINO and MegaStyle. Downloads pin model revisions;
 the trainer validates local files before loading. No full-size model was tested
 on the workstation; memory fit must be checked on the Colab host.
 
@@ -80,6 +82,12 @@ disables recomputation; an integer selects the first N blocks. Both reference an
 target block functions support per-block `torch.compile` with Inductor. Whole-model
 compilation is explicitly rejected. Preview JPEGs are ordered A, B, generated
 result, with a JSON sidecar containing prompt, seed and source IDs.
+
+After updating an existing Colab checkout, use a new `RUN_NAME` for the velocity-only
+recipe. Old uploaded notebooks may still set `style_weight` or decoder/feature
+checkpointing flags: Anima normalizes the saved loss weights to content 1/style 0,
+and these checkpointing flags have no work to checkpoint during training. Existing
+MegaStyle files in the model directory are ignored and need not be downloaded again.
 
 ## Investigating degraded previews
 
@@ -129,4 +137,5 @@ for the final baseline; checkpoint files are never changed. If only CFG fails,
 investigate conditioning coverage; if conditional generation also fails while the
 base is coherent, investigate adapter updates/objective balance/noise coverage.
 If the base fails too, investigate prompt/latent/model/sampler compatibility first.
-Equal flow/style coefficients do not imply equal gradient contributions.
+The earlier auxiliary style objective has been removed; its contribution cannot
+be inferred from the old scalar loss coefficients alone.

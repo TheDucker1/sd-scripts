@@ -61,22 +61,54 @@ class TestAnimaReference(unittest.TestCase):
         class ExactVelocity(torch.nn.Module):
             dtype = torch.float32
 
-            def forward(self, *args):
+            def forward(self, inputs, *args):
+                captured.append(inputs)
                 return velocity
 
-        def decode(vae, latent, enabled):
-            captured.append(latent)
-            return latent
-
-        components = SimpleNamespace(dit=ExactVelocity(), content=None, vae=None,
-                                     style=lambda pixels: pixels.new_zeros((2, 1)))
+        components = SimpleNamespace(dit=ExactVelocity(), content=None, vae=None, style=None)
         prepared = dict(latents=clean, reference=clean, context=torch.zeros(2, 1, 32),
-                        mask=None, style_target=torch.zeros(2, 1))
-        with mock.patch("library.moss_image_style_train_utils.decode_style_latents", side_effect=decode):
-            loss, metrics = style_objective(components, prepared, torch.tensor([0.2, 0.8]), noise, style_weight=0)
+                        mask=None)
+        sigmas = torch.tensor([0.2, 0.8])
+        with mock.patch("library.moss_image_style_train_utils.decode_style_latents", side_effect=AssertionError("Training decoded")):
+            loss, metrics = style_objective(components, prepared, sigmas, noise, style_weight=0)
         self.assertEqual(loss.item(), 0)
         self.assertEqual(metrics["content_loss"].item(), 0)
-        torch.testing.assert_close(captured[0], clean, atol=3e-7, rtol=1e-5)
+        torch.testing.assert_close(captured[0] - sigmas[:, None, None, None] * velocity, clean, atol=3e-7, rtol=1e-5)
+
+    def test_flow_only_backward_matches_mse_without_decoding_for_mixed_grids(self):
+        from types import SimpleNamespace
+        from library.moss_image_style_train_utils import style_objective
+
+        for ragged in (False, True):
+            with self.subTest(ragged=ragged):
+                clean = [torch.randn(16, 2, 4), torch.randn(16, 4, 2)] if ragged else torch.randn(2, 16, 2, 4)
+                noise = [torch.randn_like(value) for value in clean] if ragged else torch.randn_like(clean)
+
+                class ScaledInput(torch.nn.Module):
+                    dtype = torch.float32
+
+                    def __init__(self):
+                        super().__init__()
+                        self.scale = torch.nn.Parameter(torch.tensor(0.2))
+
+                    def forward(self, inputs, *args):
+                        return [value * self.scale for value in inputs] if ragged else inputs * self.scale
+
+                model = ScaledInput()
+                components = SimpleNamespace(dit=model, content=None, style=None, vae=None)
+                prepared = dict(latents=clean, reference=clean, context=self.context, mask=None)
+                sigmas = torch.tensor([0.25, 0.75])
+                with mock.patch("library.moss_image_style_train_utils.decode_style_latents", side_effect=AssertionError("Training decoded")):
+                    loss, _ = style_objective(components, prepared, sigmas, noise, style_weight=0,
+                                              checkpoint_decoder=True, checkpoint_features=True)
+                    expected = torch.stack([
+                        torch.nn.functional.mse_loss(((1 - sigma) * z + sigma * n) * model.scale, n - z)
+                        for sigma, z, n in zip(sigmas, clean, noise)
+                    ]).mean()
+                    torch.testing.assert_close(loss, expected)
+                    expected_grad = torch.autograd.grad(expected, model.scale)[0]
+                    loss.backward()
+                    torch.testing.assert_close(model.scale.grad, expected_grad)
 
     def test_preview_euler_reaches_clean_latent_and_cfg1_skips_negative(self):
         import tempfile

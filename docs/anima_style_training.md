@@ -80,3 +80,40 @@ disables recomputation; an integer selects the first N blocks. Both reference an
 target block functions support per-block `torch.compile` with Inductor. Whole-model
 compilation is explicitly rejected. Preview JPEGs are ordered A, B, generated
 result, with a JSON sidecar containing prompt, seed and source IDs.
+
+## Investigating degraded previews
+
+The main L2 target is `noise - latent`, noisy input is `(1-sigma)*latent + sigma*noise`,
+and the clean prediction is `noisy - sigma*velocity`. Euler updates use decreasing
+sigma. Tiny regression tests verify zero loss/reconstruction for exact velocity,
+the actual preview integrator's endpoint, and equivalence to native Anima without
+reference when adapter updates are zero.
+
+Those checks do not establish that a particular trained checkpoint is stable.
+The inherited noise preset puts 95% of training at sigma <=0.7 and none above
+0.95. With 30 preview steps and flow shift 5, 21 evaluations are above 0.7 and
+seven are above 0.95. Low training MSE therefore does not establish good prediction
+over most of the generation trajectory. Also, the current training recipe always
+conditions on B and nonempty A tags, while default CFG includes an empty-prompt,
+reference-free target branch. Unlike the published SnapRef training recipe, it
+does not yet include conditioning dropout or a base-preservation objective.
+These are coverage gaps, not proof of the cause of a particular bad image.
+
+To compare a saved checkpoint without changing its training config or loading
+optimizer state, run this in Colab after updating the checkout:
+
+```bash
+/content/moss-venv/bin/python -u tools/colab/review_anima_checkpoint.py \
+  --checkpoint /content/drive/MyDrive/moss-training/RUN_NAME/step-000200 \
+  --output /content/drive/MyDrive/moss-training/RUN_NAME/review-200 --steps 30
+```
+
+It samples one pair and renders four comparisons using the same images, prompt,
+seed and initial noise: CFG 1, saved CFG, saved CFG with reference in both branches,
+and frozen base behavior with adapter updates zeroed and no reference. Output
+subdirectories identify each mode. Only the in-process adapter tensors are zeroed
+for the final baseline; checkpoint files are never changed. If only CFG fails,
+investigate conditioning coverage; if conditional generation also fails while the
+base is coherent, investigate adapter updates/objective balance/noise coverage.
+If the base fails too, investigate prompt/latent/model/sampler compatibility first.
+Equal flow/style coefficients do not imply equal gradient contributions.

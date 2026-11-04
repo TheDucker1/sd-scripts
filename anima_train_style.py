@@ -64,15 +64,21 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                     grid = torch.linspace(1, 0, options["steps"] + 1, device=device)
                     shift = options["flow_shift"]
                     grid = shift * grid / (1 + (shift - 1) * grid)
-                    negative = anima_context(components, [""], device)
+                    use_cfg = options["guidance_scale"] != 1
+                    negative = anima_context(components, [""], device) if use_cfg else None
                     # Ephemeral inference cache only. Training builds a fresh
                     # differentiable reference graph for every batch.
-                    cache = components.dit.encode_reference(prepared["reference"], prepared["ref_context"], latent.shape[-2:])
+                    cache = (components.dit.encode_reference(prepared["reference"], prepared["ref_context"], latent.shape[-2:])
+                             if options.get("use_reference", True) else None)
                     for left, right in zip(grid[:-1], grid[1:]):
                         t = left.reshape(1) * 1000
                         positive = components.dit(latent.to(components.dit.dtype), t, prepared["context"], ref_kv=cache)
-                        unconditional = components.dit(latent.to(components.dit.dtype), t, negative)
-                        latent += (right - left) * (unconditional.float() + options["guidance_scale"] * (positive - unconditional).float())
+                        velocity = positive.float()
+                        if use_cfg:
+                            unconditional = components.dit(latent.to(components.dit.dtype), t, negative,
+                                ref_kv=cache if options.get("ref_in_uncond", False) else None).float()
+                            velocity = unconditional + options["guidance_scale"] * (velocity - unconditional)
+                        latent += (right - left) * velocity
                     result = components.vae.decode_from_dit(latent)
                     images = [Image.fromarray(((value[0].float().cpu().permute(1, 2, 0) + 1) * 127.5).clamp(0, 255).byte().numpy())
                               for value in (pair["image_a"], pair["image_b"], result)]
@@ -86,7 +92,9 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                     path = destination / f"pair-{count:03d}.jpg"
                     board.save(path, quality=options["jpeg_quality"])
                     path.with_suffix(".json").write_text(json.dumps(dict(prompt=prepared["prompts"][0],
-                        id_a=pair["id_a"][0], id_b=pair["id_b"][0], seed=seed, steps=options["steps"])), encoding="utf-8")
+                        id_a=pair["id_a"][0], id_b=pair["id_b"][0], seed=seed, steps=options["steps"],
+                        guidance_scale=options["guidance_scale"], use_reference=options.get("use_reference", True),
+                        ref_in_uncond=options.get("ref_in_uncond", False))), encoding="utf-8")
                     count += 1
                     if count == options["num_pairs"]:
                         break

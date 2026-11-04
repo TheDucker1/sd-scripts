@@ -1,0 +1,87 @@
+{
+  "initialization": "pretrained",
+  "content_loss": "flow_l2",
+  "seed": 42,
+  "dtype": "bfloat16",
+  "gradient_checkpointing": false,
+  "checkpoint_blocks": 0,
+  "max_prompt_length": 512,
+  "offload_text_encoder": false,
+  "assets_manifest": "/content/anima-models/resolved_models.json",
+  "tagger": {
+    "dtype": "bfloat16",
+    "max_tags": 256,
+    "prompt_categories": [
+      "general",
+      "character",
+      "copyright"
+    ],
+    "thresholds": {
+      "general": 0.17,
+      "character": 0.27,
+      "style": 0.15,
+      "copyright": 0.24,
+      "meta": 0.17,
+      "rating": 0.41
+    }
+  },
+  "noise": {
+    "minimum": 0.05,
+    "maximum": 0.7,
+    "mean": -0.5,
+    "std": 0.9,
+    "tail_probability": 0.05,
+    "tail_maximum": 0.95
+  },
+  "sampling": {
+    "enabled": true,
+    "every_n_steps": 1000,
+    "at_end": true,
+    "num_pairs": 5,
+    "steps": 50,
+    "guidance_scale": 3.0,
+    "flow_shift": 5.0,
+    "jpeg_quality": 95,
+    "preview_max_side": 0
+  },
+  "training": {
+    "max_steps": 100000,
+    "batch_size": 2,
+    "gradient_accumulation_steps": 2,
+    "optimizer_type": "AdamW8bit",
+    "learning_rate": 0.0001,
+    "optimizer_args": [
+      "weight_decay=0.01",
+      "betas=(0.9, 0.999)",
+      "eps=1e-8"
+    ],
+    "lr_scheduler": "cosine_cycles",
+    "warmup_steps": 1000,
+    "lr_cycles": 5,
+    "min_lr_ratio": 0.01,
+    "num_workers": 0,
+    "prefetch_batches": 2,
+    "content_weight": 1.0,
+    "style_weight": 1.0,
+    "max_grad_norm": 1.0,
+    "checkpoint_decoder": false,
+    "checkpoint_features": false,
+    "save_every": 1000,
+    "keep_last_checkpoints": 3,
+    "tensorboard": true,
+    "history_limit": 1000,
+    "resume_data_mode": "restart",
+    "log_timing": true
+  },
+  "architecture": "anima",
+  "adapter": {
+    "ref": {
+      "rank": 128,
+      "alpha": 128
+    },
+    "tgt": {
+      "rank": 64,
+      "alpha": 64
+    }
+  }
+}

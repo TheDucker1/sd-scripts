@@ -1,0 +1,186 @@
+{
+  "initialization": "random",
+  "seed": 42,
+  "dtype": "float32",
+  "gradient_checkpointing": true,
+  "max_prompt_length": 16,
+  "adapter": {
+    "ref": {
+      "rank": 4,
+      "alpha": 4
+    },
+    "tgt": {
+      "rank": 3,
+      "alpha": 3
+    }
+  },
+  "vae": {
+    "base_dim": 8,
+    "z_dim": 16,
+    "dim_mult": [
+      1,
+      1
+    ],
+    "num_res_blocks": 1,
+    "temperal_downsample": [
+      false
+    ],
+    "disable_cache": true
+  },
+  "text_encoder": {
+    "vocab_size": 258,
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 16,
+    "use_cache": false
+  },
+  "tagger": {
+    "architecture": "vit_tiny_patch16_224",
+    "dtype": "bfloat16",
+    "model_args": {
+      "img_size": 32,
+      "patch_size": 8,
+      "embed_dim": 32,
+      "depth": 1,
+      "num_heads": 2,
+      "num_classes": 6
+    },
+    "preprocessing": {
+      "size": 32,
+      "mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "std": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "pad_color": 0,
+      "color_space": "RGB",
+      "interpolation": "bicubic",
+      "antialias": false
+    },
+    "thresholds": {
+      "general": 0.17,
+      "character": 0.27,
+      "style": 0.15,
+      "copyright": 0.24,
+      "meta": 0.17,
+      "rating": 0.41
+    },
+    "labels": [
+      {
+        "name": "one_subject",
+        "category": "general"
+      },
+      {
+        "name": "blue_background",
+        "category": "general"
+      },
+      {
+        "name": "standing",
+        "category": "general"
+      },
+      {
+        "name": "example_character",
+        "category": "character"
+      },
+      {
+        "name": "watercolor",
+        "category": "style"
+      },
+      {
+        "name": "high_resolution",
+        "category": "meta"
+      }
+    ]
+  },
+  "style": {
+    "model": {
+      "hidden_size": 32,
+      "intermediate_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 2,
+      "patch_size": 8,
+      "image_size": 32
+    },
+    "preprocessing": {
+      "size": 32,
+      "mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "std": [
+        0.5,
+        0.5,
+        0.5
+      ]
+    }
+  },
+  "noise": {
+    "minimum": 0.05,
+    "maximum": 0.7,
+    "mean": -0.5,
+    "std": 0.9,
+    "tail_probability": 0.05,
+    "tail_maximum": 0.95
+  },
+  "data": {
+    "shards": [
+      "tests/test_data/moss_style_toy/images.tar"
+    ],
+    "resolution": 32,
+    "shuffle_buffer": 0,
+    "repeat": true
+  },
+  "sampling": {
+    "num_pairs": 1,
+    "guidance_scale": 1.0,
+    "flow_shift": 1.0,
+    "jpeg_quality": 95,
+    "preview_max_side": 0
+  },
+  "training": {
+    "max_steps": 3,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.001,
+    "num_workers": 0,
+    "content_weight": 1.0,
+    "style_weight": 1.0,
+    "max_grad_norm": 1.0,
+    "checkpoint_decoder": false,
+    "checkpoint_features": false,
+    "save_every": 3,
+    "sample_every": 3,
+    "sample_steps": 3
+  },
+  "architecture": "anima",
+  "content_loss": "flow_l2",
+  "checkpoint_blocks": 1,
+  "anima": {
+    "max_img_h": 64,
+    "max_img_w": 64,
+    "max_frames": 2,
+    "in_channels": 16,
+    "out_channels": 16,
+    "patch_spatial": 2,
+    "patch_temporal": 1,
+    "model_channels": 64,
+    "num_blocks": 2,
+    "num_heads": 2,
+    "mlp_ratio": 2,
+    "crossattn_emb_channels": 32,
+    "pos_emb_cls": "rope3d",
+    "concat_padding_mask": true,
+    "use_adaln_lora": true,
+    "adaln_lora_dim": 16,
+    "rope_enable_fps_modulation": false
+  }
+}

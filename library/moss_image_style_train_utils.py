@@ -452,6 +452,7 @@ def style_objective(
             prepared["context"],
             reference,
             prepared["mask"],
+            **({"ref_context": prepared["ref_context"]} if "ref_context" in prepared else {}),
         )
     predicted = ([value - sigma * prediction.float() for value, sigma, prediction in zip(noisy, sigmas.float(), velocity)]
                  if ragged else noisy - sigma * velocity.float())
@@ -564,7 +565,9 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
         raise FloatingPointError("Cannot save nonfinite adapter weights")
     modules = {}
     for name, module in components.dit.named_modules():
-        if isinstance(module, LoRALinear):
+        if hasattr(module, "adapter_metadata"):
+            modules[name] = module.adapter_metadata()
+        elif isinstance(module, LoRALinear):
             modules[name] = dict(
                 rank=module.rank,
                 alpha=module.alpha,
@@ -575,13 +578,14 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
             )
     modules = dict(sorted(modules.items()))
     metadata = dict(
-        format="moss-edit-lora",
+        format="anima-reference-lora" if config.get("architecture") == "anima" else "moss-edit-lora",
         format_version=1,
         targets=list(modules),
         modules=modules,
         metadata=dict(
-            initialization=config["initialization"], model_config=config["moss"],
-            edit_contract="ref-prefix-only-t0__target-text-original-moss-v1",
+            initialization=config["initialization"], model_config=config.get("anima", config.get("moss")),
+            edit_contract=("anima-snapref-dual-lora-clean-ref-t10-centered-v1" if config.get("architecture") == "anima"
+                           else "ref-prefix-only-t0__target-text-original-moss-v1"),
             pretrained_revisions={name: entry["revision"] for name, entry in config.get("pretrained_assets", {}).items()},
         ),
     )

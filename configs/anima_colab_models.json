@@ -1,0 +1,92 @@
+{
+  "models": [
+    {
+      "name": "vae",
+      "repo_id": "circlestone-labs/Anima",
+      "revision": "main",
+      "allow_patterns": [
+        "split_files/vae/qwen_image_vae.safetensors"
+      ],
+      "required_patterns": [
+        "split_files/vae/qwen_image_vae.safetensors"
+      ]
+    },
+    {
+      "name": "anima",
+      "repo_id": "circlestone-labs/Anima",
+      "revision": "main",
+      "allow_patterns": [
+        "split_files/diffusion_models/anima-base-v1.0.safetensors"
+      ],
+      "required_patterns": [
+        "split_files/diffusion_models/anima-base-v1.0.safetensors"
+      ]
+    },
+    {
+      "name": "tagger",
+      "repo_id": "Bedovyy/pixai-tagger-v1.0-timm",
+      "revision": "main",
+      "load_dtype": "bfloat16",
+      "allow_patterns": [
+        "*.json",
+        "*.csv",
+        "*.py",
+        "model.safetensors",
+        "README.md",
+        "LICENSE*"
+      ]
+    },
+    {
+      "name": "style_encoder",
+      "repo_id": "Gaojunyao/MegaStyle",
+      "revision": "main",
+      "allow_patterns": [
+        "megastyle_encoder.pth",
+        "README.md"
+      ]
+    },
+    {
+      "name": "style_architecture",
+      "repo_id": "google/siglip-so400m-patch14-384",
+      "revision": "main",
+      "allow_patterns": [
+        "config.json",
+        "preprocessor_config.json"
+      ]
+    },
+    {
+      "name": "t5_tokenizer",
+      "repo_id": "google/t5-v1_1-xxl",
+      "revision": "main",
+      "allow_patterns": [
+        "*.json",
+        "spiece.model"
+      ],
+      "required_patterns": [
+        "spiece.model"
+      ]
+    }
+  ],
+  "text_encoder_profiles": {
+    "bf16": {
+      "name": "text_encoder",
+      "repo_id": "Qwen/Qwen3-0.6B-Base",
+      "revision": "main",
+      "allow_patterns": [
+        "*.json",
+        "*.safetensors",
+        "merges.txt",
+        "vocab.json"
+      ],
+      "required_patterns": [
+        "*.safetensors",
+        "tokenizer.json"
+      ]
+    }
+  },
+  "dataset": {
+    "repo_id": "nyanko7/danbooru2023",
+    "revision": "main",
+    "directory": "original"
+  }
+}

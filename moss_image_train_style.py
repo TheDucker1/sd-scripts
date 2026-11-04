@@ -72,6 +72,9 @@ class MossImageStyleTrainer:
             return build_pretrained_components(config, device)
         return build_random_components(config, device)
 
+    def configure_compile(self, components, args):
+        configure_style_compile(components, args)
+
     def get_optimizer(self, config, parameters):
         train = config["training"]
         # Use the current optimizer module, rather than train_util's legacy alias.
@@ -172,7 +175,7 @@ class MossImageStyleTrainer:
         device = torch.device(device)
         components = self.load_target_model(config, device)
         if compile_args is not None:
-            configure_style_compile(components, compile_args)
+            self.configure_compile(components, compile_args)
         train = config["training"]
         log_stages = train.get("log_stage_timing", train.get("log_timing", False))
         if log_stages:

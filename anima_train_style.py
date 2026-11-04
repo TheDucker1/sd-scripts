@@ -1,6 +1,8 @@
 """Anima asymmetric reference LoRA training using the shared artist-pair pipeline."""
 
 import json
+import logging
+import math
 from pathlib import Path
 import random
 
@@ -15,10 +17,18 @@ from library.moss_image_style_dataset import iter_image_pairs_batch
 from library.moss_image_style_train_utils import get_style_sampling_options, sample_style_sigmas, style_objective
 
 
+logger = logging.getLogger(__name__)
+
+
 class AnimaStyleTrainer(MossImageStyleTrainer):
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
             raise ValueError("Anima style training requires architecture=anima and content_loss=flow_l2")
+        noise = config.get("noise", {})
+        low, high = noise.get("minimum", 0.05), noise.get("maximum", 0.7)
+        median = low + (high - low) * (1 + math.tanh(noise.get("mean", -0.5) / 2)) / 2
+        logger.info("Noise convention: progress=1-sigma; main progress range=%.1f%%..%.1f%%, median=%.1f%%; early tail=%.1f%%",
+                    100 * (1 - high), 100 * (1 - low), 100 * (1 - median), 100 * noise.get("tail_probability", 0.05))
         return build_anima_style_components(config, device)
 
     def configure_compile(self, components, args):

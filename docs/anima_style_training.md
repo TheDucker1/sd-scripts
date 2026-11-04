@@ -83,6 +83,16 @@ result, with a JSON sidecar containing prompt, seed and source IDs.
 
 ## Investigating degraded previews
 
+Numbers in `noise` are noise coefficients, not denoising progress: progress is
+`1-sigma`. Progress 0.3 corresponds to sigma 0.7 (earlier); progress 0.7 corresponds
+to sigma 0.3 (later). The original bounded logit-normal preset accidentally put
+the main distribution's median at 70.5% progress. The corrected Anima preset uses
+noise minimum 0.3, maximum 0.7 and logit-normal mean +0.5: 95% of samples have
+progress between 30% and 70%, with main-distribution median 45.1%. The remaining
+5% sample an earlier progress tail between 5% and 30%. Startup logs explicitly
+report the progress range and median. Changing this recipe requires a fresh run
+name; it does not establish the cause of a previous checkpoint's degeneration.
+
 The main L2 target is `noise - latent`, noisy input is `(1-sigma)*latent + sigma*noise`,
 and the clean prediction is `noisy - sigma*velocity`. Euler updates use decreasing
 sigma. Tiny regression tests verify zero loss/reconstruction for exact velocity,
@@ -90,7 +100,7 @@ the actual preview integrator's endpoint, and equivalence to native Anima withou
 reference when adapter updates are zero.
 
 Those checks do not establish that a particular trained checkpoint is stable.
-The inherited noise preset puts 95% of training at sigma <=0.7 and none above
+Both the original and corrected presets put 95% of training at sigma <=0.7 and none above
 0.95. With 30 preview steps and flow shift 5, 21 evaluations are above 0.7 and
 seven are above 0.95. Low training MSE therefore does not establish good prediction
 over most of the generation trajectory. Also, the current training recipe always

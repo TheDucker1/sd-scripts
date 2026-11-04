@@ -124,9 +124,9 @@
     }
   },
   "noise": {
-    "minimum": 0.05,
+    "minimum": 0.3,
     "maximum": 0.7,
-    "mean": -0.5,
+    "mean": 0.5,
     "std": 0.9,
     "tail_probability": 0.05,
     "tail_maximum": 0.95

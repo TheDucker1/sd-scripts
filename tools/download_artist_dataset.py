@@ -117,39 +117,72 @@ def prepare_source(source, output, index_subdir=None):
         return root
 
 
-def select_artists(rows, artists, window_days, count, min_pairs, seed):
-    """Count unordered distinct pairs, not ordered A/B permutations or images."""
-    boundaries = np.r_[0, np.flatnonzero(np.diff(rows["artist"])) + 1, len(rows)]
-    eligible = []
-    window = window_days * 86400
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        times = rows["timestamp"][start:end]
-        if np.any(times[1:] < times[:-1]):
-            raise ValueError("Artist timestamps are not sorted")
-        right = np.searchsorted(times, times + window, side="right")
-        pairs = int(np.sum(right - np.arange(len(times)) - 1))
+def count_pairs(times, window):
+    return int(np.sum(np.searchsorted(times, times + window, side="right") - np.arange(len(times)) - 1))
+
+
+def pick_artist_range(times, window, min_pairs, rng):
+    """Random feasible start, then the first endpoint reaching min_pairs.
+
+    Each image contributes its later partners within the date constraint.
+    Suffix sums identify starts that can reach the count; the forward scan
+    stops immediately at the minimum endpoint for the chosen start.
+    """
+    right = np.searchsorted(times, times + window, side="right")
+    contributions = right - np.arange(len(times)) - 1
+    starts = np.flatnonzero(np.cumsum(contributions[::-1])[::-1] >= min_pairs)
+    if not len(starts):
+        return None
+    start = int(rng.choice(starts))
+    left, pairs = start, 0
+    for end in range(start, len(times)):
+        while times[end] - times[left] > window:
+            left += 1
+        pairs += end - left
         if pairs >= min_pairs:
-            eligible.append((int(start), int(end), pairs))
-    if len(eligible) < count:
-        raise ValueError(f"Only {len(eligible)} artists have >= {min_pairs} unordered pairs; requested {count}")
-    chosen = sorted(random.Random(seed).sample(eligible, count))
+            return start, end + 1, pairs
+
+
+def select_artists(rows, artists, window_days, count, min_pairs, seed, preferred_artists=(), preferred_folders=None):
+    """Roll artists without replacement; choose a random start and minimum end."""
+    boundaries = np.r_[0, np.flatnonzero(np.diff(rows["artist"])) + 1, len(rows)]
+    window = window_days * 86400
+    groups = [(int(start), int(end)) for start, end in zip(boundaries[:-1], boundaries[1:]) if end > start]
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+    previous = set(preferred_artists)
+    groups.sort(key=lambda group: str(artists[int(rows[group[0]]["artist"])]) not in previous)
+    chosen, attempted = [], 0
+    with tqdm(total=count, desc="Select artist ranges", unit="artist") as bar:
+        for start, end in groups:
+            times = rows["timestamp"][start:end]
+            if np.any(times[1:] < times[:-1]):
+                raise ValueError("Artist timestamps are not sorted")
+            attempted += 1
+            selection = pick_artist_range(times, window, min_pairs, rng)
+            if selection is None:
+                continue
+            chosen.append((start, end, selection))
+            bar.update(1)
+            if len(chosen) == count:
+                break
+    if len(chosen) < count:
+        raise ValueError(f"Only {len(chosen)} artists have >= {min_pairs} unordered pairs; requested {count}")
     selected, names, folders, summary = [], [], [], []
-    for artist, (start, end, pairs) in enumerate(chosen):
-        block = rows[start:end].copy()
-        times = block["timestamp"]
-        left = np.searchsorted(times, times - window, side="left")
-        right = np.searchsorted(times, times + window, side="right")
-        block = block[right - left >= 2]  # Keep only images that can participate.
+    for artist, (start, end, (first, last, pairs)) in enumerate(sorted(chosen)):
+        times = rows["timestamp"][start:end]
+        block = rows[start + first:start + last].copy()
         name = str(artists[int(rows[start]["artist"])])
         slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_-")[:64] or "artist"
-        folder = f"images/{artist:04d}-{slug}"
+        folder = (preferred_folders or {}).get(name, f"images/a{int(rows[start]['artist']):06d}-{slug}")
         block["artist"] = artist
         selected.append(block)
         names.append(name)
         folders.append(folder)
         summary.append(dict(name=name, folder=folder, images=len(block), pairs=pairs,
+                            candidate_images=end - start, candidate_pairs=count_pairs(times, window),
                             bytes=int(block["size"].sum())))
-    return np.concatenate(selected), np.asarray(names), np.asarray(folders), summary, len(eligible)
+    return np.concatenate(selected), np.asarray(names), np.asarray(folders), summary, attempted
 
 
 def request_batches(rows, pending, ranges_per_request, response_bytes):
@@ -350,7 +383,7 @@ class ArchiveClient:
                     self.next_request = max(self.next_request, time.monotonic() + delay)
 
 
-def read_records(path, rows):
+def read_post_records(path):
     """Read the latest record per image, truncating only an interrupted last line."""
     records = {}
     if path.exists():
@@ -364,28 +397,39 @@ def read_records(path, rows):
                     handle.truncate(position)
                     break
                 record = json.loads(line)
-                index = int(record["index"])
-                if not 0 <= index < len(rows) or int(rows[index]["id"]) != record["id"]:
-                    raise ValueError("Download journal does not match the saved selection")
-                records[index] = record
+                records[int(record["id"])] = record
     return records
 
 
-def read_journal(root, rows):
+def read_records(path, rows):
+    # Journals survive compact-plan revisions: post IDs, not old row indices,
+    # identify completed/skipped work. Unselected files remain untouched.
+    positions = {int(row["id"]): index for index, row in enumerate(rows)}
+    return {positions[post_id]: dict(record, index=positions[post_id])
+            for post_id, record in read_post_records(path).items() if post_id in positions}
+
+
+def read_journal(root, rows=None):
     """Verify completed payloads; discard only an interrupted final JSONL line."""
-    records = read_records(root / "downloaded.jsonl", rows)
+    records = (read_post_records(root / "downloaded.jsonl") if rows is None
+               else read_records(root / "downloaded.jsonl", rows))
     good = {}
     for index, record in tqdm(records.items(), desc="Verify saved images", unit="image"):
-        if not 0 <= index < len(rows) or int(rows[index]["id"]) != record["id"]:
+        if rows is not None and (not 0 <= index < len(rows) or int(rows[index]["id"]) != record["id"]):
             raise ValueError("Download journal does not match the saved selection")
         path = index_path(root, record["file"])
-        if path.is_file() and path.stat().st_size == int(rows[index]["size"]) and file_sha256(path) == record["sha256"]:
+        if (path.is_file() and (rows is None or path.stat().st_size == int(rows[index]["size"]))
+                and file_sha256(path) == record["sha256"]):
             good[index] = record
     return good
 
 
 class InvalidArchiveImage(Exception):
     """A permanent per-image validation failure, distinct from disk/network errors."""
+
+
+class RepairSelection(Exception):
+    """Compact selection needs replacement candidates after invalid images."""
 
 
 def save_image(root, index, row, folder, block, min_side=0, min_pixels=0):
@@ -540,6 +584,8 @@ def download_selection(root, manifest, rows, artists, folders, args):
             client.close()
     if len(good) + len(skipped) != len(rows):
         raise RuntimeError("Incomplete offline dataset; rerun the same command")
+    if getattr(args, "require_all_artists", False) and skipped:
+        raise RepairSelection("Replacing invalid posts while retaining minimum image counts")
     final_rows, final_artists, kept, pair_counts = finalize_rows(rows, artists, good, manifest["pair_max_days"],
                                                               getattr(args, "min_pairs", 1))
     write_index_arrays(root / "artist-index.npz", images=final_rows, artists=final_artists,
@@ -556,6 +602,57 @@ def download_selection(root, manifest, rows, artists, folders, args):
     print(f"Offline dataset ready: {root}\n{len(final_rows):,} images, {len(final_artists):,} artists; "
           f"{len(skipped)} skipped, {len(good) - len(kept)} additionally excluded by pair eligibility.\n"
           "Use this directory as data.artist_index.")
+    return manifest
+
+
+def load_plan(root, plan):
+    path = index_path(root, plan.get("plan_file", "download-plan.npz"))
+    if file_sha256(path) != plan["plan_sha256"]:
+        raise ValueError("Saved selection checksum differs; restore the original plan")
+    with np.load(path, allow_pickle=False) as data:
+        return data["images"], data["artists"], data["folders"]
+
+
+def save_minimum_plan(root, manifest, all_rows, all_artists, settings, previous=None, excluded=()):
+    folders = {}
+    if previous:
+        load_plan(root, previous)
+        folders = {entry["name"]: entry["folder"] for entry in previous["artists"]}
+    available = all_rows[~np.isin(all_rows["id"], list(excluded))] if excluded else all_rows
+    rows, artists, folder_table, summary, attempted = select_artists(available, all_artists, manifest["pair_max_days"],
+        settings["artists"], settings["min_pairs"], settings["seed"], folders.keys(), folders)
+    # Commit a versioned array file first, then atomically switch one JSON pointer.
+    # The old plan and all journals remain usable if interrupted before the switch.
+    digest = hashlib.sha256(rows.tobytes()).hexdigest()[:24]
+    filename = f"download-plan-range-{digest}.npz"
+    write_index_arrays(root / filename, images=rows, artists=artists, folders=folder_table)
+    plan = dict(settings=settings, selection_policy="random-start-min-end-v1", plan_file=filename,
+                attempted_artists=attempted, artists=summary, images=len(rows), bytes=int(rows["size"].sum()),
+                excluded_post_ids=sorted(excluded), plan_sha256=file_sha256(root / filename))
+    # An old complete index could otherwise reference the oversized selection.
+    write_index_json(root / "manifest.json", dict(manifest, storage="local", complete=False))
+    write_index_json(root / "selection.json", plan)
+    if previous:
+        print(f"Compacted selection: {previous['images']:,} -> {len(rows):,} images; "
+              f"{previous['bytes'] / 1024**3:.2f} -> {plan['bytes'] / 1024**3:.2f} GiB. "
+              "Existing image files and journals were preserved.", flush=True)
+    return plan
+
+
+def download_minimum_selection(root, source, manifest, plan, args):
+    args.require_all_artists = True
+    while True:
+        rows, artists, folders = load_plan(root, plan)
+        try:
+            return download_selection(root, dict(manifest, selection_policy=plan["selection_policy"]), rows, artists, folders, args)
+        except RepairSelection:
+            completed = read_journal(root, rows)
+            failures = set(read_records(root / "skipped.jsonl", rows)) - set(completed)
+            excluded = set(plan.get("excluded_post_ids", ())) | {int(rows[index]["id"]) for index in failures}
+            print("Replacing invalid images; reusing completed downloads and rolling another artist if needed.", flush=True)
+            _, all_rows, all_artists = load_artist_index(source)
+            plan = save_minimum_plan(root, manifest, all_rows, all_artists, plan["settings"], plan, excluded)
+            del all_rows, all_artists
 
 
 def main():
@@ -564,7 +661,7 @@ def main():
     parser.add_argument("--index-subdir", help="Select an index inside a ZIP/parent directory when there are several")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--artists", type=int, default=1000)
-    parser.add_argument("--min-pairs", type=int, default=101, help="Unordered distinct pairs within the saved date window")
+    parser.add_argument("--min-pairs", type=int, default=101, help="Random range start; stop at the first endpoint with this many valid unordered pairs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ranges-per-request", type=int, default=16)
     parser.add_argument("--response-mib", type=int, default=64, help="Maximum sum of requested bytes per batch")
@@ -591,25 +688,25 @@ def main():
         plan_path = root / "selection.json"
         if plan_path.exists():
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            if plan["settings"] != settings or file_sha256(root / "download-plan.npz") != plan["plan_sha256"]:
+            if plan["settings"] != settings:
                 raise ValueError("Saved selection/settings differ; use the original selection settings or a new output directory")
-            with np.load(root / "download-plan.npz", allow_pickle=False) as data:
-                rows, artists, folders = data["images"], data["artists"], data["folders"]
+            load_plan(root, plan)
+            if plan.get("selection_policy") != "random-start-min-end-v1":
+                completed = read_journal(root)
+                excluded = set() if args.retry_skipped else set(read_post_records(root / "skipped.jsonl")) - set(completed)
+                plan = save_minimum_plan(root, manifest, all_rows, all_artists, settings, plan, excluded)
         else:
-            rows, artists, folders, summary, qualifying = select_artists(all_rows, all_artists, manifest["pair_max_days"],
-                args.artists, args.min_pairs, args.seed)
-            write_index_arrays(root / "download-plan.npz", images=rows, artists=artists, folders=folders)
-            plan = dict(settings=settings, qualifying_artists=qualifying, artists=summary, images=len(rows),
-                        bytes=int(rows["size"].sum()), plan_sha256=file_sha256(root / "download-plan.npz"))
-            write_index_json(plan_path, plan)
+            plan = save_minimum_plan(root, manifest, all_rows, all_artists, settings)
         del all_rows, all_artists
+        rows, artists, folders = load_plan(root, plan)
         requests = sum(1 for _ in request_batches(rows, np.ones(len(rows), dtype=bool),
                                                 args.ranges_per_request, args.response_mib * 1024**2))
-        print(f"Selected {len(artists):,} / {plan['qualifying_artists']:,} qualifying artists; {len(rows):,} unique images; "
+        print(f"Selected {len(artists):,} artists from {plan['attempted_artists']:,} tried; {len(rows):,} unique images; "
               f"{int(rows['size'].sum()) / 1024**3:.2f} GiB payload; {requests:,} multi-range batches "
               f"({len(rows):,} requests if unsupported).\nSelection: {plan_path}", flush=True)
         if not args.dry_run:
-            download_selection(root, manifest, rows, artists, folders, args)
+            del rows
+            download_minimum_selection(root, source, manifest, plan, args)
 
 
 if __name__ == "__main__":

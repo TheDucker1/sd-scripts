@@ -28,13 +28,19 @@ Start downloading with the same command without `--dry-run`:
   --output D:\danbooru-offline
 ```
 
-The default selects **1,000 artists uniformly without replacement**, seed 42.
-Each must have **at least 101 distinct unordered pairs** within the index's saved
-date window (365 days for this index). A/B and B/A count as one pair; pairing an
-image with itself is excluded. For example, 15 images all within one year give
-105 pairs and qualify. All selected images that participate in a valid pair are
-downloaded once, retaining the original bytes/resolution. There is no arbitrary
-100-image minimum, image cap, or duplicate copy for every possible pair.
+The default rolls artists without replacement, seed 42, until **1,000 artists**
+qualify. For each artist, files are sorted by timestamp. Each image contributes
+its later partners within the index's saved date constraint (365 days for this
+index). Suffix pair counts identify feasible starting images. The worker picks
+one of those starts randomly, then advances the end only until **101 distinct
+unordered pairs** are available. An artist with too few pairs is skipped and
+another is rolled. A/B and B/A count as one pair; self-pairs are excluded.
+
+The endpoint is the minimum for the chosen random start. The selected range can
+span multiple years: the one-year constraint applies to each pair, not the entire
+range. For dense dates, `--min-pairs 50` selects 11 images (55 pairs); the default
+101 needs 15 (105 pairs). Sparse dates may require more images. The worker downloads
+only that selected range, once per image, retaining original bytes/resolution.
 
 `selection.json` lists each chosen artist, image/pair counts, bytes and subfolder.
 The summary reports total images, payload GiB, and anticipated multi-range request
@@ -83,7 +89,7 @@ remove the server's request limits. Useful tuning flags:
 
 ## Resume, validation and progress
 
-Rerun the same command to continue. The saved selection is immutable. Completed
+Rerun the same command to continue. The compact selection is saved. Completed
 images are rechecked against their recorded sizes and **actual payload SHA256**
 with a verification progress bar; missing/corrupt files are downloaded again.
 Single-range transfers retain partial bytes and request only the remainder after
@@ -100,17 +106,23 @@ with a different MD5 from `posts.json`. Local SHA256 is computed from the downlo
 payload itself.
 
 Invalid images (bad member identity, corrupt payload or below-minimum actual size)
-are recorded in `skipped.jsonl` and do not abort later downloads. Restarting retains
-these skips; use `--retry-skipped` to try them again. Disk failures and exhausted
-network/protocol failures still stop with recoverable download state; they do not
-silently exclude images. Existing download plans/journals from before this fix are
-compatible: rerun the same command in the same output directory.
+are recorded in `skipped.jsonl` and do not abort later downloads. The worker excludes
+failed posts and picks replacement ranges from the source index, reusing verified
+downloads. If an artist no longer supplies enough pairs, another is rolled. It
+finishes only with the requested artist count, or reports that too few artists
+remain. Disk failures and exhausted network/protocol failures still stop with
+recoverable state; they do not silently exclude images.
 
-Before finalizing, the index drops skipped images, images left without a partner,
-and artists now below `--min-pairs`. The date window is unchanged. Missing artists
-are not automatically replaced; final counts and `artist_pair_counts` in the
-manifest describe the usable subset. Files excluded by this final pairing check
-are left on disk but not referenced by the training index.
+Older oversized plans automatically shrink when you rerun the same command in
+the same output directory. Existing artist folders are retained where possible;
+download journals are matched by post ID, so changing row positions does not lose
+completed work. A new versioned NPZ is written before switching `selection.json`
+atomically. Old plans and unselected image files stay on disk. Stop an older
+downloader process before rerunning. Use the packer below to exclude those leftover
+files from your Colab upload.
+
+Before finalizing, the index drops any images with no valid partner. The date
+constraint is unchanged; `artist_pair_counts` records the usable pair counts.
 
 The image progress bar shows processed/total (saved plus skipped), speed and ETA. Its suffix shows the
 current tar and remaining payload GiB; a separate network bar shows bytes and
@@ -123,13 +135,13 @@ Output structure:
 ```text
 danbooru-offline/
   selection.json
-  download-plan.npz
+  download-plan-range-<hash>.npz
   downloaded.jsonl
   progress.json
   manifest.json
   artist-index.npz
-  images/0000-artist_name/123456.jpg
-  images/0001-another_artist/234567.png
+  images/a000123-artist_name/123456.jpg
+  images/a000456-another_artist/234567.png
   .source-index/             # Only when input was a ZIP
   .partial/                 # Interrupted single-range payloads
 ```
@@ -152,12 +164,15 @@ requests.
 After the downloader finishes, pack its training files as an **uncompressed tar**:
 
 ```powershell
-tar -cf D:\artists-pair-dataset.tar -C D:\danbooru-offline manifest.json artist-index.npz images
+& C:\Users\d\.conda\envs\ml\python.exe tools/pack_artist_dataset.py `
+  --dataset D:\danbooru-offline --output D:\artists-pair-dataset.tar
 ```
 
-Packing the whole folder, including a containing directory, is supported too.
-The command above leaves out downloader caches/journals to reduce RAM use. Do not
-pack a still-running/incomplete download. Upload the tar to
+The packer includes only the completed index, its manifest and referenced images.
+Old unselected downloads, caches and journals are omitted. Selected files are
+verified against their saved SHA256, and the final tar appears only after packing
+finishes. An existing output tar is never overwritten. Do not pack a still-running
+or incomplete download. Upload the tar to
 `MyDrive/moss-training/artists-pair-dataset.tar` and run the updated Anima notebook's
 dataset cell. It sets `INDEX_DIR` to `/dev/shm/anima-artist-dataset` by default.
 
@@ -181,6 +196,6 @@ Drive, and a Colab runtime reset requires staging again.
 
 The saved `pair_max_days` remains authoritative. The downloader counts only
 distinct unordered same-artist pairs within that window and drops images with no
-partner. It can retain separate time clusters from the same artist: the training
+partner. The selected range can retain separate time clusters from the same artist: the training
 loader's timestamp bounds always choose B within 365 days of A, including the
 boundary, and exclude A itself. Packing/staging does not relax that constraint.

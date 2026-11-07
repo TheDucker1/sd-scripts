@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 from pathlib import Path
+import random
 import sys
 import tarfile
 import tempfile
@@ -23,9 +24,10 @@ from library.danbooru_index import IMAGE_DTYPE, file_sha256, load_artist_index, 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from download_artist_dataset import (
-    ArchiveClient, InvalidArchiveImage, MultiRangeUnsupported, download_selection, finalize_rows,
-    prepare_source, read_journal, request_batches, save_image, select_artists,
+    ArchiveClient, InvalidArchiveImage, MultiRangeUnsupported, download_minimum_selection, download_selection, finalize_rows,
+    load_plan, pick_artist_range, prepare_source, read_journal, request_batches, save_image, save_minimum_plan, select_artists,
 )
+from pack_artist_dataset import pack_dataset
 
 
 def fixture(root):
@@ -127,8 +129,9 @@ class TestArtistDownload(unittest.TestCase):
         rows["timestamp"][15:30] = np.arange(15) * 366 * 86400
         # Artist 2 has only 91 pairs in its first cluster, plus one isolated image.
         rows["timestamp"][44] = 2 * 365 * 86400
-        chosen, names, _, summary, qualifying = select_artists(rows, np.array(["a", "b", "c"]), 365, 1, 101, 42)
-        self.assertEqual(qualifying, 1)
+        chosen, names, _, summary, attempted = select_artists(rows, np.array(["a", "b", "c"]), 365, 1, 101, 42)
+        self.assertGreaterEqual(attempted, 1)
+        self.assertLessEqual(attempted, 3)
         self.assertEqual(names.tolist(), ["a"])
         self.assertEqual(len(chosen), 15)
         self.assertEqual(summary[0]["pairs"], 105)
@@ -147,6 +150,104 @@ class TestArtistDownload(unittest.TestCase):
         _, rows, _ = load_artist_index(source)
         np.testing.assert_array_equal(rows, self.rows)
         self.assertEqual(sorted(path.name for path in source.iterdir()), ["artist-index.npz", "manifest.json"])
+
+    def test_random_range_stops_at_minimum_end_and_can_span_multiple_years(self):
+        rows = np.zeros(127, dtype=IMAGE_DTYPE)
+        rows["id"] = np.arange(len(rows))
+        rows["artist"] = np.repeat([0, 1, 2], [100, 16, 11])
+        rows["timestamp"][:100] = np.arange(100) * 86400
+        # Enough pairs across two clusters; the whole selected range spans >365 days.
+        rows["timestamp"][108:116] = 366 * 86400
+        rows["timestamp"][-1] = 365 * 86400  # Inclusive boundary supplies the 11th image.
+        names = np.asarray(["many_images", "separate_clusters", "boundary"])
+        chosen, artists, _, summary, attempted = select_artists(rows, names, 365, 3, 50, 42)
+        self.assertEqual(attempted, 3)
+        self.assertEqual(artists.tolist(), names.tolist())
+        self.assertEqual(len(chosen), 38)
+        self.assertEqual([entry["pairs"] for entry in summary], [55, 56, 55])
+        repeated = select_artists(rows, names, 365, 3, 50, 42)[0]
+        np.testing.assert_array_equal(chosen, repeated)
+        rows["timestamp"][-1] += 86400
+        with self.assertRaisesRegex(ValueError, "Only 2 artists"):
+            select_artists(rows, names, 365, 3, 50, 42)
+
+    def test_random_start_and_first_endpoint_match_direct_pair_enumeration(self):
+        times = np.asarray([0, 100, 365, 366, 500, 730, 731, 900, 1200]) * 86400
+        window = 365 * 86400
+        def pairs(start, end):
+            return sum(times[b] - times[a] <= window for a in range(start, end) for b in range(a + 1, end))
+        for minimum in (1, 3, 8, 12, 100):
+            starts = [start for start in range(len(times)) if pairs(start, len(times)) >= minimum]
+            for seed in range(10):
+                result = pick_artist_range(times, window, minimum, random.Random(seed))
+                if not starts:
+                    self.assertIsNone(result)
+                    continue
+                start = random.Random(seed).choice(starts)
+                end = next(end for end in range(start + 1, len(times) + 1) if pairs(start, end) >= minimum)
+                self.assertEqual(result, (start, end, pairs(start, end)))
+
+    def test_legacy_plan_shrinks_reuses_images_and_packs_only_selected_files(self):
+        output = self.root / "legacy"
+        with server(self.body) as (url, state):
+            manifest = self.run_download(url, output)
+            folders = np.asarray(["images/0000-first_artist", "images/0001-second_artist"])
+            write_index_arrays(output / "download-plan.npz", images=self.rows, artists=self.artists, folders=folders)
+            settings = dict(source_sha256=manifest["index_sha256"], artists=2, min_pairs=1, seed=42, pair_max_days=365)
+            previous = dict(settings=settings, plan_sha256=file_sha256(output / "download-plan.npz"),
+                images=6, bytes=int(self.rows["size"].sum()),
+                artists=[dict(name=str(name), folder=str(folder)) for name, folder in zip(self.artists, folders)])
+            plan = save_minimum_plan(output, manifest, self.rows, self.artists, settings, previous)
+            rows, names, new_folders = load_plan(output, plan)
+            self.assertEqual(len(rows), 4)
+            np.testing.assert_array_equal(new_folders, folders)
+            self.assertEqual(len(read_journal(output, rows)), 4)  # Old row indices remapped by post ID.
+            with np.load(output / "download-plan.npz") as data:
+                self.assertEqual(len(data["images"]), 6)  # Original plan is preserved.
+            self.assertEqual(len(list((output / "images").rglob("*.jpg"))), 6)
+            args = SimpleNamespace(ranges_per_request=2, response_mib=1, http1=True, retries=1, timeout=3,
+                                   request_interval=0, workers=2, retry_skipped=False, min_pairs=1)
+            before = len(state.requests)
+            download_minimum_selection(output, self.root / "source", manifest, plan, args)
+            self.assertEqual(len(state.requests), before)  # No redownload of valid images.
+        archive_path = self.root / "selected.tar"
+        pack_dataset(output, archive_path)
+        with tarfile.open(archive_path) as archive:
+            self.assertEqual(len(archive.getmembers()), 6)  # Manifest, index, four selected images.
+            with np.load(output / "artist-index.npz") as data:
+                self.assertEqual(set(archive.getnames()), {"manifest.json", "artist-index.npz", *data["files"]})
+        with self.assertRaises(FileExistsError):
+            pack_dataset(output, archive_path)
+        # A failed pack never publishes a complete .tar.
+        next((output / "images").rglob(f"{int(rows[0]['id'])}.jpg")).write_bytes(b"broken")
+        with self.assertRaisesRegex(ValueError, "Missing/corrupt"):
+            pack_dataset(output, self.root / "broken.tar")
+        self.assertFalse((self.root / "broken.tar").exists())
+
+    def test_bad_image_is_replaced_without_redownloading_good_images(self):
+        output = self.root / "repair"
+        output.mkdir()
+        settings = dict(source_sha256=self.manifest["index_sha256"], artists=2, min_pairs=1, seed=42, pair_max_days=365)
+        plan = save_minimum_plan(output, self.manifest, self.rows, self.artists, settings)
+        selected, _, _ = load_plan(output, plan)
+        bad_id = int(selected[0]["id"])
+        bad = self.rows[np.flatnonzero(self.rows["id"] == bad_id)[0]]
+        start, size = int(bad["offset"]), int(bad["size"])
+        body = self.body[:start] + b"x" * size + self.body[start + size:]
+        with server(body) as (url, state):
+            manifest = dict(self.manifest, archives=[dict(self.manifest["archives"][0], url=url)])
+            write_index_json(self.root / "source" / "manifest.json", manifest)
+            args = SimpleNamespace(ranges_per_request=1, response_mib=1, http1=True, retries=1, timeout=3,
+                                   request_interval=0, workers=2, retry_skipped=False, min_pairs=1)
+            download_minimum_selection(output, self.root / "source", manifest, plan, args)
+            self.assertEqual(len(state.requests), 5)  # Four initial images, then only one replacement.
+        final, rows, names = load_artist_index(output)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(names), 2)
+        self.assertNotIn(bad_id, rows["id"])
+        self.assertEqual(final["artist_pair_counts"], [1, 1])
+        saved = json.loads((output / "selection.json").read_text())
+        self.assertIn(bad_id, saved["excluded_post_ids"])
 
     def test_batch_intervals_are_exact_never_merged(self):
         batches = list(request_batches(self.rows, np.ones(len(self.rows), dtype=bool), 2, 1024**2))

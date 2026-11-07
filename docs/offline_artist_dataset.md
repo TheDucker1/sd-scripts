@@ -97,13 +97,18 @@ interruptions. An interrupted multipart response retries its bounded batch; imag
 already committed to the journal remain completed. An OS lock prevents two workers
 from writing the same output directory and is released even after a process crash.
 
-Each image must match the tar header's post ID/size and decode fully. If its actual
-dimensions differ from metadata, the downloader records the correction and uses
-the actual dimensions in the final index, provided they still pass the source
-index's `min_side`/`min_pixels` filters. Metadata MD5 differences are recorded,
-rather than rejecting valid archive images: this dataset can contain valid bytes
-with a different MD5 from `posts.json`. Local SHA256 is computed from the downloaded
-payload itself.
+Each image must match the tar header's post ID/size, decode fully and match the
+metadata dimensions exactly. A dimension mismatch is skipped, even when the aspect
+ratios match or the actual image is large enough. Neither circumstance proves it
+is a downscaled copy of the indexed original. Images must also pass the source
+index's `min_side`/`min_pixels` filters. Resume rejects dimension mismatches accepted
+by older downloader versions, including journals that lack the discrepancy flag.
+Existing image files are left on disk, but excluded from the final training index.
+
+Metadata MD5 differences are still recorded rather than rejected under the existing
+archive-tolerance behavior. A local SHA256 is computed from the downloaded payload;
+it detects later file changes, but does not authenticate that payload against the
+original metadata.
 
 Invalid images (bad member identity, corrupt payload or below-minimum actual size)
 are recorded in `skipped.jsonl` and do not abort later downloads. The worker excludes

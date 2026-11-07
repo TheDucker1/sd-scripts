@@ -32,7 +32,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from library.danbooru_index import (
-    INDEX_VERSION, file_sha256, index_path, inspect_archive_image, load_artist_index, write_index_arrays, write_index_json,
+    INDEX_VERSION, file_sha256, index_path, load_artist_index, validate_archive_image, write_index_arrays, write_index_json,
 )
 
 
@@ -417,9 +417,20 @@ def read_journal(root, rows=None):
     for index, record in tqdm(records.items(), desc="Verify saved images", unit="image"):
         if rows is not None and (not 0 <= index < len(rows) or int(rows[index]["id"]) != record["id"]):
             raise ValueError("Download journal does not match the saved selection")
+        if not record.get("metadata_dimensions_match", True):
+            continue
         path = index_path(root, record["file"])
         if (path.is_file() and (rows is None or path.stat().st_size == int(rows[index]["size"]))
                 and file_sha256(path) == record["sha256"]):
+            if rows is not None:
+                # Old journals may predate dimension tracking. A matching local
+                # SHA proves file integrity, not agreement with source metadata.
+                try:
+                    with Image.open(path) as image:
+                        if image.size != (int(rows[index]["width"]), int(rows[index]["height"])):
+                            continue
+                except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError):
+                    continue
             good[index] = record
     return good
 
@@ -435,7 +446,8 @@ class RepairSelection(Exception):
 def save_image(root, index, row, folder, block, min_side=0, min_pixels=0):
     payload = block[512:]
     try:
-        suffix, (width, height) = inspect_archive_image(row, block[:512], payload)
+        suffix = validate_archive_image(row, block[:512], payload)
+        width, height = int(row["width"]), int(row["height"])
         if min(width, height) < min_side or width * height < min_pixels:
             raise ValueError(f"Actual dimensions {width}x{height} fail min_side={min_side}, min_pixels={min_pixels}")
     except (OSError, ValueError, SyntaxError, EOFError, tarfile.TarError, Image.DecompressionBombError) as error:
@@ -448,7 +460,7 @@ def save_image(root, index, row, folder, block, min_side=0, min_pixels=0):
         handle.write(payload)
     temporary.replace(path)
     return dict(index=index, id=int(row["id"]), file=relative, sha256=hashlib.sha256(payload).hexdigest(),
-                width=width, height=height, metadata_dimensions_match=(width, height) == (int(row["width"]), int(row["height"])),
+                width=width, height=height, metadata_dimensions_match=True,
                 metadata_md5_match=hashlib.md5(payload, usedforsecurity=False).hexdigest().encode("ascii") == row["md5"])
 
 
@@ -475,9 +487,6 @@ def finalize_rows(rows, artists, good, window_days, min_pairs):
     result = rows[kept].copy()
     original_artists = result["artist"].copy()
     result["artist"] = np.searchsorted(np.unique(original_artists), original_artists)
-    for position, index in enumerate(kept):
-        result["width"][position] = good[index].get("width", int(result["width"][position]))
-        result["height"][position] = good[index].get("height", int(result["height"][position]))
     return result, np.asarray(names), kept, pair_counts
 
 
@@ -491,7 +500,6 @@ def download_selection(root, manifest, rows, artists, folders, args):
     done_bytes = sum(int(rows[index]["size"]) for index in good)
     skipped_bytes = sum(int(rows[index]["size"]) for index in skipped)
     mismatches = sum(not record["metadata_md5_match"] for record in good.values())
-    dimension_mismatches = sum(not record.get("metadata_dimensions_match", True) for record in good.values())
     write_index_json(root / "manifest.json", dict(manifest, complete=False, storage="local"))
     partial_root = root / ".partial"
     partial_root.mkdir(exist_ok=True)
@@ -508,7 +516,6 @@ def download_selection(root, manifest, rows, artists, folders, args):
                 bytes_done=done_bytes, bytes_total=total_bytes, network_bytes_this_run=network.n,
                 requests_this_run=client.requests, retries_this_run=client.retry_count,
                 metadata_md5_discrepancies=mismatches,
-                metadata_dimension_discrepancies=dimension_mismatches,
                 http_version=client.http_version, multi_range=client.multirange and args.ranges_per_request > 1,
                 updated_at=datetime.now(timezone.utc).isoformat()))
 
@@ -569,12 +576,6 @@ def download_selection(root, manifest, rows, artists, folders, args):
                             good[index] = record
                             done_bytes += int(rows[index]["size"])
                             mismatches += not record["metadata_md5_match"]
-                            if not record["metadata_dimensions_match"]:
-                                dimension_mismatches += 1
-                                if dimension_mismatches <= 3 or dimension_mismatches & (dimension_mismatches - 1) == 0:
-                                    tqdm.write(f"Post {record['id']}: corrected dimensions "
-                                               f"{rows[index]['width']}x{rows[index]['height']} -> {record['width']}x{record['height']}; "
-                                               f"dimension discrepancies={dimension_mismatches}")
                         images.update(1)
                     os.fsync(journal.fileno())
                     os.fsync(skip_log.fileno())

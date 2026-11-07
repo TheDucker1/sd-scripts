@@ -296,18 +296,62 @@ class TestArtistDownload(unittest.TestCase):
             self.assertEqual(len(state.requests), 8)
         self.assertEqual(len(read_journal(output, self.rows)), 6)
 
-    def test_valid_dimension_mismatch_is_corrected_in_final_index(self):
+    def test_dimension_mismatch_is_skipped_without_changing_metadata(self):
         self.rows[0]["width"], self.rows[0]["height"] = 16, 12
         output = self.root / "dimensions"
         with server(self.body) as (url, state):
             self.run_download(url, output)
-            _, rows, _ = load_artist_index(output)
-            self.assertEqual((int(rows[0]["width"]), int(rows[0]["height"])), (8, 6))
-            self.assertEqual(json.loads((output / "progress.json").read_text())["metadata_dimension_discrepancies"], 1)
+            manifest, rows, _ = load_artist_index(output)
+            self.assertNotIn(100, rows["id"])
+            self.assertEqual(manifest["skipped_image_count"], 1)
+            self.assertEqual((int(self.rows[0]["width"]), int(self.rows[0]["height"])), (16, 12))
+            skipped = json.loads((output / "skipped.jsonl").read_text().splitlines()[0])
+            self.assertIn("dimensions", skipped["reason"])
             self.run_download(url, output)
             self.assertEqual(len(state.requests), 3)
             _, resumed, _ = load_artist_index(output)
-            self.assertEqual(int(resumed[0]["width"]), 8)
+            self.assertNotIn(100, resumed["id"])
+
+    def test_resume_rejects_previously_accepted_dimension_mismatch(self):
+        output = self.root / "old-dimensions"
+        output.mkdir()
+        row = self.rows[0]
+        block = self.body[int(row["offset"]) - 512:int(row["offset"] + row["size"])]
+        record = save_image(output, 0, row, "images/artist", block)
+        rows = self.rows.copy()
+        rows[0]["width"], rows[0]["height"] = 16, 12
+        record["metadata_dimensions_match"] = False
+        (output / "downloaded.jsonl").write_text(json.dumps(record) + "\n")
+        self.assertEqual(read_journal(output, rows), {})
+        self.assertEqual(read_journal(output), {})
+        # Journals older than the discrepancy flag are checked against the image header.
+        record.pop("metadata_dimensions_match")
+        (output / "downloaded.jsonl").write_text(json.dumps(record) + "\n")
+        self.assertEqual(read_journal(output, rows), {})
+        self.assertEqual(len(read_journal(output, self.rows)), 1)
+
+    def test_dimension_mismatch_gets_replacement_to_preserve_pair_count(self):
+        output = self.root / "replace-dimensions"
+        output.mkdir()
+        selected = select_artists(self.rows, self.artists, 365, 2, 1, 42)[0]
+        bad_id = int(selected[0]["id"])
+        position = int(np.flatnonzero(self.rows["id"] == bad_id)[0])
+        self.rows[position]["width"], self.rows[position]["height"] = 16, 12
+        write_index_arrays(self.root / "source" / "artist-index.npz", images=self.rows, artists=self.artists)
+        manifest = dict(self.manifest, index_sha256=file_sha256(self.root / "source" / "artist-index.npz"))
+        settings = dict(source_sha256=manifest["index_sha256"], artists=2, min_pairs=1, seed=42, pair_max_days=365)
+        plan = save_minimum_plan(output, manifest, self.rows, self.artists, settings)
+        with server(self.body) as (url, state):
+            manifest["archives"] = [dict(manifest["archives"][0], url=url)]
+            write_index_json(self.root / "source" / "manifest.json", manifest)
+            args = SimpleNamespace(ranges_per_request=1, response_mib=1, http1=True, retries=1, timeout=3,
+                                   request_interval=0, workers=2, retry_skipped=False, min_pairs=1)
+            download_minimum_selection(output, self.root / "source", manifest, plan, args)
+            self.assertEqual(len(state.requests), 5)  # Four initial images, then only one replacement.
+        final, rows, names = load_artist_index(output)
+        self.assertNotIn(bad_id, rows["id"])
+        self.assertEqual(len(names), 2)
+        self.assertEqual(final["artist_pair_counts"], [1, 1])
 
     def test_corrupt_image_is_skipped_and_later_batch_images_finish(self):
         row = self.rows[0]
@@ -329,7 +373,7 @@ class TestArtistDownload(unittest.TestCase):
                 self.run_download(url, output, multi_ranges, retry_skipped=True)
                 self.assertEqual(len(state.requests), before + 1)
 
-    def test_recovered_dimensions_still_obey_source_size_filters(self):
+    def test_actual_dimensions_still_obey_source_size_filters(self):
         row = self.rows[0]
         left, right = int(row["offset"]) - 512, int(row["offset"] + row["size"])
         block = self.body[left:right]

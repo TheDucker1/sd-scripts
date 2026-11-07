@@ -1,6 +1,10 @@
 {
   "initialization": "pretrained",
   "content_loss": "flow_l2",
+  "reference_adapter": {
+    "format": "snapref_v1a",
+    "mode": "cs"
+  },
   "seed": 42,
   "dtype": "bfloat16",
   "gradient_checkpointing": false,

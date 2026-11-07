@@ -603,6 +603,7 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
             edit_contract=("anima-snapref-dual-lora-clean-ref-t10-centered-v1" if config.get("architecture") == "anima"
                            else "ref-prefix-only-t0__target-text-original-moss-v1"),
             pretrained_revisions={name: entry["revision"] for name, entry in config.get("pretrained_assets", {}).items()},
+            adapter_initialization=config.get("adapter_initialization"),
         ),
     )
     weights_path = folder / "adapter_model.safetensors"

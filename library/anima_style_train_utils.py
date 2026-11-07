@@ -1,18 +1,22 @@
 """Anima-specific component loading and prompt preparation for style training."""
 
 import json
+import logging
 from pathlib import Path
 
 import torch
 from torch import nn
 
 from library import anima_models, anima_utils, qwen_image_autoencoder_kl, strategy_anima
-from library.anima_reference import AnimaReference, install_reference_lora
+from library.anima_reference import AnimaReference, install_reference_lora, load_snapref_adapter
 from library.moss_image_style_train_utils import (
     BytePromptTokenizer, DTYPES, MossStyleComponents, StylePromptTagger,
     StyleStageTimer, encode_style_images,
 )
 from library.streaming_dataset import process_stream_caption
+
+
+logger = logging.getLogger(__name__)
 
 
 class AnimaStyleVAE(nn.Module):
@@ -56,7 +60,12 @@ def build_anima_style_components(config, device):
         from library.moss_image_style_pretrained import load_prompt_tagger
 
         assets = json.loads(Path(config["assets_manifest"]).read_text(encoding="utf-8"))
-        for name in ("anima", "vae", "text_encoder", "t5_tokenizer", "tagger"):
+        required = ["anima", "vae", "text_encoder", "t5_tokenizer", "tagger"]
+        if config.get("reference_adapter") and not config["reference_adapter"].get("path"):
+            required.append("snapref_adapter")
+        for name in required:
+            if name not in assets:
+                raise ValueError(f"Missing asset {name}; rerun Colab setup with the updated Anima manifest")
             entry = assets[name]
             root = Path(entry["local_dir"]).resolve()
             for file in entry["files"]:
@@ -83,6 +92,18 @@ def build_anima_style_components(config, device):
     if count is None:
         count = len(model.blocks) if config.get("gradient_checkpointing", False) else 0
     dit = AnimaReference(model, count).to(device=device, dtype=dtype)
+    if config.get("reference_adapter"):
+        options = config["reference_adapter"]
+        if options.get("format") != "snapref_v1a":
+            raise ValueError("reference_adapter.format must be snapref_v1a")
+        path = options.get("path")
+        if path is None:
+            if config["initialization"] != "pretrained":
+                raise ValueError("Random toy warm-starts require an explicit tiny reference_adapter.path")
+            path = weight("snapref_adapter")
+        config["adapter_initialization"] = load_snapref_adapter(dit, path, options.get("mode", "cs"))
+        logger.info("Loaded pretrained SnapRef reference + target LoRAs and mode=%s; both branches remain trainable",
+                    config["adapter_initialization"]["mode"])
     components = MossStyleComponents(dit, AnimaStyleVAE(vae), text, tokenizer, tagger, None, None)
     for module in components.frozen_modules():
         module.requires_grad_(False).eval().to(device=device)

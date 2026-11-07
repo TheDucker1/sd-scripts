@@ -15,10 +15,14 @@ Each reference block runs self-attention, caption cross-attention and MLP.
 Its pre-update self-attention K/V are supplied to the corresponding target block.
 Target text cross-attention continues to read the generation prompt.
 
-This implements the single-reference architecture for a new **style** adapter.
-It initializes new adapters and one learned reference-mode embedding; it does not
-load the published character adapter or expose its cs/char mode pair, FP8 adapter
-format, multi-reference weights, or attention-strength controls. Checkpoints use
+Production training initializes both adapter streams from the published BF16
+`snapref_v1a.safetensors` checkpoint. Its `cs` (character + style) embedding
+initializes our single learned reference-mode vector, which is then finetuned
+along with both LoRA streams using our same-artist velocity L2 objective.
+The loader validates complete tensor coverage, shapes/ranks, alpha values, finite
+parameters and the reference timestep contract. Missing assets are an error; it
+does not silently fall back to zero updates. It does not expose the upstream
+cs/char mode pair, FP8 adapter format, multi-reference weights, or attention-strength controls. Checkpoints use
 this trainer's format, not the ComfyUI SnapRef file format. Preview inference
 encodes the reference once, then reuses per-block K/V for the entire denoising run.
 The positive CFG branch reads B; the negative branch has no reference by default.
@@ -69,18 +73,37 @@ are protected from overwriting; use a fresh output directory before repeating an
 identical smoke command. The unit tests check cached/live parity, caption influence,
 gradients in both branches, frozen base weights, checkpoint recomputation parity,
 and saving/restoring both branches.
+`tests/test_anima_snapref_load.py` checks upstream-format import, mode selection,
+invalid checkpoint rejection before mutation, component integration and a tiny
+CUDA optimizer step. All its checkpoint tensors are synthetic and small.
 
 ## Colab
 
 Upload `tools/colab/anima_style_setup.ipynb` after pushing the branch. Its setup
 cell explicitly selects `configs/anima_colab_models.json` while reusing the existing
 isolated environment installer. The manifest downloads Anima **base v1.0** (not
-turbo), Qwen3-0.6B-Base, Qwen Image VAE, T5 tokenizer files only and PixAI.
+turbo), Qwen3-0.6B-Base, Qwen Image VAE, T5 tokenizer files only, PixAI and the
+published BF16 SnapRef v1a adapter (pinned to a specific upstream commit).
 It excludes MOSS, Qwen3.5-9B, DINO and MegaStyle. Downloads pin model revisions;
 the trainer validates local files before loading. No full-size model was tested
 on the workstation; memory fit must be checked on the Colab host.
 The Anima asset manifest omits remote dataset discovery; setup downloads only the
 models/tokenizers. Dataset preparation uses the uploaded offline tar.
+
+Rerun setup after updating an older Colab checkout so `resolved_models.json`
+includes `snapref_adapter`. Use a new run name to begin from the published adapter;
+the notebook's default name has changed accordingly. The preset contains
+`reference_adapter = {"format": "snapref_v1a", "mode": "cs"}`. An explicit `path`
+may be supplied for a local upstream-format checkpoint; ranks and alpha must match
+the configured adapter. Random toy presets remain randomly initialized unless an
+explicit tiny adapter fixture is requested.
+
+This is a weight warm-start, with a fresh optimizer/scheduler. Normal `--resume`
+subsequently restores our own adapter, mode vector, optimizer and scheduler states.
+Checkpoint metadata records the initial adapter's revision, SHA256 and selected
+mode. It does not continue the upstream optimizer or reproduce its character
+training recipe, and pretrained image conditioning is not a guarantee of style
+transfer quality after finetuning.
 
 The notebook uses the staged RAM/local tar index and has its own Anima run name.
 It retains batch size 2, accumulation 2, a 768-square pixel budget with aspect

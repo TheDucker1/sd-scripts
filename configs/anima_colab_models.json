@@ -1,6 +1,20 @@
 {
   "models": [
     {
+      "name": "snapref_adapter",
+      "repo_id": "0ppxnhximxr/snapref-v1a",
+      "revision": "bc3ca7091c08acce8f20af8f1cd7ed8643261023",
+      "allow_patterns": [
+        "snapref_v1a.safetensors",
+        "training_config.json",
+        "LICENSE.md",
+        "NOTICE.txt"
+      ],
+      "required_patterns": [
+        "snapref_v1a.safetensors"
+      ]
+    },
+    {
       "name": "vae",
       "repo_id": "circlestone-labs/Anima",
       "revision": "main",

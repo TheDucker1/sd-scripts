@@ -6,12 +6,16 @@ Implemented against this repository's Anima, without a ComfyUI dependency.
 """
 
 import math
+import json
+
+from safetensors import safe_open
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from library.anima_models import apply_rotary_pos_emb
+from library.danbooru_index import file_sha256
 
 
 TARGET_TARGETS = [f"self_attn.{name}" for name in ("q_proj", "k_proj", "v_proj", "output_proj")]
@@ -55,6 +59,64 @@ def install_reference_lora(model, ref, tgt):
             module = block.get_submodule(parent)
             setattr(module, attribute, BranchLoRALinear(getattr(module, attribute),
                     ref if name in REFERENCE_TARGETS else None, tgt if name in TARGET_TARGETS else None))
+
+
+def load_snapref_adapter(model, path, mode="cs"):
+    """Warm-start both streams and one mode from upstream BF16 anima_ref_kv/1.
+
+    Validate the full schema before changing parameters. Read one tensor at a
+    time from the safetensors mapping, without materializing another full state.
+    The imported tensors stay trainable; optimizer state is not imported.
+    """
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+        metadata = json.loads(metadata.get("snapref") or metadata.get("anima_ref_kv") or "{}")
+        if metadata.get("format") != "anima_ref_kv/1" or metadata.get("ref_t", 10) != 10:
+            raise ValueError("Expected a SnapRef anima_ref_kv/1 checkpoint with ref_t=10")
+        modes = metadata.get("modes", ["cs"])
+        if not isinstance(modes, list) or len(set(modes)) != len(modes) or mode not in modes:
+            raise ValueError(f"SnapRef checkpoint does not contain requested mode {mode!r}")
+        mapping, alphas = {}, {}
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad or name == "reference_mode":
+                continue
+            module_name, leaf = name.rsplit(".", 1)
+            module = model.get_submodule(module_name)
+            if not isinstance(module, BranchLoRALinear) or not module_name.startswith("model.blocks."):
+                raise ValueError(f"Unexpected trainable adapter parameter: {name}")
+            stream = "ref" if leaf.startswith("ref_") else "tgt"
+            root = "anima_ref_kv." + stream + "." + module_name.removeprefix("model.")
+            direction = "lora_down" if leaf.endswith("_A") else "lora_up"
+            mapping[root + "." + direction] = parameter
+            alphas[root + ".alpha"] = module.branches[stream]["alpha"]
+        mode_key = "anima_ref_kv.mode_embed"
+        expected = set(mapping) | set(alphas) | {mode_key}
+        actual = set(handle.keys())
+        if actual != expected:
+            raise ValueError("SnapRef BF16 checkpoint coverage differs from this model: "
+                             f"missing={sorted(expected - actual)[:5]}, unexpected={sorted(actual - expected)[:5]}")
+        for key, parameter in mapping.items():
+            value = handle.get_slice(key)
+            if tuple(value.get_shape()) != tuple(parameter.shape):
+                raise ValueError(f"SnapRef shape/rank mismatch: {key}: {value.get_shape()} != {list(parameter.shape)}")
+            if value.get_dtype() not in ("BF16", "F16", "F32", "F64"):
+                raise ValueError("Use snapref_v1a.safetensors (BF16), not an FP8 adapter checkpoint")
+        if tuple(handle.get_slice(mode_key).get_shape()) != (len(modes), model.reference_mode.numel()):
+            raise ValueError("SnapRef mode embedding shape differs from this model")
+        for key, alpha in alphas.items():
+            value = handle.get_tensor(key)
+            if value.numel() != 1 or not torch.isfinite(value).all() or float(value.item()) != alpha:
+                raise ValueError(f"SnapRef alpha differs from configured adapter settings: {key}")
+        # Catch invalid tensors before performing any partial parameter import.
+        for key in list(mapping) + [mode_key]:
+            if not torch.isfinite(handle.get_tensor(key)).all():
+                raise ValueError(f"Nonfinite SnapRef parameter: {key}")
+        with torch.no_grad():
+            for key, parameter in mapping.items():
+                parameter.copy_(handle.get_tensor(key))
+            model.reference_mode.copy_(handle.get_tensor(mode_key)[modes.index(mode)])
+    return dict(format="snapref_v1a", mode=mode, sha256=file_sha256(path), source_step=metadata.get("step"),
+                source_name=metadata.get("name"), source_version=metadata.get("version"), tensors=len(expected))
 
 
 def reference_rope(model, height, width, frame, shift, device):
@@ -138,8 +200,8 @@ class AnimaReference(nn.Module):
     def __init__(self, model, checkpoint_blocks=0):
         super().__init__()
         self.model = model
-        # This trainer learns one style mode rather than the published cs/char
-        # mode pair. Like SnapRef, its embedding modifies reference timesteps.
+        # One trainable style mode, optionally seeded from upstream cs/char.
+        # Like SnapRef, this embedding modifies reference timestep conditioning.
         self.reference_mode = nn.Parameter(torch.zeros(model.model_channels, device=model.device, dtype=model.dtype))
         if not 0 <= checkpoint_blocks <= len(model.blocks):
             raise ValueError("Invalid checkpoint_blocks")

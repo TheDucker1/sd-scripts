@@ -218,6 +218,9 @@ def prepare_assets(args):
             if not destination.is_file() or destination.stat().st_size != file["bytes"]:
                 raise RuntimeError(f"Incomplete asset: {destination}")
 
+    if not manifest.get("dataset"):
+        print(f"Ready: {lock_path}. Offline dataset manifest; no dataset API requests or shard listing.")
+        return
     # Only list dataset shards. Never request their bodies or the multi-TB dataset.
     spec = manifest["dataset"]
     dataset_lock = root / "dataset_stream.json"

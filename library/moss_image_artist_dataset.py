@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 import torch
 
-from library.danbooru_index import RemoteRangeReader, index_path, load_artist_index, validate_archive_image
+from library.danbooru_index import LocalRangeReader, RemoteRangeReader, index_path, load_artist_index, validate_archive_image
 
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,8 @@ class MossArtistPairs:
         if np.any(self.right - self.left < 2):
             raise ValueError("Index contains posts without an eligible reference")
         self.local_root = None
-        if self.manifest.get("storage") == "local":
+        self.local_tar = None
+        if self.manifest.get("storage") in ("local", "local_tar"):
             self.local_root = Path(directory).resolve()
             with np.load(index_path(directory, self.manifest["index_file"]), allow_pickle=False) as data:
                 self.local_files, self.local_sha256 = data["files"], data["sha256"]
@@ -68,6 +69,14 @@ class MossArtistPairs:
                     or self.local_sha256.shape != (count,) or self.local_sha256.dtype != np.dtype("S64")):
                 raise ValueError("Invalid local image/checksum table")
             self.readers = []
+            if self.manifest["storage"] == "local_tar":
+                with np.load(index_path(directory, self.manifest["index_file"]), allow_pickle=False) as data:
+                    self.tar_offsets = data["tar_offsets"]
+                size = self.manifest["local_tar"]["size"]
+                if (self.tar_offsets.shape != (count,) or self.tar_offsets.dtype != np.dtype("int64")
+                        or np.any(self.tar_offsets < 0) or np.any(self.tar_offsets > size - self.rows["size"])):
+                    raise ValueError("Invalid staged tar offsets")
+                self.local_tar = LocalRangeReader(index_path(directory, self.manifest["local_tar"]["file"]), size)
         else:
             self.readers = [RemoteRangeReader(item["url"], item["size"]) for item in self.manifest["archives"]]
         logger.info("Loaded artist index into RAM: %d images, %d artists, revision=%s", count,
@@ -84,10 +93,13 @@ class MossArtistPairs:
         if not 0 < row["size"] <= subset.max_member_bytes:
             raise ValueError(f"Post {key} exceeds max_member_bytes")
         if self.local_root is not None:
-            path = index_path(self.local_root, str(self.local_files[index]))
-            if path.stat().st_size != int(row["size"]):
-                raise ValueError(f"Post {key}: local image size mismatch")
-            payload = path.read_bytes()
+            if self.local_tar is not None:
+                payload = self.local_tar.fetch(int(self.tar_offsets[index]), int(row["size"]))
+            else:
+                path = index_path(self.local_root, str(self.local_files[index]))
+                if path.stat().st_size != int(row["size"]):
+                    raise ValueError(f"Post {key}: local image size mismatch")
+                payload = path.read_bytes()
             if hashlib.sha256(payload).hexdigest().encode("ascii") != self.local_sha256[index]:
                 raise ValueError(f"Post {key}: local image SHA256 mismatch; rerun downloader")
             return payload

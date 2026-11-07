@@ -65,10 +65,5 @@
         "tokenizer.json"
       ]
     }
-  },
-  "dataset": {
-    "repo_id": "nyanko7/danbooru2023",
-    "revision": "main",
-    "directory": "original"
   }
 }

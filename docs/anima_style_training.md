@@ -33,7 +33,11 @@ The architecture accepts an explicit `ref_context` for that purpose.
 
 The existing persistent Danbooru artist/date index is reusable without rebuilding.
 For offline training, use the [resumable artist-subset downloader](offline_artist_dataset.md)
-and point `data.artist_index` at its completed output directory.
+and the notebook's archive-staging cell. It copies an uncompressed dataset tar
+from Drive into actual tmpfs RAM once, verifies it and writes a local tar-offset
+index. Set `data.artist_index` to that staged directory. An explicit local-SSD mode
+is available when the archive does not fit RAM; neither mode reads images from
+Drive during training. Same-artist/date-window pairing remains enforced.
 A supplies shuffled/dropout content tags and the target latent. B is a distinct
 same-artist image within the indexed date window and supplies the reference latent.
 The only objective is flow velocity MSE against noise minus the target latent.
@@ -75,8 +79,10 @@ turbo), Qwen3-0.6B-Base, Qwen Image VAE, T5 tokenizer files only and PixAI.
 It excludes MOSS, Qwen3.5-9B, DINO and MegaStyle. Downloads pin model revisions;
 the trainer validates local files before loading. No full-size model was tested
 on the workstation; memory fit must be checked on the Colab host.
+The Anima asset manifest omits remote dataset discovery; setup downloads only the
+models/tokenizers. Dataset preparation uses the uploaded offline tar.
 
-The notebook reuses the Drive artist-index path and has its own Anima run name.
+The notebook uses the staged RAM/local tar index and has its own Anima run name.
 It retains batch size 2, accumulation 2, a 768-square pixel budget with aspect
 buckets, AdamW8bit, the decaying cyclic cosine schedule, 1,000-step previews and
 adapter/resume saves, and retention of three checkpoints. `CHECKPOINT_BLOCKS=0`

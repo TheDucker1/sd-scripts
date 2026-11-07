@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+import threading
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -82,6 +83,36 @@ def validate_archive_image(row, header_bytes, payload):
             raise ValueError(f"Post {post_id}: image dimensions {image.size} differ from metadata {expected}")
         image.load()
     return name.suffix.lower()
+
+
+class LocalRangeReader:
+    """Thread-safe exact reads from an uncompressed local/RAM-backed tar."""
+
+    def __init__(self, path, size):
+        self.size = int(size)
+        self.handle = Path(path).open("rb")
+        if os.fstat(self.handle.fileno()).st_size != self.size:
+            self.handle.close()
+            raise ValueError("Staged tar size differs from its manifest; restage the dataset")
+        self.lock = threading.Lock()
+
+    def fetch(self, offset, length):
+        if not 0 <= offset <= self.size or not 0 <= length <= self.size - offset:
+            raise ValueError("Requested bytes lie outside the staged tar")
+        # A shared seek/read lock also works on Windows, where os.pread is absent.
+        with self.lock:
+            self.handle.seek(offset)
+            payload = self.handle.read(length)
+        if len(payload) != length:
+            raise OSError("Short read from staged tar")
+        return payload
+
+    def close(self):
+        self.handle.close()
+
+    def __del__(self):
+        if hasattr(self, "handle"):
+            self.handle.close()
 
 
 class RemoteRangeReader(io.RawIOBase):

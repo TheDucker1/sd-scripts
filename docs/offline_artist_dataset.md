@@ -127,5 +127,42 @@ config['data']['artist_index'] = r'D:\danbooru-offline'
 
 Artist/date pairing, bucketing, resizing, prompts and prefetching still use the
 existing pipeline. The local backend verifies payload SHA256 and performs no HTTP
-requests. To use it on Colab later, copy the completed directory there and set its
-Colab path; pointing Colab at a workstation's Windows path cannot access its disk.
+requests.
+
+## Colab: load a tar into RAM once
+
+After the downloader finishes, pack its training files as an **uncompressed tar**:
+
+```powershell
+tar -cf D:\artists-pair-dataset.tar -C D:\danbooru-offline manifest.json artist-index.npz images
+```
+
+Packing the whole folder, including a containing directory, is supported too.
+The command above leaves out downloader caches/journals to reduce RAM use. Do not
+pack a still-running/incomplete download. Upload the tar to
+`MyDrive/moss-training/artists-pair-dataset.tar` and run the updated Anima notebook's
+dataset cell. It sets `INDEX_DIR` to `/dev/shm/anima-artist-dataset` by default.
+
+`tools/colab/stage_artist_dataset.py` copies the tar from Drive once with progress
+and partial-copy resume. It verifies the final index and each image's saved SHA256,
+then saves a compact `local_tar` index pointing at the new archive offsets. Images
+stay in their original JPEG/PNG/etc encoding inside the uncompressed tar. Training
+reads exact image bytes from RAM; there is no image-file extraction or second
+in-process copy of the whole dataset. Repeating the staging cell reuses its ready
+cache without rereading the Drive archive body. Source size/mtime changes require
+a new staging directory. Keep the same tar for checkpoint resume: repacking can
+change offsets and the resolved dataset index checksum.
+
+The default `DATA_STORAGE='ram'` checks for an actual tmpfs mount and sufficient
+space/available memory, with `RESERVE_RAM_GIB=12` left for model loading, CPU buffers
+and training. The tar must fit both the tmpfs capacity and available RAM. `/content`
+is disk, not RAM. For a dataset that does not fit, choose fewer artists or explicitly
+set `DATA_STORAGE='local'`: the notebook then stages to Colab's local SSD. Neither
+mode reads image data from Drive during training. Nothing silently falls back to
+Drive, and a Colab runtime reset requires staging again.
+
+The saved `pair_max_days` remains authoritative. The downloader counts only
+distinct unordered same-artist pairs within that window and drops images with no
+partner. It can retain separate time clusters from the same artist: the training
+loader's timestamp bounds always choose B within 365 days of A, including the
+boundary, and exclude A itself. Packing/staging does not relax that constraint.

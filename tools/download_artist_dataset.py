@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 import random
 import re
 import sys
+import tarfile
 import threading
 import time
 from urllib.parse import urlparse
@@ -25,12 +26,13 @@ import zipfile
 
 import httpx
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from library.danbooru_index import (
-    INDEX_VERSION, file_sha256, index_path, load_artist_index, validate_archive_image, write_index_arrays, write_index_json,
+    INDEX_VERSION, file_sha256, index_path, inspect_archive_image, load_artist_index, write_index_arrays, write_index_json,
 )
 
 
@@ -348,10 +350,9 @@ class ArchiveClient:
                     self.next_request = max(self.next_request, time.monotonic() + delay)
 
 
-def read_journal(root, rows):
-    """Verify completed payloads; discard only an interrupted final JSONL line."""
+def read_records(path, rows):
+    """Read the latest record per image, truncating only an interrupted last line."""
     records = {}
-    path = root / "downloaded.jsonl"
     if path.exists():
         with path.open("r+b") as handle:
             while True:
@@ -363,7 +364,16 @@ def read_journal(root, rows):
                     handle.truncate(position)
                     break
                 record = json.loads(line)
-                records[int(record["index"])] = record
+                index = int(record["index"])
+                if not 0 <= index < len(rows) or int(rows[index]["id"]) != record["id"]:
+                    raise ValueError("Download journal does not match the saved selection")
+                records[index] = record
+    return records
+
+
+def read_journal(root, rows):
+    """Verify completed payloads; discard only an interrupted final JSONL line."""
+    records = read_records(root / "downloaded.jsonl", rows)
     good = {}
     for index, record in tqdm(records.items(), desc="Verify saved images", unit="image"):
         if not 0 <= index < len(rows) or int(rows[index]["id"]) != record["id"]:
@@ -374,9 +384,18 @@ def read_journal(root, rows):
     return good
 
 
-def save_image(root, index, row, folder, block):
+class InvalidArchiveImage(Exception):
+    """A permanent per-image validation failure, distinct from disk/network errors."""
+
+
+def save_image(root, index, row, folder, block, min_side=0, min_pixels=0):
     payload = block[512:]
-    suffix = validate_archive_image(row, block[:512], payload)
+    try:
+        suffix, (width, height) = inspect_archive_image(row, block[:512], payload)
+        if min(width, height) < min_side or width * height < min_pixels:
+            raise ValueError(f"Actual dimensions {width}x{height} fail min_side={min_side}, min_pixels={min_pixels}")
+    except (OSError, ValueError, SyntaxError, EOFError, tarfile.TarError, Image.DecompressionBombError) as error:
+        raise InvalidArchiveImage(str(error)) from error
     relative = f"{folder}/{int(row['id'])}{suffix}"
     path = index_path(root, relative)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -385,31 +404,77 @@ def save_image(root, index, row, folder, block):
         handle.write(payload)
     temporary.replace(path)
     return dict(index=index, id=int(row["id"]), file=relative, sha256=hashlib.sha256(payload).hexdigest(),
+                width=width, height=height, metadata_dimensions_match=(width, height) == (int(row["width"]), int(row["height"])),
                 metadata_md5_match=hashlib.md5(payload, usedforsecurity=False).hexdigest().encode("ascii") == row["md5"])
+
+
+def finalize_rows(rows, artists, good, window_days, min_pairs):
+    """Remove failed/orphan posts and artists below the requested valid-pair count."""
+    kept, names, pair_counts = [], [], []
+    candidates = np.asarray(sorted(good), dtype=np.int64)
+    available = rows[candidates]
+    groups = np.r_[0, np.flatnonzero(np.diff(available["artist"])) + 1, len(available)] if len(available) else [0]
+    window = window_days * 86400
+    for start, end in zip(groups[:-1], groups[1:]):
+        times = available["timestamp"][start:end]
+        right = np.searchsorted(times, times + window, side="right")
+        pairs = int(np.sum(right - np.arange(len(times)) - 1))
+        if pairs < min_pairs:
+            continue
+        left = np.searchsorted(times, times - window, side="left")
+        indices = candidates[start:end][right - left >= 2]
+        kept.extend(indices.tolist())
+        names.append(str(artists[int(available[start]["artist"])]))
+        pair_counts.append(pairs)
+    if len(kept) < 2:
+        raise RuntimeError("No artists retain enough valid pairs after skips; see skipped.jsonl and adjust the selection")
+    result = rows[kept].copy()
+    original_artists = result["artist"].copy()
+    result["artist"] = np.searchsorted(np.unique(original_artists), original_artists)
+    for position, index in enumerate(kept):
+        result["width"][position] = good[index].get("width", int(result["width"][position]))
+        result["height"][position] = good[index].get("height", int(result["height"][position]))
+    return result, np.asarray(names), kept, pair_counts
 
 
 def download_selection(root, manifest, rows, artists, folders, args):
     good = read_journal(root, rows)
+    skipped = read_records(root / "skipped.jsonl", rows)
+    skipped = {} if getattr(args, "retry_skipped", False) else {index: record for index, record in skipped.items() if index not in good}
     pending = np.ones(len(rows), dtype=bool)
-    pending[list(good)] = False
+    pending[list(good) + list(skipped)] = False
     total_bytes = int(rows["size"].sum())
     done_bytes = sum(int(rows[index]["size"]) for index in good)
+    skipped_bytes = sum(int(rows[index]["size"]) for index in skipped)
     mismatches = sum(not record["metadata_md5_match"] for record in good.values())
+    dimension_mismatches = sum(not record.get("metadata_dimensions_match", True) for record in good.values())
     write_index_json(root / "manifest.json", dict(manifest, complete=False, storage="local"))
     partial_root = root / ".partial"
     partial_root.mkdir(exist_ok=True)
     batches = request_batches(rows, pending, args.ranges_per_request, args.response_mib * 1024**2)
-    with tqdm(total=len(rows), initial=len(good), unit="image", desc="Images") as images, tqdm(
+    filters = manifest.get("filters", {})
+    with tqdm(total=len(rows), initial=len(good) + len(skipped), unit="image", desc="Images processed") as images, tqdm(
         unit="B", unit_scale=True, desc="Network (this run)"
-    ) as network, (root / "downloaded.jsonl").open("a", encoding="utf-8") as journal:
+    ) as network, (root / "downloaded.jsonl").open("a", encoding="utf-8") as journal, \
+            (root / "skipped.jsonl").open("a", encoding="utf-8") as skip_log:
         client = ArchiveClient(not args.http1, args.retries, args.timeout, args.request_interval, network.update)
         def progress(complete=False):
             write_index_json(root / "progress.json", dict(complete=complete, images_done=len(good), images_total=len(rows),
+                images_skipped=len(skipped), images_processed=len(good) + len(skipped), bytes_skipped=skipped_bytes,
                 bytes_done=done_bytes, bytes_total=total_bytes, network_bytes_this_run=network.n,
                 requests_this_run=client.requests, retries_this_run=client.retry_count,
                 metadata_md5_discrepancies=mismatches,
+                metadata_dimension_discrepancies=dimension_mismatches,
                 http_version=client.http_version, multi_range=client.multirange and args.ranges_per_request > 1,
                 updated_at=datetime.now(timezone.utc).isoformat()))
+
+        def save_or_skip(index, block):
+            row = rows[index]
+            try:
+                return save_image(root, index, row, str(folders[int(row["artist"])]), block,
+                                  filters.get("min_side", 0), filters.get("min_pixels", 0))
+            except InvalidArchiveImage as error:
+                return dict(index=index, id=int(row["id"]), skipped=True, reason=str(error))
 
         def single(index):
             row = rows[index]
@@ -417,7 +482,7 @@ def download_selection(root, manifest, rows, artists, folders, args):
             partial = partial_root / f"{int(row['id'])}.part"
             block = client.fetch(manifest["archives"][int(row["archive"])], [interval], partial)[0]
             try:
-                record = save_image(root, index, row, str(folders[int(row["artist"])]), block)
+                record = save_or_skip(index, block)
             except Exception:
                 partial.unlink(missing_ok=True)
                 raise
@@ -432,44 +497,65 @@ def download_selection(root, manifest, rows, artists, folders, args):
                 cleanup.callback(client.cancel.set)
                 for archive_id, indices in batches:
                     archive = manifest["archives"][archive_id]
-                    images.set_postfix_str(f"{archive['path']} | remaining {(total_bytes - done_bytes) / 1024**3:.2f} GiB")
+                    images.set_postfix_str(f"{archive['path']} | skipped {len(skipped)} | "
+                                          f"remaining {(total_bytes - done_bytes - skipped_bytes) / 1024**3:.2f} GiB")
                     records = None
                     if client.multirange and len(indices) > 1:
                         intervals = [(int(rows[index]["offset"]) - 512,
                                       int(rows[index]["offset"] + rows[index]["size"]) - 1) for index in indices]
                         try:
                             blocks = client.fetch(archive, intervals)
-                            records = (save_image(root, index, rows[index], str(folders[int(rows[index]["artist"])]), block)
-                                       for index, block in zip(indices, blocks))
+                            records = (save_or_skip(index, block) for index, block in zip(indices, blocks))
                         except MultiRangeUnsupported as error:
                             client.multirange = False
                             tqdm.write(f"{error}. Falling back to exact single ranges on the persistent connection.")
                     if records is None:
                         records = pool.map(single, indices)
                     for record in records:
-                        journal.write(json.dumps(record) + "\n")
-                        journal.flush()
-                        good[record["index"]] = record
-                        done_bytes += int(rows[record["index"]]["size"])
-                        mismatches += not record["metadata_md5_match"]
+                        index = record["index"]
+                        if record.get("skipped"):
+                            skip_log.write(json.dumps(record) + "\n")
+                            skip_log.flush()
+                            skipped[index] = record
+                            skipped_bytes += int(rows[index]["size"])
+                            tqdm.write(f"Skipped post {record['id']}: {record['reason']}")
+                        else:
+                            journal.write(json.dumps(record) + "\n")
+                            journal.flush()
+                            good[index] = record
+                            done_bytes += int(rows[index]["size"])
+                            mismatches += not record["metadata_md5_match"]
+                            if not record["metadata_dimensions_match"]:
+                                dimension_mismatches += 1
+                                if dimension_mismatches <= 3 or dimension_mismatches & (dimension_mismatches - 1) == 0:
+                                    tqdm.write(f"Post {record['id']}: corrected dimensions "
+                                               f"{rows[index]['width']}x{rows[index]['height']} -> {record['width']}x{record['height']}; "
+                                               f"dimension discrepancies={dimension_mismatches}")
                         images.update(1)
                     os.fsync(journal.fileno())
+                    os.fsync(skip_log.fileno())
                     progress()
         finally:
             progress()
             client.close()
-    if len(good) != len(rows):
+    if len(good) + len(skipped) != len(rows):
         raise RuntimeError("Incomplete offline dataset; rerun the same command")
-    write_index_arrays(root / "artist-index.npz", images=rows, artists=artists,
-        files=np.asarray([good[index]["file"] for index in range(len(rows))]),
-        sha256=np.asarray([good[index]["sha256"] for index in range(len(rows))], dtype="S64"))
+    final_rows, final_artists, kept, pair_counts = finalize_rows(rows, artists, good, manifest["pair_max_days"],
+                                                              getattr(args, "min_pairs", 1))
+    write_index_arrays(root / "artist-index.npz", images=final_rows, artists=final_artists,
+        files=np.asarray([good[index]["file"] for index in kept]),
+        sha256=np.asarray([good[index]["sha256"] for index in kept], dtype="S64"))
     manifest = dict(manifest, storage="local", complete=True, index_file="artist-index.npz",
-        index_sha256=file_sha256(root / "artist-index.npz"), image_count=len(rows), artist_count=len(artists))
+        index_sha256=file_sha256(root / "artist-index.npz"), image_count=len(final_rows), artist_count=len(final_artists),
+        skipped_image_count=len(skipped), pair_pruned_image_count=len(good) - len(kept),
+        pair_pruned_artist_count=len(artists) - len(final_artists), artist_pair_counts=pair_counts)
     write_index_json(root / "manifest.json", manifest)
     state = json.loads((root / "progress.json").read_text())
-    state["complete"] = True
+    state.update(complete=True, final_images=len(final_rows), final_artists=len(final_artists))
     write_index_json(root / "progress.json", state)
-    print(f"Offline dataset ready: {root}\nUse this directory as data.artist_index.")
+    print(f"Offline dataset ready: {root}\n{len(final_rows):,} images, {len(final_artists):,} artists; "
+          f"{len(skipped)} skipped, {len(good) - len(kept)} additionally excluded by pair eligibility.\n"
+          "Use this directory as data.artist_index.")
 
 
 def main():
@@ -487,6 +573,7 @@ def main():
     parser.add_argument("--retries", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--http1", action="store_true", help="Disable HTTP/2 negotiation")
+    parser.add_argument("--retry-skipped", action="store_true", help="Retry permanently invalid images recorded in skipped.jsonl")
     parser.add_argument("--dry-run", action="store_true", help="Save selection/report only; no network")
     args = parser.parse_args()
     if min(args.artists, args.min_pairs, args.ranges_per_request, args.response_mib, args.workers) < 1:

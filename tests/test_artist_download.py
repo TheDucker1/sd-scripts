@@ -23,7 +23,8 @@ from library.danbooru_index import IMAGE_DTYPE, file_sha256, load_artist_index, 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from download_artist_dataset import (
-    ArchiveClient, MultiRangeUnsupported, download_selection, prepare_source, read_journal, request_batches, select_artists,
+    ArchiveClient, InvalidArchiveImage, MultiRangeUnsupported, download_selection, finalize_rows,
+    prepare_source, read_journal, request_batches, save_image, select_artists,
 )
 
 
@@ -152,10 +153,10 @@ class TestArtistDownload(unittest.TestCase):
         self.assertEqual([len(batch) for _, batch in batches], [2, 2, 2])
         self.assertEqual([index for _, batch in batches for index in batch], list(range(6)))
 
-    def run_download(self, url, output, multi_ranges=2):
+    def run_download(self, url, output, multi_ranges=2, retry_skipped=False):
         output.mkdir(exist_ok=True)
         args = SimpleNamespace(ranges_per_request=multi_ranges, response_mib=1, http1=True, retries=1,
-                               timeout=3, request_interval=0, workers=2)
+                               timeout=3, request_interval=0, workers=2, retry_skipped=retry_skipped)
         manifest = dict(self.manifest, archives=[dict(self.manifest["archives"][0], url=url)])
         folders = np.asarray(["images/0000-first_artist", "images/0001-second_artist"])
         download_selection(output, manifest, self.rows, self.artists, folders, args)
@@ -193,6 +194,59 @@ class TestArtistDownload(unittest.TestCase):
             self.run_download(url, output)
             self.assertEqual(len(state.requests), 8)
         self.assertEqual(len(read_journal(output, self.rows)), 6)
+
+    def test_valid_dimension_mismatch_is_corrected_in_final_index(self):
+        self.rows[0]["width"], self.rows[0]["height"] = 16, 12
+        output = self.root / "dimensions"
+        with server(self.body) as (url, state):
+            self.run_download(url, output)
+            _, rows, _ = load_artist_index(output)
+            self.assertEqual((int(rows[0]["width"]), int(rows[0]["height"])), (8, 6))
+            self.assertEqual(json.loads((output / "progress.json").read_text())["metadata_dimension_discrepancies"], 1)
+            self.run_download(url, output)
+            self.assertEqual(len(state.requests), 3)
+            _, resumed, _ = load_artist_index(output)
+            self.assertEqual(int(resumed[0]["width"]), 8)
+
+    def test_corrupt_image_is_skipped_and_later_batch_images_finish(self):
+        row = self.rows[0]
+        start, size = int(row["offset"]), int(row["size"])
+        body = self.body[:start] + b"x" * size + self.body[start + size:]
+        for multi_ranges in (1, 2):
+            with self.subTest(ranges=multi_ranges), server(body) as (url, state):
+                output = self.root / f"skip-{multi_ranges}"
+                self.run_download(url, output, multi_ranges)
+                manifest, rows, _ = load_artist_index(output)
+                self.assertEqual(rows["id"].tolist(), [101, 102, 200, 201, 202])
+                self.assertEqual(manifest["skipped_image_count"], 1)
+                records = [json.loads(line) for line in (output / "skipped.jsonl").read_text().splitlines()]
+                self.assertEqual(records[0]["id"], 100)
+                self.assertTrue(records[0]["reason"])
+                before = len(state.requests)
+                self.run_download(url, output, multi_ranges)
+                self.assertEqual(len(state.requests), before)  # Bad image is not retried forever.
+                self.run_download(url, output, multi_ranges, retry_skipped=True)
+                self.assertEqual(len(state.requests), before + 1)
+
+    def test_recovered_dimensions_still_obey_source_size_filters(self):
+        row = self.rows[0]
+        left, right = int(row["offset"]) - 512, int(row["offset"] + row["size"])
+        block = self.body[left:right]
+        with self.assertRaises(InvalidArchiveImage):
+            save_image(self.root, 0, row, "images/artist", block, min_side=7)
+        self.assertFalse((self.root / "images").exists())
+
+    def test_finalization_drops_orphans_and_artists_below_pair_threshold(self):
+        rows = self.rows.copy()
+        rows["timestamp"][:3] = np.array([0, 10, 800]) * 86400
+        good = {index: {} for index in range(6)}
+        result, names, kept, counts = finalize_rows(rows, self.artists, good, 365, min_pairs=1)
+        self.assertEqual(kept, [0, 1, 3, 4, 5])
+        self.assertEqual(counts, [1, 3])
+        result, names, kept, counts = finalize_rows(rows, self.artists, good, 365, min_pairs=2)
+        self.assertEqual(kept, [3, 4, 5])
+        self.assertEqual(names.tolist(), ["second_artist"])
+        self.assertEqual(result["artist"].tolist(), [0, 0, 0])
 
     def test_partial_single_response_continues_at_exact_byte(self):
         row = self.rows[0]

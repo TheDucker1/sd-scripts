@@ -63,8 +63,8 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def validate_archive_image(row, header_bytes, payload):
-    """Check pinned tar member identity and decoded dimensions, returning its suffix."""
+def inspect_archive_image(row, header_bytes, payload):
+    """Validate pinned member identity and decode fully; return suffix/actual size."""
     import tarfile
     from PIL import Image
 
@@ -78,11 +78,18 @@ def validate_archive_image(row, header_bytes, payload):
     if name.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
         raise ValueError(f"Post {post_id}: unsupported image suffix")
     with Image.open(io.BytesIO(payload)) as image:
-        expected = (int(row["width"]), int(row["height"]))
-        if image.size != expected:
-            raise ValueError(f"Post {post_id}: image dimensions {image.size} differ from metadata {expected}")
         image.load()
-    return name.suffix.lower()
+        size = image.size
+    return name.suffix.lower(), size
+
+
+def validate_archive_image(row, header_bytes, payload):
+    """Strict metadata-dimension validation, retained for the remote training loader."""
+    suffix, size = inspect_archive_image(row, header_bytes, payload)
+    expected = (int(row["width"]), int(row["height"]))
+    if size != expected:
+        raise ValueError(f"Post {row['id']}: image dimensions {size} differ from metadata {expected}")
+    return suffix
 
 
 class LocalRangeReader:

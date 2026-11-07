@@ -78,6 +78,7 @@ remove the server's request limits. Useful tuning flags:
 | `--retries` | 8 | Retries after the initial request. |
 | `--timeout` | 60 | Network operation timeout in seconds. |
 | `--http1` | off | Disable HTTP/2 negotiation if a proxy/server has issues. |
+| `--retry-skipped` | off | Retry invalid images previously recorded in `skipped.jsonl`. |
 | `--index-subdir` | automatic | Select a completed index when a ZIP contains several. |
 
 ## Resume, validation and progress
@@ -90,12 +91,28 @@ interruptions. An interrupted multipart response retries its bounded batch; imag
 already committed to the journal remain completed. An OS lock prevents two workers
 from writing the same output directory and is released even after a process crash.
 
-Each image must match the tar header's post ID/size, decode fully, and match the
-indexed dimensions. Metadata MD5 differences are recorded, rather than rejecting
-valid archive images: this dataset can contain valid bytes with a different MD5
-from `posts.json`. Local SHA256 is computed from the downloaded payload itself.
+Each image must match the tar header's post ID/size and decode fully. If its actual
+dimensions differ from metadata, the downloader records the correction and uses
+the actual dimensions in the final index, provided they still pass the source
+index's `min_side`/`min_pixels` filters. Metadata MD5 differences are recorded,
+rather than rejecting valid archive images: this dataset can contain valid bytes
+with a different MD5 from `posts.json`. Local SHA256 is computed from the downloaded
+payload itself.
 
-The image progress bar shows completed/total, speed and ETA. Its suffix shows the
+Invalid images (bad member identity, corrupt payload or below-minimum actual size)
+are recorded in `skipped.jsonl` and do not abort later downloads. Restarting retains
+these skips; use `--retry-skipped` to try them again. Disk failures and exhausted
+network/protocol failures still stop with recoverable download state; they do not
+silently exclude images. Existing download plans/journals from before this fix are
+compatible: rerun the same command in the same output directory.
+
+Before finalizing, the index drops skipped images, images left without a partner,
+and artists now below `--min-pairs`. The date window is unchanged. Missing artists
+are not automatically replaced; final counts and `artist_pair_counts` in the
+manifest describe the usable subset. Files excluded by this final pairing check
+are left on disk but not referenced by the training index.
+
+The image progress bar shows processed/total (saved plus skipped), speed and ETA. Its suffix shows the
 current tar and remaining payload GiB; a separate network bar shows bytes and
 throughput, including retry/multipart overhead. `progress.json` records counts,
 payload bytes, request/retry totals for the current invocation, MD5 discrepancies
@@ -117,7 +134,8 @@ danbooru-offline/
   .partial/                 # Interrupted single-range payloads
 ```
 
-The final index becomes `complete` only when every selected image is present.
+The final index becomes `complete` only after every selected image has been saved
+or explicitly skipped and the remaining pair eligibility has been checked.
 It contains relative paths, so move/copy the **whole output directory** as needed.
 Set the existing training configuration to:
 

@@ -32,6 +32,8 @@ The architecture accepts an explicit `ref_context` for that purpose.
 ## Data and loss
 
 The existing persistent Danbooru artist/date index is reusable without rebuilding.
+For offline training, use the [resumable artist-subset downloader](offline_artist_dataset.md)
+and point `data.artist_index` at its completed output directory.
 A supplies shuffled/dropout content tags and the target latent. B is a distinct
 same-artist image within the indexed date window and supplies the reference latent.
 The only objective is flow velocity MSE against noise minus the target latent.

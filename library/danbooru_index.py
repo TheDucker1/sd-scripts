@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -60,6 +60,28 @@ def file_sha256(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_archive_image(row, header_bytes, payload):
+    """Check pinned tar member identity and decoded dimensions, returning its suffix."""
+    import tarfile
+    from PIL import Image
+
+    offset, size, post_id = int(row["offset"]), int(row["size"]), int(row["id"])
+    if offset < 512 or offset % 512 or len(payload) != size:
+        raise ValueError(f"Post {post_id}: invalid indexed member offset/length")
+    header = tarfile.TarInfo.frombuf(header_bytes, encoding="utf-8", errors="surrogateescape")
+    name = PurePosixPath(header.name)
+    if not header.isfile() or header.size != size or not name.stem.isdecimal() or int(name.stem) != post_id:
+        raise ValueError(f"Post {post_id}: archive member identity/size mismatch ({header.name!r}, {header.size})")
+    if name.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+        raise ValueError(f"Post {post_id}: unsupported image suffix")
+    with Image.open(io.BytesIO(payload)) as image:
+        expected = (int(row["width"]), int(row["height"]))
+        if image.size != expected:
+            raise ValueError(f"Post {post_id}: image dimensions {image.size} differ from metadata {expected}")
+        image.load()
+    return name.suffix.lower()
 
 
 class RemoteRangeReader(io.RawIOBase):

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import logging
-from pathlib import PurePosixPath
+from pathlib import Path
 import random
 import tarfile
 import threading
@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 import torch
 
-from library.danbooru_index import RemoteRangeReader, load_artist_index
+from library.danbooru_index import RemoteRangeReader, index_path, load_artist_index, validate_archive_image
 
 
 logger = logging.getLogger(__name__)
@@ -28,18 +28,8 @@ def validate_metadata_mismatch(reader, row, payload):
     may describe an earlier image encoding. Never accept a mismatching post ID,
     invalid tar header, wrong image dimensions, or undecodable image.
     """
-    offset, size, post_id = int(row["offset"]), int(row["size"]), int(row["id"])
-    if offset < 512 or offset % 512 or len(payload) != size:
-        raise ValueError(f"Post {post_id}: invalid indexed member offset/length")
-    header = tarfile.TarInfo.frombuf(reader.fetch(offset - 512, 512), encoding="utf-8", errors="surrogateescape")
-    name = PurePosixPath(header.name).stem
-    if not header.isfile() or header.size != size or not name.isdecimal() or int(name) != post_id:
-        raise ValueError(f"Post {post_id}: archive member identity/size mismatch ({header.name!r}, {header.size})")
-    with Image.open(io.BytesIO(payload)) as image:
-        expected = (int(row["width"]), int(row["height"]))
-        if image.size != expected:
-            raise ValueError(f"Post {post_id}: image dimensions {image.size} differ from metadata {expected}")
-        image.load()
+    offset = int(row["offset"])
+    validate_archive_image(row, reader.fetch(offset - 512, 512), payload)
 
 
 class MossArtistPairs:
@@ -69,7 +59,17 @@ class MossArtistPairs:
             self.right[start:end] = start + np.searchsorted(times, times + window, side="right")
         if np.any(self.right - self.left < 2):
             raise ValueError("Index contains posts without an eligible reference")
-        self.readers = [RemoteRangeReader(item["url"], item["size"]) for item in self.manifest["archives"]]
+        self.local_root = None
+        if self.manifest.get("storage") == "local":
+            self.local_root = Path(directory).resolve()
+            with np.load(index_path(directory, self.manifest["index_file"]), allow_pickle=False) as data:
+                self.local_files, self.local_sha256 = data["files"], data["sha256"]
+            if (self.local_files.shape != (count,) or self.local_files.dtype.kind != "U"
+                    or self.local_sha256.shape != (count,) or self.local_sha256.dtype != np.dtype("S64")):
+                raise ValueError("Invalid local image/checksum table")
+            self.readers = []
+        else:
+            self.readers = [RemoteRangeReader(item["url"], item["size"]) for item in self.manifest["archives"]]
         logger.info("Loaded artist index into RAM: %d images, %d artists, revision=%s", count,
                     self.manifest["artist_count"], self.manifest["revision"])
 
@@ -83,6 +83,14 @@ class MossArtistPairs:
         subset = self.processor.subsets[0]
         if not 0 < row["size"] <= subset.max_member_bytes:
             raise ValueError(f"Post {key} exceeds max_member_bytes")
+        if self.local_root is not None:
+            path = index_path(self.local_root, str(self.local_files[index]))
+            if path.stat().st_size != int(row["size"]):
+                raise ValueError(f"Post {key}: local image size mismatch")
+            payload = path.read_bytes()
+            if hashlib.sha256(payload).hexdigest().encode("ascii") != self.local_sha256[index]:
+                raise ValueError(f"Post {key}: local image SHA256 mismatch; rerun downloader")
+            return payload
         reader = self.readers[int(row["archive"])]
         payload = reader.fetch(int(row["offset"]), int(row["size"]))
         actual_md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()

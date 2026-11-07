@@ -661,6 +661,12 @@ def load_style_checkpoint(folder, components, optimizer, config):
     # Extending a toy run is allowed; all architecture/data/optimizer settings must match.
     saved_config["training"].pop("max_steps")
     current_config["training"].pop("max_steps")
+    if saved_config.get("architecture") == current_config.get("architecture") == "anima":
+        # Offline deterministic caching is an execution choice. Image geometry,
+        # augmentation, VAE assets and all optimizer settings still must match.
+        for value in (saved_config, current_config):
+            for key in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir", "latent_cache"):
+                value.pop(key, None)
     if saved_config != current_config:
         raise ValueError("Resume configuration differs from the saved run (except max_steps)")
     weights_path = folder / "adapter_model.safetensors"

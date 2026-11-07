@@ -9,7 +9,7 @@ import random
 import torch
 from PIL import Image
 
-from moss_image_train_style import MossImageStyleTrainer, setup_parser
+from moss_image_train_style import MossImageStyleTrainer, setup_parser as setup_style_parser
 from library import compile_utils
 from library.anima_reference import reference_block, target_block
 from library.anima_style_train_utils import anima_context, build_anima_style_components, prepare_anima_batch
@@ -20,7 +20,23 @@ from library.moss_image_style_train_utils import get_style_sampling_options, sam
 logger = logging.getLogger(__name__)
 
 
+def setup_parser():
+    parser = setup_style_parser()
+    parser.description = "Anima reference LoRA training with optional offline latent caching"
+    parser.add_argument("--cache_latents", action="store_true", default=None)
+    parser.add_argument("--cache_latents_to_disk", action="store_true", default=None)
+    parser.add_argument("--vae_batch_size", type=int, default=None)
+    parser.add_argument("--latent_cache_dir", default=None, help="Local SSD directory for standard Anima NPZ caches")
+    return parser
+
+
 class AnimaStyleTrainer(MossImageStyleTrainer):
+    def prepare_dataset(self, components, loader, config, device):
+        if config.get("cache_latents", False):
+            from library.anima_latent_cache import cache_anima_latents
+
+            cache_anima_latents(components, loader.dataset, config, device)
+
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
             raise ValueError("Anima style training requires architecture=anima and content_loss=flow_l2")
@@ -118,6 +134,8 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                         break
         finally:
             components.dit.train(was_training)
+            if getattr(components, "latent_cache", None) is not None:
+                components.vae.release()
         return batches_seen
 
 

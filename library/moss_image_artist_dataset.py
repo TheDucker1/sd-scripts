@@ -48,17 +48,7 @@ class MossArtistPairs:
         self.cache, self.cached_bytes, self.cache_lock = OrderedDict(), 0, threading.Lock()
         self.metadata_mismatches = 0
         count = len(self.rows)
-        self.left, self.right = np.empty(count, dtype=np.int64), np.empty(count, dtype=np.int64)
-        groups = np.r_[0, np.flatnonzero(np.diff(self.rows["artist"])) + 1, count]
-        window = self.manifest["pair_max_days"] * 86400
-        for start, end in zip(groups[:-1], groups[1:]):
-            times = self.rows["timestamp"][start:end]
-            if np.any(times[1:] < times[:-1]):
-                raise ValueError("Artist timestamps must be sorted")
-            self.left[start:end] = start + np.searchsorted(times, times - window, side="left")
-            self.right[start:end] = start + np.searchsorted(times, times + window, side="right")
-        if np.any(self.right - self.left < 2):
-            raise ValueError("Index contains posts without an eligible reference")
+        self._build_pair_bounds()
         self.local_root = None
         self.local_tar = None
         if self.manifest.get("storage") in ("local", "local_tar"):
@@ -81,6 +71,40 @@ class MossArtistPairs:
             self.readers = [RemoteRangeReader(item["url"], item["size"]) for item in self.manifest["archives"]]
         logger.info("Loaded artist index into RAM: %d images, %d artists, revision=%s", count,
                     self.manifest["artist_count"], self.manifest["revision"])
+
+    def _build_pair_bounds(self):
+        count = len(self.rows)
+        self.left, self.right = np.empty(count, dtype=np.int64), np.empty(count, dtype=np.int64)
+        groups = np.r_[0, np.flatnonzero(np.diff(self.rows["artist"])) + 1, count]
+        window = self.manifest["pair_max_days"] * 86400
+        for start, end in zip(groups[:-1], groups[1:]):
+            times = self.rows["timestamp"][start:end]
+            if np.any(times[1:] < times[:-1]):
+                raise ValueError("Artist timestamps must be sorted")
+            self.left[start:end] = start + np.searchsorted(times, times - window, side="left")
+            self.right[start:end] = start + np.searchsorted(times, times + window, side="right")
+        if np.any(self.right - self.left < 2):
+            raise ValueError("Index contains posts without an eligible reference")
+
+    def restrict_to_indices(self, indices):
+        """Remove preprocessing rejects and newly orphaned posts before sampling."""
+        indices = np.asarray(indices, dtype=np.int64)
+        rows = self.rows[indices]
+        neighbors = ((rows["artist"][1:] == rows["artist"][:-1])
+                     & (rows["timestamp"][1:] - rows["timestamp"][:-1] <= self.manifest["pair_max_days"] * 86400))
+        paired = np.zeros(len(rows), dtype=bool)
+        paired[:-1] |= neighbors
+        paired[1:] |= neighbors
+        indices = indices[paired]
+        if len(indices) < 2:
+            raise ValueError("No valid same-artist/date pairs remain after latent-cache preprocessing")
+        self.rows = self.rows[indices]
+        for name in ("local_files", "local_sha256", "tar_offsets"):
+            if hasattr(self, name):
+                setattr(self, name, getattr(self, name)[indices])
+        self.cache.clear()
+        self.cached_bytes = 0
+        self._build_pair_bounds()
 
     def fetch(self, index):
         row = self.rows[index]

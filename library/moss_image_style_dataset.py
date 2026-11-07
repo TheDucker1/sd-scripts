@@ -44,6 +44,8 @@ def style_stream_user_config(settings):
 def resolve_style_dataset_config(config):
     """Resolve --dataset_config through the current config loader, and snapshot it."""
     config = copy.deepcopy(config)
+    if config.get("architecture") == "anima" and config.get("cache_latents_to_disk"):
+        config["cache_latents"] = True
     if config.get("dataset_config"):
         settings = config_util.load_user_config(config.pop("dataset_config"))
     else:
@@ -61,6 +63,9 @@ def resolve_style_dataset_config(config):
         config["dataset_index"] = dict(revision=manifest["revision"], sha256=manifest["index_sha256"])
     for name in ("cache_latents", "cache_latents_to_disk", "cache_text_encoder_outputs", "cache_text_encoder_outputs_to_disk"):
         if config.get(name) or config["training"].get(name):
+            if (name in ("cache_latents", "cache_latents_to_disk") and config.get("cache_latents") and config.get("architecture") == "anima"
+                    and config["data"].get("artist_index") and manifest.get("storage") in ("local", "local_tar")):
+                continue
             raise ValueError(f"{name} is unavailable for strict streaming and on-the-fly prompts")
     for name in ("num_workers", "max_data_loader_n_workers"):
         if config.get(name, 0) or config["training"].get(name, 0):

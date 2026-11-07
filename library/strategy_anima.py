@@ -258,8 +258,9 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
 
     ANIMA_LATENTS_NPZ_SUFFIX = "_anima.npz"
 
-    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool, latents_stride: int = 8) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
+        self.latents_stride = latents_stride
 
     @property
     def cache_suffix(self) -> str:
@@ -269,12 +270,12 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
         return os.path.splitext(absolute_path)[0] + f"_{image_size[0]:04d}x{image_size[1]:04d}" + self.ANIMA_LATENTS_NPZ_SUFFIX
 
     def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
-        return self._default_is_disk_cached_latents_expected(8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
+        return self._default_is_disk_cached_latents_expected(self.latents_stride, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True)
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
     ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
-        return self._default_load_latents_from_disk(8, npz_path, bucket_reso)
+        return self._default_load_latents_from_disk(self.latents_stride, npz_path, bucket_reso)
 
     def cache_batch_latents(self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool):
         """Cache batch of latents using Qwen Image VAE.

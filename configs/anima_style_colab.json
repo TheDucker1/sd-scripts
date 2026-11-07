@@ -1,6 +1,13 @@
 {
   "initialization": "pretrained",
   "content_loss": "flow_l2",
+  "cache_latents": true,
+  "cache_latents_to_disk": true,
+  "vae_batch_size": 1,
+  "latent_cache_dir": "/content/anima-latents",
+  "latent_cache": {
+    "reserve_ram_gib": 8
+  },
   "reference_adapter": {
     "format": "snapref_v1a",
     "mode": "cs"

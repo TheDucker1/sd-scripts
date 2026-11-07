@@ -47,6 +47,10 @@ class MossImageStyleTrainer:
         setup_logging(args, reset=True)
         torch.set_num_threads(args.num_threads)
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        for name in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir"):
+            value = getattr(args, name, None)
+            if value is not None:
+                config[name] = value
         for name in ("batch_size", "gradient_accumulation_steps", "max_steps", "save_every", "keep_last_checkpoints",
                      "sample_every", "sample_steps", "learning_rate", "optimizer_type", "lr_scheduler", "warmup_steps"):
             value = getattr(args, name, None)
@@ -74,6 +78,9 @@ class MossImageStyleTrainer:
 
     def configure_compile(self, components, args):
         configure_style_compile(components, args)
+
+    def prepare_dataset(self, components, loader, config, device):
+        """Optional model-specific offline preparation, before starting the stream."""
 
     def get_optimizer(self, config, parameters):
         train = config["training"]
@@ -193,6 +200,7 @@ class MossImageStyleTrainer:
         optimizer = self.get_optimizer(config, parameters)
         scheduler = self.get_scheduler(config, optimizer)
         loader = self.get_train_dataloader(config, device)
+        self.prepare_dataset(components, loader, config, device)
         state = load_style_checkpoint(resume, components, optimizer, config) if resume else None
         if state:
             if state.get("scheduler") is not None:

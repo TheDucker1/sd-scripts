@@ -48,6 +48,47 @@ The only objective is flow velocity MSE against noise minus the target latent.
 Neither DINO nor MegaStyle is loaded. Training does not decode guessed latents;
 VAE decoding is used only for previews. Both LoRA streams still receive gradients
 through the target's attention to the reference K/V.
+
+The offline preset enables `cache_latents` and `cache_latents_to_disk`. It uses
+`AnimaLatentsCachingStrategy` from `library/strategy_anima.py`, the same image
+caching helpers and NPZ writer/reader as the established Anima trainer. Files use
+the usual `_anima.npz` suffix and resolution-keyed `latents_HxW`, original-size
+and crop entries. The tar-backed index supplies normal `ImageInfo` objects with
+in-memory source images; no image extraction or alternate NPZ format is needed.
+By default files live under `/content/anima-latents/<signature>` on Colab's SSD.
+Only file paths are retained in the full cache table, and A/B latents are read for
+the current batch. Images
+rejected by geometry settings and newly orphaned posts are removed from sampling;
+the same-artist/date bounds are rebuilt. The VAE weights are then released entirely.
+Previews temporarily reload the frozen VAE to decode results, and release it again
+after the preview set. Production keeps only its checkpoint path between previews;
+random toy fixtures keep a tiny CPU state so they can reproduce the same decoder.
+
+`vae_batch_size` defaults to 1 and batches matching shapes through the existing
+strategy. `latent_cache.reserve_ram_gib` defaults to 8; disk caching checks this
+reserve plus bounded working-batch RAM, rather than requiring all latents to fit
+RAM. It also checks free SSD space. The standard writer stores float32 NPZ arrays
+even when VAE compute uses BF16: at 768-square area with 16 channels and 8x spatial
+compression, that is about 0.562 MiB per image on disk, plus NPZ metadata.
+Latent caching requires a finite local/local-tar index and deterministic pixel
+preprocessing: random crop, color augmentation and flip augmentation are rejected.
+Prompt shuffling, tag dropout, pair sampling and training noise remain dynamic.
+It does not cache learned reference K/V, which are recomputed with gradients.
+
+Valid SSD caches are reused across training process restarts. Missing/corrupt
+entries are regenerated individually. A namespace binds caches to the dataset,
+geometry, VAE and dtype so incompatible results cannot be reused. If
+`cache_latents_to_disk=false`, the optional RAM mode keeps CPU tensors instead
+and rebuilds them on a new process. Neither cache is part of Drive checkpoints;
+Colab SSD/RAM caches disappear on a runtime reset. Cache settings alone may change when resuming;
+geometry, VAE assets, augmentation and optimizer settings must still match.
+Streaming remote-tar training and other models retain their existing cache limits.
+
+The root Anima entry point accepts the usual `--cache_latents`,
+`--cache_latents_to_disk` (which implies latent caching), and `--vae_batch_size`.
+`--latent_cache_dir /content/anima-latents` places files on SSD independently of
+the image archive's RAM/SSD location. The notebook sets these in its JSON and
+prints them in the launch command.
 Buckets, image preprocessing, byte-range fetching and bounded prefetching use the
 existing dataset code. Mixed spatial shapes currently run per sample inside the
 Anima wrapper, preserving their own coordinates; equal-shaped tensors batch

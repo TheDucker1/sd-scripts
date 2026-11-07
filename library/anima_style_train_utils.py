@@ -20,18 +20,40 @@ logger = logging.getLogger(__name__)
 
 
 class AnimaStyleVAE(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, factory=None):
         super().__init__()
         self.model = model
+        self.factory = factory
+        self._dtype = next(model.parameters()).dtype
 
     @property
     def dtype(self):
-        return next(self.model.parameters()).dtype
+        return next(self.model.parameters()).dtype if self.model is not None else self._dtype
+
+    def release(self):
+        if self.model is not None:
+            device = next(self.model.parameters()).device
+            self._dtype = self.dtype
+            self.model = None
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    def ensure_loaded(self, device):
+        if self.model is None:
+            if self.factory is None:
+                raise RuntimeError("VAE reload factory is unavailable")
+            # A preview reload must not change the training noise RNG sequence.
+            with torch.random.fork_rng(devices=[]):
+                self.model = self.factory().requires_grad_(False).eval().to(device=device, dtype=self._dtype)
+            logger.info("Temporarily loaded VAE for preview decoding")
 
     def encode_for_dit(self, pixels):
+        if self.model is None:
+            raise RuntimeError("VAE encoder was released after caching; encountered an uncached image")
         return self.model.encode_pixels_to_latents(pixels.to(self.dtype))
 
     def decode_from_dit(self, latents):
+        self.ensure_loaded(latents.device)
         return self.model.decode_to_pixels(latents.to(self.dtype))
 
 
@@ -50,6 +72,13 @@ def build_anima_style_components(config, device):
                 if "adaln_modulation" in name and torch.count_nonzero(parameter) == 0:
                     parameter.normal_(std=0.02)
         vae = qwen_image_autoencoder_kl.AutoencoderKLQwenImage(**config["vae"])
+        # Synthetic fixtures have no pretrained file to reload for previews.
+        # Preserve their tiny random state on CPU; production retains only a path.
+        vae_state = {name: value.detach().cpu().clone() for name, value in vae.state_dict().items()}
+        def vae_factory():
+            result = qwen_image_autoencoder_kl.AutoencoderKLQwenImage(**config["vae"])
+            result.load_state_dict(vae_state)
+            return result
         text = Qwen3Model(Qwen3Config(**config["text_encoder"]))
         tokenizer = BytePromptTokenizer(config["text_encoder"]["vocab_size"], config.get("max_prompt_length", 16))
         options = config["tagger"]
@@ -80,7 +109,10 @@ def build_anima_style_components(config, device):
 
         model = anima_utils.load_anima_model(device, weight("anima"), "torch", False, "cpu", dtype)
         config["anima"] = dict(preset="anima-base-v1.0", num_blocks=len(model.blocks))
-        vae = qwen_image_autoencoder_kl.load_vae(weight("vae"), device="cpu", disable_cache=True)
+        vae_path = weight("vae")
+        def vae_factory():
+            return qwen_image_autoencoder_kl.load_vae(vae_path, device="cpu", disable_cache=True)
+        vae = vae_factory()
         text, _ = anima_utils.load_qwen3_text_encoder(assets["text_encoder"]["local_dir"], dtype, "cpu")
         tokenizer = strategy_anima.AnimaTokenizeStrategy(
             qwen3_path=assets["text_encoder"]["local_dir"], t5_tokenizer_path=assets["t5_tokenizer"]["local_dir"],
@@ -104,7 +136,7 @@ def build_anima_style_components(config, device):
         config["adapter_initialization"] = load_snapref_adapter(dit, path, options.get("mode", "cs"))
         logger.info("Loaded pretrained SnapRef reference + target LoRAs and mode=%s; both branches remain trainable",
                     config["adapter_initialization"]["mode"])
-    components = MossStyleComponents(dit, AnimaStyleVAE(vae), text, tokenizer, tagger, None, None)
+    components = MossStyleComponents(dit, AnimaStyleVAE(vae, vae_factory), text, tokenizer, tagger, None, None)
     for module in components.frozen_modules():
         module.requires_grad_(False).eval().to(device=device)
         module._apply(lambda tensor: tensor.to(dtype) if tensor.is_floating_point() else tensor)
@@ -130,7 +162,10 @@ def prepare_anima_batch(components, batch, device, rng, current_step=0, max_step
     ragged = isinstance(batch["image_a"], list) or isinstance(batch["image_b"], list)
     def move(values):
         return [value.to(device) for value in values] if ragged else values.to(device)
-    a, b = move(batch["image_a"]), move(batch["image_b"])
+    cache = getattr(components, "latent_cache", None)
+    a = move(batch["image_a"])
+    # Cached B only needs its shape checked; tagger input comes from A.
+    b = ((list(batch["image_b"]) if ragged else batch["image_b"]) if cache is not None else move(batch["image_b"]))
     with timer.measure("tagger"):
         prompts = components.tagger.prompts(components.tagger(a), rng, shuffle="subsets_a" not in batch)
         if "subsets_a" in batch:
@@ -141,9 +176,22 @@ def prepare_anima_batch(components, batch, device, rng, current_step=0, max_step
         if isinstance(context, list):
             context = torch.nn.utils.rnn.pad_sequence(context, batch_first=True)
         ref_context = anima_context(components, [""] * len(prompts), device)
-    with timer.measure("vae_encode_A"):
-        latents = encode_style_images(components.vae, a)
-    with timer.measure("vae_encode_B"):
-        reference = encode_style_images(components.vae, b)
+    if cache is not None:
+        def cached(ids, pixels):
+            values = []
+            for post_id, image in zip(ids, pixels):
+                latent, shape = cache[str(post_id)]
+                if tuple(image.shape[-2:]) != shape:
+                    raise ValueError(f"Post {post_id}: image geometry differs from the latent cache")
+                values.append(latent.to(device))
+            return values if ragged else torch.stack(values)
+        with timer.measure("latent_cache"):
+            latents = cached(batch["id_a"], a)
+            reference = cached(batch["id_b"], b)
+    else:
+        with timer.measure("vae_encode_A"):
+            latents = encode_style_images(components.vae, a)
+        with timer.measure("vae_encode_B"):
+            reference = encode_style_images(components.vae, b)
     return dict(latents=latents, reference=reference, context=context, ref_context=ref_context, mask=None,
                 prompts=prompts)

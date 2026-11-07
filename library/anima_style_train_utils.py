@@ -20,11 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 class AnimaStyleVAE(nn.Module):
-    def __init__(self, model, factory=None):
+    def __init__(self, model, factory=None, dtype=None, source_path=None):
         super().__init__()
         self.model = model
         self.factory = factory
-        self._dtype = next(model.parameters()).dtype
+        self._dtype = next(model.parameters()).dtype if model is not None else dtype
+        self.source_path = source_path
+        self.spatial_compression_ratio = model.spatial_compression_ratio if model is not None else 8
+        self.z_dim = model.z_dim if model is not None else 16
 
     @property
     def dtype(self):
@@ -112,7 +115,8 @@ def build_anima_style_components(config, device):
         vae_path = weight("vae")
         def vae_factory():
             return qwen_image_autoencoder_kl.load_vae(vae_path, device="cpu", disable_cache=True)
-        vae = vae_factory()
+        # Imported offline latents need no VAE weights until a preview decode.
+        vae = None if config.get("latent_cache", {}).get("precomputed_dir") else vae_factory()
         text, _ = anima_utils.load_qwen3_text_encoder(assets["text_encoder"]["local_dir"], dtype, "cpu")
         tokenizer = strategy_anima.AnimaTokenizeStrategy(
             qwen3_path=assets["text_encoder"]["local_dir"], t5_tokenizer_path=assets["t5_tokenizer"]["local_dir"],
@@ -136,7 +140,8 @@ def build_anima_style_components(config, device):
         config["adapter_initialization"] = load_snapref_adapter(dit, path, options.get("mode", "cs"))
         logger.info("Loaded pretrained SnapRef reference + target LoRAs and mode=%s; both branches remain trainable",
                     config["adapter_initialization"]["mode"])
-    components = MossStyleComponents(dit, AnimaStyleVAE(vae, vae_factory), text, tokenizer, tagger, None, None)
+    components = MossStyleComponents(dit, AnimaStyleVAE(vae, vae_factory, dtype,
+        vae_path if config["initialization"] == "pretrained" else None), text, tokenizer, tagger, None, None)
     for module in components.frozen_modules():
         module.requires_grad_(False).eval().to(device=device)
         module._apply(lambda tensor: tensor.to(dtype) if tensor.is_floating_point() else tensor)

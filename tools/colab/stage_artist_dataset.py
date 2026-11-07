@@ -52,11 +52,11 @@ def source_identity(source):
     return dict(path=str(Path(source).resolve()), size=stat.st_size, mtime_ns=stat.st_mtime_ns)
 
 
-def copy_archive(source, output, storage, reserve_ram_bytes):
+def copy_archive(source, output, storage, reserve_ram_bytes, filename="dataset.tar"):
     identity = source_identity(source)
     if storage == "ram" and not is_tmpfs(output):
         raise ValueError("RAM output must be on a tmpfs mount such as /dev/shm; /content is local disk")
-    state_path, target = output / "copy.json", output / "dataset.tar"
+    state_path, target = output / "copy.json", output / filename
     state = json.loads(state_path.read_text()) if state_path.exists() else None
     if state is not None and state["source"] != identity:
         raise ValueError("Staging directory belongs to a different/changed archive; choose a new --output")
@@ -67,7 +67,7 @@ def copy_archive(source, output, storage, reserve_ram_bytes):
             write_index_json(state_path, dict(source=identity, complete=True, storage=storage))
         print(f"Reusing staged archive: {target} (no Drive image reads)", flush=True)
         return target, identity
-    partial = output / "dataset.tar.part"
+    partial = target.with_suffix(target.suffix + ".part")
     if state is None and (partial.exists() or target.exists()):
         raise ValueError("Untracked staging files found; choose a fresh --output")
     have = partial.stat().st_size if partial.exists() else 0

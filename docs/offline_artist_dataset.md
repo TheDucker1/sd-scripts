@@ -199,6 +199,10 @@ set `DATA_STORAGE='local'`: the notebook then stages to Colab's local SSD. Neith
 mode reads image data from Drive during training. Nothing silently falls back to
 Drive, and a Colab runtime reset requires staging again.
 
+To avoid VAE encoding on Colab, use the [VAE-only local cache worker](offline_anima_latents.md).
+It produces a separate portable latent-cache tar that the notebook stages to SSD,
+with optional CPU RAM loading. The image tar remains necessary for tagging and previews.
+
 The saved `pair_max_days` remains authoritative. The downloader counts only
 distinct unordered same-artist pairs within that window and drops images with no
 partner. The selected range can retain separate time clusters from the same artist: the training

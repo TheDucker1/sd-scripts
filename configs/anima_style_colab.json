@@ -8,6 +8,24 @@
   "latent_cache": {
     "reserve_ram_gib": 8
   },
+  "data": {
+    "datasets": [{
+      "batch_size": 2,
+      "resolution": [768, 768],
+      "enable_bucket": true,
+      "max_pixels": 589824,
+      "min_bucket_reso": 256,
+      "max_bucket_reso": 1536,
+      "bucket_reso_steps": 64,
+      "bucket_no_upscale": false,
+      "max_aspect_ratio": 3.0,
+      "repeat": true,
+      "shuffle_buffer": 0,
+      "shuffle_caption": true,
+      "resize_interpolation": "area",
+      "subsets": [{}]
+    }]
+  },
   "reference_adapter": {
     "format": "snapref_v1a",
     "mode": "cs"

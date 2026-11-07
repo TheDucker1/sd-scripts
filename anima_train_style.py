@@ -33,13 +33,18 @@ def setup_parser():
 class AnimaStyleTrainer(MossImageStyleTrainer):
     def prepare_dataset(self, components, loader, config, device):
         if config.get("cache_latents", False):
-            from library.anima_latent_cache import cache_anima_latents
+            from library.anima_latent_cache import cache_anima_latents, load_precomputed_anima_latents
 
-            cache_anima_latents(components, loader.dataset, config, device)
+            if config.get("latent_cache", {}).get("precomputed_dir"):
+                load_precomputed_anima_latents(components, loader.dataset, config)
+            else:
+                cache_anima_latents(components, loader.dataset, config, device)
 
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
             raise ValueError("Anima style training requires architecture=anima and content_loss=flow_l2")
+        if config.get("latent_cache", {}).get("precomputed_dir") and not config.get("cache_latents"):
+            raise ValueError("Enable cache_latents when using precomputed_dir")
         # Old uploaded notebooks can still carry the former auxiliary weights.
         config["training"].update(content_weight=1.0, style_weight=0.0)
         logger.info("Training objective: velocity L2 only; no perceptual encoders or training VAE decode")

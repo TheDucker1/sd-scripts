@@ -9,7 +9,7 @@ from unittest import mock
 import torch
 
 from library.anima_models import Anima
-from library.anima_reference import AnimaReference, install_reference_lora
+from library.anima_reference import AnimaReference, BranchLoRALinear, install_reference_lora
 
 
 class TestAnimaReference(unittest.TestCase):
@@ -48,6 +48,25 @@ class TestAnimaReference(unittest.TestCase):
                                         padding_mask=padding).squeeze(2)
             actual = self.model(self.x, self.t, self.context)
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+    def test_bf16_forward_preserves_small_fp32_optimizer_updates(self):
+        base = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        layer = BranchLoRALinear(base, ref=dict(rank=2, alpha=2), tgt=dict(rank=2, alpha=2))
+        with torch.no_grad():
+            for parameter in layer.parameters():
+                if parameter.requires_grad:
+                    parameter.fill_(0.125)
+        optimizer = torch.optim.SGD([parameter for parameter in layer.parameters() if parameter.requires_grad], lr=1e-5)
+        original = layer.lora_A.detach().clone()
+        result = layer(torch.ones(1, 4, dtype=torch.bfloat16))
+        self.assertEqual(result.dtype, torch.bfloat16)
+        result.float().sum().backward()
+        self.assertEqual(layer.lora_A.grad.dtype, torch.float32)
+        expected = original - 1e-5 * layer.lora_A.grad
+        optimizer.step()
+        self.assertFalse(torch.equal(original, layer.lora_A))
+        torch.testing.assert_close(layer.lora_A, expected, atol=1e-8, rtol=0)
+        self.assertIsNone(base.weight.grad)
 
     def test_exact_flow_velocity_has_zero_l2_and_recovers_clean_latent(self):
         from types import SimpleNamespace

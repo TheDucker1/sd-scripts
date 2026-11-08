@@ -23,7 +23,7 @@ REFERENCE_TARGETS = TARGET_TARGETS + ["mlp.layer1", "mlp.layer2", "cross_attn.q_
 
 
 class BranchLoRALinear(nn.Module):
-    """One frozen projection, two explicit independently trainable updates."""
+    """Frozen projection with FP32 trainable updates, cast only for computation."""
 
     def __init__(self, base, ref=None, tgt=None):
         super().__init__()
@@ -34,10 +34,11 @@ class BranchLoRALinear(nn.Module):
             if rank < 1 or options["alpha"] <= 0:
                 raise ValueError("LoRA rank and alpha must be positive")
             prefix = "ref" if stream == "ref" else "lora"
-            down = nn.Parameter(base.weight.new_empty(rank, base.in_features))
+            down = nn.Parameter(torch.empty(rank, base.in_features, device=base.weight.device, dtype=torch.float32))
             nn.init.kaiming_uniform_(down, a=math.sqrt(5))
             self.register_parameter(prefix + "_A", down)
-            self.register_parameter(prefix + "_B", nn.Parameter(base.weight.new_zeros(base.out_features, rank)))
+            self.register_parameter(prefix + "_B", nn.Parameter(torch.zeros(
+                base.out_features, rank, device=base.weight.device, dtype=torch.float32)))
 
     def adapter_metadata(self):
         return dict(branches=self.branches, in_features=self.base.in_features, out_features=self.base.out_features)
@@ -47,7 +48,9 @@ class BranchLoRALinear(nn.Module):
         if stream in self.branches:
             prefix = "ref" if stream == "ref" else "lora"
             options = self.branches[stream]
-            output = output + F.linear(F.linear(value, getattr(self, prefix + "_A")), getattr(self, prefix + "_B")) * (options["alpha"] / options["rank"])
+            down = getattr(self, prefix + "_A").to(value.dtype)
+            up = getattr(self, prefix + "_B").to(value.dtype)
+            output = output + F.linear(F.linear(value, down), up) * (options["alpha"] / options["rank"])
         return output
 
 
@@ -202,7 +205,7 @@ class AnimaReference(nn.Module):
         self.model = model
         # One trainable style mode, optionally seeded from upstream cs/char.
         # Like SnapRef, this embedding modifies reference timestep conditioning.
-        self.reference_mode = nn.Parameter(torch.zeros(model.model_channels, device=model.device, dtype=model.dtype))
+        self.reference_mode = nn.Parameter(torch.zeros(model.model_channels, device=model.device, dtype=torch.float32))
         if not 0 <= checkpoint_blocks <= len(model.blocks):
             raise ValueError("Invalid checkpoint_blocks")
         self.checkpoint_blocks = checkpoint_blocks
@@ -233,7 +236,7 @@ class AnimaReference(nn.Module):
                  round((target_hw[1] // patch - reference.shape[-1] // patch) / 2))
         zero = reference.new_zeros(reference.shape[0])
         ref, embedding, extra, rope = self.embed(reference, zero, 10, shift)
-        embedding = embedding + self.reference_mode[None, None]
+        embedding = embedding + self.reference_mode.to(embedding.dtype)[None, None]
         cache = []
         for index, block in enumerate(self.model.blocks):
             args = (block, ref, embedding, extra, context, rope)

@@ -15,6 +15,17 @@ Each reference block runs self-attention, caption cross-attention and MLP.
 Its pre-update self-attention K/V are supplied to the corresponding target block.
 Target text cross-attention continues to read the generation prompt.
 
+Production keeps the frozen base and forward computation in BF16. Both LoRA
+streams and the learned reference-mode embedding retain FP32 parameter storage
+and FP32 gradients for optimization, matching upstream SnapRef training. Forward
+casts remain differentiable; they do not replace the FP32 parameters. The base
+is cast before adapter creation, and startup checks/logs the trainable dtype.
+Trainer checkpoints retain these FP32 trainable tensors.
+
+Use a fresh `RUN_NAME` when retraining with this precision fix. The notebook's
+default run name has an `-fp32` suffix. Existing VAE latent caches remain valid:
+the VAE checkpoint, encoding dtype and image preprocessing are unchanged.
+
 Production training initializes both adapter streams from the published BF16
 `snapref_v1a.safetensors` checkpoint. Its `cs` (character + style) embedding
 initializes our single learned reference-mode vector, which is then finetuned

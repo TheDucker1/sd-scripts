@@ -54,7 +54,7 @@ class TestSnapRefLoad(unittest.TestCase):
             if name in self.expected:
                 torch.testing.assert_close(value.detach().float().cpu(), self.expected[name].to(value.dtype).float())
         torch.testing.assert_close(model.reference_mode.detach().float().cpu(),
-                                   self.weights["anima_ref_kv.mode_embed"][mode].to(model.dtype).float())
+                                   self.weights["anima_ref_kv.mode_embed"][mode].to(model.reference_mode.dtype).float())
 
     def test_imports_every_branch_and_cs_mode_without_changing_base(self):
         base = {name: value.detach().clone() for name, value in self.model.named_parameters() if not value.requires_grad}
@@ -105,17 +105,35 @@ class TestSnapRefLoad(unittest.TestCase):
         self.assertEqual(config["adapter_initialization"]["mode"], "cs")
         self.assertIsNone(components.style)
 
+    def test_bf16_builder_retains_fp32_trainable_storage(self):
+        from library.anima_style_train_utils import build_anima_style_components
+
+        config = copy.deepcopy(self.config)
+        config["dtype"] = "bfloat16"
+        config["reference_adapter"] = dict(format="snapref_v1a", path=str(self.path), mode="cs")
+        model = build_anima_style_components(config, torch.device("cpu")).dit
+        self.assert_imported(model)
+        for parameter in model.parameters():
+            self.assertEqual(parameter.dtype, torch.float32 if parameter.requires_grad else torch.bfloat16)
+
     @unittest.skipUnless(torch.cuda.is_available(), "Tiny CUDA import check requires a GPU")
     def test_gpu_import_and_optimizer_step_train_both_loaded_streams(self):
-        model = self.model.to(device="cuda", dtype=torch.bfloat16)
-        load_snapref_adapter(model, self.path)
+        from library.anima_style_train_utils import build_anima_style_components
+
+        config = copy.deepcopy(self.config)
+        config["dtype"] = "bfloat16"
+        config["reference_adapter"] = dict(format="snapref_v1a", path=str(self.path), mode="cs")
+        model = build_anima_style_components(config, torch.device("cuda")).dit
         self.assert_imported(model)
-        optimizer = torch.optim.AdamW([value for value in model.parameters() if value.requires_grad], lr=1e-3)
+        optimizer = torch.optim.AdamW([value for value in model.parameters() if value.requires_grad], lr=1e-4)
         inputs = torch.randn(1, 16, 4, 4, device="cuda", dtype=torch.bfloat16)
         context = torch.randn(1, 3, 32, device="cuda", dtype=torch.bfloat16)
         original = {name: value.detach().clone() for name, value in model.named_parameters() if value.requires_grad}
         prediction = model(inputs, torch.tensor([500.0], device="cuda"), context, inputs, ref_context=context)
+        self.assertEqual(prediction.dtype, torch.bfloat16)
         prediction.float().square().mean().backward()
+        self.assertTrue(all(value.dtype == value.grad.dtype == torch.float32
+                            for value in model.parameters() if value.requires_grad and value.grad is not None))
         optimizer.step()
         for suffix in ("ref_B", "lora_B"):
             self.assertTrue(any(name.endswith(suffix) and not torch.equal(value, original[name])

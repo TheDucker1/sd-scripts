@@ -123,11 +123,18 @@ def build_anima_style_components(config, device):
             qwen3_max_length=config.get("max_prompt_length", 256), t5_max_length=config.get("max_prompt_length", 256),
         )
         tagger = load_prompt_tagger(Path(assets["tagger"]["local_dir"]), config["tagger"], device)
+    # Cast/move the frozen base before creating trainable parameters. Casting the
+    # whole wrapper afterward would quantize the optimizer's parameter storage.
+    model = model.to(device=device, dtype=dtype)
     install_reference_lora(model, **config["adapter"])
     count = config.get("checkpoint_blocks")
     if count is None:
         count = len(model.blocks) if config.get("gradient_checkpointing", False) else 0
-    dit = AnimaReference(model, count).to(device=device, dtype=dtype)
+    dit = AnimaReference(model, count)
+    if any(parameter.dtype != torch.float32 for parameter in dit.parameters() if parameter.requires_grad):
+        raise RuntimeError("Anima trainable adapters and mode embedding must remain FP32")
+    logger.info("Anima precision: frozen base=%s; trainable reference/target adapters and mode embedding=float32",
+                dtype)
     if config.get("reference_adapter"):
         options = config["reference_adapter"]
         if options.get("format") != "snapref_v1a":

@@ -176,6 +176,7 @@ class MossImageStyleTrainer:
     def train_config(self, config, output_dir, device="cpu", compile_args=None, resume=None):
         validate_style_config(config)
         config = resolve_style_dataset_config(config)
+        checkpoint_dir = getattr(compile_args, "checkpoint_dir", None)
         seed = config.get("seed", 42)
         torch.manual_seed(seed)
         prompt_rng = random.Random(seed)
@@ -223,6 +224,7 @@ class MossImageStyleTrainer:
             prompt_rng.setstate(state["prompt_rng"])
         folder = Path(output_dir)
         folder.mkdir(parents=True, exist_ok=True)
+        checkpoint_root = Path(checkpoint_dir) if checkpoint_dir is not None else folder
         (folder / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         accumulation = train["gradient_accumulation_steps"]
         history = []
@@ -328,10 +330,11 @@ class MossImageStyleTrainer:
                     save_every = train.get("save_every", 0)
                     if step == train["max_steps"] or (save_every and step % save_every == 0):
                         save_style_checkpoint(
-                            folder / f"step-{step:06d}", components, optimizer, config, step, batches_seen, prompt_rng,
+                            checkpoint_root / f"step-{step:06d}", components, optimizer, config, step, batches_seen, prompt_rng,
                             scheduler=scheduler,
                         )
-                        prune_style_checkpoints(folder, train.get("keep_last_checkpoints", 0))
+                        if checkpoint_dir is None:
+                            prune_style_checkpoints(folder, train.get("keep_last_checkpoints", 0))
         finally:
             if writer is not None:
                 writer.close()
@@ -352,6 +355,7 @@ def setup_parser():
     add_logging_arguments(parser)
     parser.set_defaults(console_log_simple=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--checkpoint_dir", type=Path, help="Save checkpoints to a separate directory with external retention")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", help="Completed adapter/training-state checkpoint directory from this trainer")
     for name in ("batch_size", "gradient_accumulation_steps", "max_steps", "save_every", "keep_last_checkpoints",

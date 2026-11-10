@@ -571,7 +571,8 @@ def get_style_sampling_options(config):
     return options
 
 
-def save_style_checkpoint(folder, components, optimizer, config, step, batches_seen, prompt_rng, scheduler=None):
+def save_style_checkpoint(folder, components, optimizer, config, step, batches_seen, prompt_rng, scheduler=None, *,
+                          data_batches_seen=None):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     if (folder / "complete.json").exists():
@@ -619,6 +620,7 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
         dict(
             step=step,
             batches_seen=batches_seen,
+            data_batches_seen=batches_seen if data_batches_seen is None else data_batches_seen,
             optimizer=optimizer.state_dict(),
             scheduler=scheduler.state_dict() if scheduler is not None else None,
             torch_rng=torch.get_rng_state(),
@@ -697,11 +699,12 @@ def load_style_checkpoint(folder, components, optimizer, config):
     saved_config["training"].pop("max_steps")
     current_config["training"].pop("max_steps")
     if saved_config.get("architecture") == current_config.get("architecture") == "anima":
-        # Offline deterministic caching is an execution choice. Image geometry,
-        # augmentation, VAE assets and all optimizer settings still must match.
+        # Cache execution and stream positioning may change at resume. Image
+        # geometry, augmentation, VAE assets and optimizer settings must match.
         for value in (saved_config, current_config):
             for key in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir", "latent_cache"):
                 value.pop(key, None)
+            value["training"].pop("resume_data_mode", None)
     if saved_config != current_config:
         raise ValueError("Resume configuration differs from the saved run (except max_steps)")
     load_style_adapter_weights(folder, components.dit)

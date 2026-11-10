@@ -210,12 +210,14 @@ class MossImageStyleTrainer:
                 raise ValueError("This checkpoint has no scheduler state; cannot resume a scheduled run")
         stream = iter(loader)
         start, batches_seen = (state["step"], state["batches_seen"]) if state else (0, 0)
+        batches_before_stream = batches_seen
         if state:
             if train.get("resume_data_mode", "replay") == "replay":
-                # Compatibility for deterministic toy checks. Production resumes
-                # can restart the stream without seeking/replaying compressed tar.
-                for _ in range(batches_seen):
+                replay_batches = state.get("data_batches_seen", batches_seen)
+                logger.info("Restored training state at step %d; replaying %d dataset batches", start, replay_batches)
+                for _ in range(replay_batches):
                     next(stream)
+                batches_before_stream -= replay_batches
             else:
                 logger.info("Restored training state at step %d; restarting dataset stream without replay", start)
             torch.set_rng_state(state["torch_rng"])
@@ -331,7 +333,7 @@ class MossImageStyleTrainer:
                     if step == train["max_steps"] or (save_every and step % save_every == 0):
                         save_style_checkpoint(
                             checkpoint_root / f"step-{step:06d}", components, optimizer, config, step, batches_seen, prompt_rng,
-                            scheduler=scheduler,
+                            scheduler=scheduler, data_batches_seen=batches_seen - batches_before_stream,
                         )
                         if checkpoint_dir is None:
                             prune_style_checkpoints(folder, train.get("keep_last_checkpoints", 0))

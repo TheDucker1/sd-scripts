@@ -650,6 +650,41 @@ def prune_style_checkpoints(folder, keep):
         shutil.rmtree(path)
 
 
+def load_style_adapter_weights(folder, model, *, anima_warm_start=False):
+    folder = Path(folder)
+    weights_path = folder / "adapter_model.safetensors"
+    adapter_config = json.loads((folder / "adapter_config.json").read_text(encoding="utf-8"))
+    with weights_path.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    if adapter_config.get("weights_sha256") != digest:
+        raise ValueError("Adapter weights checksum mismatch")
+    with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
+        embedded = (handle.metadata() or {}).get("adapter_config")
+    if embedded is None or json.loads(embedded) != {key: value for key, value in adapter_config.items() if key != "weights_sha256"}:
+        raise ValueError("Adapter weights/config metadata mismatch")
+    if anima_warm_start:
+        if adapter_config.get("format") != "anima-reference-lora" or adapter_config.get("format_version") != 1:
+            raise ValueError("Expected a native Anima reference adapter checkpoint (format version 1)")
+        modules = {name: module.adapter_metadata() for name, module in model.named_modules() if hasattr(module, "adapter_metadata")}
+        if adapter_config.get("modules") != modules:
+            raise ValueError("Anima checkpoint adapter targets, ranks or alpha differ from the configured adapter")
+    weights = load_file(str(weights_path))
+    parameters = dict(model.named_parameters())
+    expected = {name for name, parameter in parameters.items() if parameter.requires_grad}
+    if weights.keys() != expected:
+        raise ValueError("Checkpoint adapter parameter names do not match")
+    for name, weight in weights.items():
+        if parameters[name].shape != weight.shape:
+            raise ValueError(f"Checkpoint adapter shape mismatch: {name}")
+        valid_dtype = weight.dtype in DTYPES.values() if anima_warm_start else weight.dtype == parameters[name].dtype
+        if not valid_dtype or not torch.isfinite(weight).all():
+            raise ValueError(f"Checkpoint adapter dtype or finite-value mismatch: {name}")
+    with torch.no_grad():
+        for name, weight in weights.items():
+            parameters[name].copy_(weight)
+    return adapter_config
+
+
 def load_style_checkpoint(folder, components, optimizer, config):
     folder = Path(folder)
     state = torch.load(folder / "training_state.pt", map_location="cpu", weights_only=True)
@@ -669,28 +704,7 @@ def load_style_checkpoint(folder, components, optimizer, config):
                 value.pop(key, None)
     if saved_config != current_config:
         raise ValueError("Resume configuration differs from the saved run (except max_steps)")
-    weights_path = folder / "adapter_model.safetensors"
-    adapter_config = json.loads((folder / "adapter_config.json").read_text(encoding="utf-8"))
-    with weights_path.open("rb") as handle:
-        digest = hashlib.file_digest(handle, "sha256").hexdigest()
-    if adapter_config.get("weights_sha256") != digest:
-        raise ValueError("Adapter weights checksum mismatch")
-    with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
-        embedded = (handle.metadata() or {}).get("adapter_config")
-    if embedded is None or json.loads(embedded) != {key: value for key, value in adapter_config.items() if key != "weights_sha256"}:
-        raise ValueError("Adapter weights/config metadata mismatch")
-    weights = load_file(str(weights_path))
-    parameters = dict(components.dit.named_parameters())
-    expected = {name for name, parameter in parameters.items() if parameter.requires_grad}
-    if weights.keys() != expected:
-        raise ValueError("Checkpoint adapter parameter names do not match")
-    with torch.no_grad():
-        for name, weight in weights.items():
-            if parameters[name].shape != weight.shape:
-                raise ValueError(f"Checkpoint adapter shape mismatch: {name}")
-            if parameters[name].dtype != weight.dtype or not torch.isfinite(weight).all():
-                raise ValueError(f"Checkpoint adapter dtype or finite-value mismatch: {name}")
-            parameters[name].copy_(weight)
+    load_style_adapter_weights(folder, components.dit)
     optimizer.load_state_dict(state["optimizer"])
     return state
 

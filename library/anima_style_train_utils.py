@@ -11,7 +11,7 @@ from library import anima_models, anima_utils, qwen_image_autoencoder_kl, strate
 from library.anima_reference import AnimaReference, install_reference_lora, load_snapref_adapter
 from library.moss_image_style_train_utils import (
     BytePromptTokenizer, DTYPES, MossStyleComponents, StylePromptTagger,
-    StyleStageTimer, encode_style_images,
+    StyleStageTimer, encode_style_images, load_style_adapter_weights,
 )
 from library.streaming_dataset import process_stream_caption
 
@@ -63,6 +63,14 @@ class AnimaStyleVAE(nn.Module):
 def build_anima_style_components(config, device):
     from transformers import Qwen3Config, Qwen3Model
 
+    reference_adapter = config.get("reference_adapter") or {}
+    adapter_format = reference_adapter.get("format")
+    adapter_path = reference_adapter.get("path")
+    if reference_adapter and adapter_format not in ("snapref_v1a", "anima_checkpoint"):
+        raise ValueError("reference_adapter.format must be snapref_v1a or anima_checkpoint")
+    if adapter_format == "anima_checkpoint" and not adapter_path:
+        raise ValueError("reference_adapter.path must point to the Anima checkpoint directory")
+
     dtype = DTYPES[config.get("dtype", "float32")]
     if config["initialization"] == "random":
         import timm
@@ -93,7 +101,7 @@ def build_anima_style_components(config, device):
 
         assets = json.loads(Path(config["assets_manifest"]).read_text(encoding="utf-8"))
         required = ["anima", "vae", "text_encoder", "t5_tokenizer", "tagger"]
-        if config.get("reference_adapter") and not config["reference_adapter"].get("path"):
+        if adapter_format == "snapref_v1a" and not adapter_path:
             required.append("snapref_adapter")
         for name in required:
             if name not in assets:
@@ -135,16 +143,18 @@ def build_anima_style_components(config, device):
         raise RuntimeError("Anima trainable adapters and mode embedding must remain FP32")
     logger.info("Anima precision: frozen base=%s; trainable reference/target adapters and mode embedding=float32",
                 dtype)
-    if config.get("reference_adapter"):
-        options = config["reference_adapter"]
-        if options.get("format") != "snapref_v1a":
-            raise ValueError("reference_adapter.format must be snapref_v1a")
-        path = options.get("path")
-        if path is None:
+    if adapter_format == "anima_checkpoint":
+        metadata = load_style_adapter_weights(adapter_path, dit, anima_warm_start=True)
+        config["adapter_initialization"] = dict(
+            format=adapter_format, checkpoint=Path(adapter_path).name, sha256=metadata["weights_sha256"],
+        )
+        logger.info("Initialized Anima reference and target adapters and mode embedding from %s (weights only)", adapter_path)
+    elif adapter_format == "snapref_v1a":
+        if adapter_path is None:
             if config["initialization"] != "pretrained":
                 raise ValueError("Random toy warm-starts require an explicit tiny reference_adapter.path")
-            path = weight("snapref_adapter")
-        config["adapter_initialization"] = load_snapref_adapter(dit, path, options.get("mode", "cs"))
+            adapter_path = weight("snapref_adapter")
+        config["adapter_initialization"] = load_snapref_adapter(dit, adapter_path, reference_adapter.get("mode", "cs"))
         logger.info("Loaded pretrained SnapRef reference + target LoRAs and mode=%s; both branches remain trainable",
                     config["adapter_initialization"]["mode"])
     components = MossStyleComponents(dit, AnimaStyleVAE(vae, vae_factory, dtype,

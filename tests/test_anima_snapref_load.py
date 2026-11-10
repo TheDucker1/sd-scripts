@@ -1,9 +1,11 @@
-"""Published-schema adapter imports using tiny synthetic safetensors only."""
+"""Anima adapter imports using tiny synthetic checkpoints only."""
 
 import copy
 import json
 from pathlib import Path
+import random
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from safetensors.torch import save_file
@@ -115,6 +117,26 @@ class TestSnapRefLoad(unittest.TestCase):
         self.assert_imported(model)
         for parameter in model.parameters():
             self.assertEqual(parameter.dtype, torch.float32 if parameter.requires_grad else torch.bfloat16)
+
+    def test_native_checkpoint_initializes_weights_without_training_state(self):
+        from library.anima_style_train_utils import build_anima_style_components
+        from library.moss_image_style_train_utils import save_style_checkpoint
+
+        load_snapref_adapter(self.model, self.path, mode="char")
+        parameters = [value for value in self.model.parameters() if value.requires_grad]
+        checkpoint = Path(self.temporary.name) / "step-000100"
+        save_style_checkpoint(checkpoint, SimpleNamespace(dit=self.model), torch.optim.SGD(parameters, lr=1e-4),
+                              self.config, 100, 200, random.Random(17))
+        (checkpoint / "training_state.pt").unlink()
+        (checkpoint / "complete.json").unlink()
+
+        config = copy.deepcopy(self.config)
+        config["training"]["max_steps"] = 123
+        config["dtype"] = "bfloat16"
+        config["reference_adapter"] = dict(format="anima_checkpoint", path=str(checkpoint))
+        components = build_anima_style_components(config, torch.device("cpu"))
+        self.assert_imported(components.dit, mode=1)
+        self.assertEqual(config["adapter_initialization"]["checkpoint"], checkpoint.name)
 
     @unittest.skipUnless(torch.cuda.is_available(), "Tiny CUDA import check requires a GPU")
     def test_gpu_import_and_optimizer_step_train_both_loaded_streams(self):

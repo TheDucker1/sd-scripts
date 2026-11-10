@@ -157,6 +157,17 @@ mode. It does not continue the upstream optimizer or reproduce its character
 training recipe, and pretrained image conditioning is not a guarantee of style
 transfer quality after finetuning.
 
+To initialize a new run from a checkpoint produced by this trainer, set
+`INIT_CHECKPOINT` in the notebook to the old `step-XXXXXX` directory and choose a
+new `RUN_NAME`. Use the latest step confirmed by `Drive verified step-XXXXXX`.
+For a manually configured launch, set `reference_adapter` to
+`{"format": "anima_checkpoint", "path": "/path/to/old/step-XXXXXX"}`.
+The source directory supplies `adapter_model.safetensors` and `adapter_config.json`.
+Keep the same Anima base and adapter configuration. Both LoRA branches and the
+learned mode initialize from the source, with fresh optimizer, scheduler, RNG,
+and step counter. Set the new `max_steps` before launching. Keep the source files
+available at the same path for future resumes of the new run.
+
 The notebook uses the staged RAM/local tar index and has its own Anima run name.
 It retains batch size 2, accumulation 2, a 768-square pixel budget with aspect
 buckets, AdamW8bit, the decaying cyclic cosine schedule, 1,000-step previews and

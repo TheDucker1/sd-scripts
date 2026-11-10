@@ -203,23 +203,32 @@ class MossImageStyleTrainer:
         loader = self.get_train_dataloader(config, device)
         self.prepare_dataset(components, loader, config, device)
         state = load_style_checkpoint(resume, components, optimizer, config) if resume else None
+        data_mode = train.get("resume_data_mode", "replay")
+        data_seed = seed
         if state:
             if state.get("scheduler") is not None:
                 scheduler.load_state_dict(state["scheduler"])
             elif train.get("lr_scheduler", "constant") != "constant" or train.get("warmup_steps", 0):
                 raise ValueError("This checkpoint has no scheduler state; cannot resume a scheduled run")
+            if data_mode == "replay":
+                data_seed = state.get("data_seed", seed)
+            elif data_mode == "reseed":
+                data_seed = random.SystemRandom().getrandbits(63)
+        if data_seed != seed:
+            loader.dataset.set_seed(data_seed)
+            loader.generator.manual_seed(data_seed)
         stream = iter(loader)
         start, batches_seen = (state["step"], state["batches_seen"]) if state else (0, 0)
         batches_before_stream = batches_seen
         if state:
-            if train.get("resume_data_mode", "replay") == "replay":
+            if data_mode == "replay":
                 replay_batches = state.get("data_batches_seen", batches_seen)
                 logger.info("Restored training state at step %d; replaying %d dataset batches", start, replay_batches)
                 for _ in range(replay_batches):
                     next(stream)
                 batches_before_stream -= replay_batches
             else:
-                logger.info("Restored training state at step %d; restarting dataset stream without replay", start)
+                logger.info("Restored training state at step %d; starting dataset stream with seed %d without replay", start, data_seed)
             torch.set_rng_state(state["torch_rng"])
             if state["cuda_rng"]:
                 torch.cuda.set_rng_state_all(state["cuda_rng"])
@@ -333,7 +342,7 @@ class MossImageStyleTrainer:
                     if step == train["max_steps"] or (save_every and step % save_every == 0):
                         save_style_checkpoint(
                             checkpoint_root / f"step-{step:06d}", components, optimizer, config, step, batches_seen, prompt_rng,
-                            scheduler=scheduler, data_batches_seen=batches_seen - batches_before_stream,
+                            scheduler=scheduler, data_batches_seen=batches_seen - batches_before_stream, data_seed=data_seed,
                         )
                         if checkpoint_dir is None:
                             prune_style_checkpoints(folder, train.get("keep_last_checkpoints", 0))

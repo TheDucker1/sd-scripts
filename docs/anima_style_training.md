@@ -169,11 +169,12 @@ and step counter. Set the new `max_steps` before launching. Keep the source file
 available at the same path for future resumes of the new run.
 
 For an existing Anima run, `RESUME_DATA_MODE = 'replay'` skips the consumed batches
-in the seeded stream before resuming. `'restart'` begins the stream again from its
-seed. You can switch modes with the same run name and checkpoint. Replay reads and
-preprocesses the skipped batches. New checkpoints record the stream position
-separately from the lifetime batch count. Older checkpoints only have the lifetime
-count, so replay skips that many batches even if a prior launch restarted the stream.
+in the seeded stream before resuming. `'restart'` starts again from the config seed.
+`'reseed'` draws a fresh dataset seed on each resume, so it can start sampling
+immediately after model and cache setup. You can switch modes with the same run name
+and checkpoint. Replay reads and preprocesses the skipped batches. New checkpoints
+record the stream position and active seed. Older checkpoints use the saved config
+seed and may fall back to the lifetime batch count.
 
 The notebook uses the staged RAM/local tar index and has its own Anima run name.
 It retains batch size 2, accumulation 2, a 768-square pixel budget with aspect

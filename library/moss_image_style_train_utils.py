@@ -504,8 +504,8 @@ def validate_style_config(config):
     if config["initialization"] == "pretrained" and not config.get("assets_manifest"):
         raise ValueError("Pretrained initialization requires the local resolved_models.json assets_manifest")
     train = config["training"]
-    if train.get("resume_data_mode", "replay") not in ("replay", "restart"):
-        raise ValueError("resume_data_mode must be replay or restart")
+    if train.get("resume_data_mode", "replay") not in ("replay", "restart", "reseed"):
+        raise ValueError("resume_data_mode must be replay, restart or reseed")
     for name in ("max_steps", "batch_size", "gradient_accumulation_steps"):
         if not isinstance(train[name], int) or train[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
@@ -572,7 +572,7 @@ def get_style_sampling_options(config):
 
 
 def save_style_checkpoint(folder, components, optimizer, config, step, batches_seen, prompt_rng, scheduler=None, *,
-                          data_batches_seen=None):
+                          data_batches_seen=None, data_seed=None):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     if (folder / "complete.json").exists():
@@ -621,6 +621,7 @@ def save_style_checkpoint(folder, components, optimizer, config, step, batches_s
             step=step,
             batches_seen=batches_seen,
             data_batches_seen=batches_seen if data_batches_seen is None else data_batches_seen,
+            data_seed=config.get("seed", 42) if data_seed is None else data_seed,
             optimizer=optimizer.state_dict(),
             scheduler=scheduler.state_dict() if scheduler is not None else None,
             torch_rng=torch.get_rng_state(),

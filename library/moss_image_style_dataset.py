@@ -133,6 +133,11 @@ class MossStylePairDataset(IterableDataset):
 
             self.artist_pairs = MossArtistPairs(artist_index, self.dataset, seed, index_fetch_workers, index_cache_bytes)
 
+    def set_seed(self, seed):
+        self.dataset.seed = seed
+        if self.artist_pairs is not None:
+            self.artist_pairs.seed = seed
+
     def __iter__(self):
         if self.artist_pairs is not None:
             yield from self.artist_pairs

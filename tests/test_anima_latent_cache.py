@@ -211,7 +211,7 @@ class TestAnimaLatentCache(unittest.TestCase):
         self.assertIsNone(components.vae.model)
         self.assertTrue((output / "step-000002/complete.json").is_file())
 
-    def test_switch_to_replay_after_restart_uses_stream_position(self):
+    def test_reseed_resumes_training_and_records_seed_and_stream_position_for_replay(self):
         config = json.loads(json.dumps(self.config))
         config["cache_latents"] = False
         config["sampling"]["enabled"] = False
@@ -219,11 +219,14 @@ class TestAnimaLatentCache(unittest.TestCase):
         output = self.root / "resume-data"
         self.trainer.train_config(config, output, "cpu")
 
-        config["training"]["max_steps"] = 2
-        self.trainer.train_config(config, output, "cpu", resume=output / "step-000001")
-        restarted = torch.load(output / "step-000002/training_state.pt", map_location="cpu", weights_only=True)
-        self.assertEqual(restarted["batches_seen"], 2)
-        self.assertEqual(restarted["data_batches_seen"], 1)
+        config["training"].update(max_steps=2, resume_data_mode="reseed")
+        with mock.patch.object(random.SystemRandom, "getrandbits", return_value=818):
+            _, history = self.trainer.train_config(config, output, "cpu", resume=output / "step-000001")
+        reseeded = torch.load(output / "step-000002/training_state.pt", map_location="cpu", weights_only=True)
+        self.assertEqual([row["step"] for row in history], [2])
+        self.assertEqual(reseeded["batches_seen"], 2)
+        self.assertEqual(reseeded["data_batches_seen"], 1)
+        self.assertEqual(reseeded["data_seed"], 818)
 
         config["training"].update(max_steps=3, resume_data_mode="replay")
         _, history = self.trainer.train_config(config, output, "cpu", resume=output / "step-000002")
@@ -231,6 +234,7 @@ class TestAnimaLatentCache(unittest.TestCase):
         self.assertEqual([row["step"] for row in history], [3])
         self.assertEqual(replayed["batches_seen"], 3)
         self.assertEqual(replayed["data_batches_seen"], 2)
+        self.assertEqual(replayed["data_seed"], 818)
 
     @unittest.skipUnless(torch.cuda.is_available(), "Tiny CUDA cache test requires a GPU")
     def test_gpu_training_cache_preview_reload_and_checkpoint(self):

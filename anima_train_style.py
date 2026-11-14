@@ -62,7 +62,7 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
             raise ValueError("Anima style training requires architecture=anima and content_loss=flow_l2")
         if config.get("latent_cache", {}).get("precomputed_dir") and not config.get("cache_latents"):
-            raise ValueError("Enable cache_latents when using precomputed_dir")
+            raise ValueError("Enable cache_latents when using a precomputed latent cache")
         # Old uploaded notebooks can still carry the former auxiliary weights.
         config["training"].update(content_weight=1.0, style_weight=0.0)
         logger.info("Training objective: velocity L2 only; no perceptual encoders or training VAE decode")

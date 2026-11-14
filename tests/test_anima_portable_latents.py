@@ -12,7 +12,7 @@ import torch
 
 import test_anima_latent_cache as fixtures
 from library import qwen_image_autoencoder_kl
-from library.anima_latent_cache import AnimaDiskLatentCache, load_precomputed_anima_latents
+from library.anima_latent_cache import AnimaDiskLatentCache, AnimaTarLatentCache, load_precomputed_anima_latents
 from library.anima_latent_archive import pack_latent_cache
 from library.anima_tag_cache import load_anima_tags
 from library.anima_style_train_utils import AnimaStyleVAE, build_anima_style_components
@@ -211,6 +211,44 @@ class TestPortableAnimaLatents(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing/corrupt"):
             load_precomputed_anima_latents(components, dataset, config)
         components.vae.factory.assert_not_called()
+
+    def test_train_cache_reads_staged_tar_without_extracting_npzs(self):
+        manifest = self.prepare()
+        archive = self.root / "latents.tar"
+        pack_latent_cache(self.output, archive)
+        staged = self.root / "packed-cache"
+        stage_latents(archive, staged, copy_only=True)
+        self.assertEqual(sorted(path.name for path in staged.iterdir()), ["copy.json", "latents.tar"])
+        reference, dataset, config = self.consumer()
+        load_precomputed_anima_latents(reference, dataset, config)
+        self.output = staged / "latents.tar"
+        for memory in (False, True):
+            components, dataset, config = self.consumer(memory=memory)
+            load_precomputed_anima_latents(components, dataset, config)
+            self.assertEqual(isinstance(components.latent_cache, AnimaTarLatentCache), not memory)
+            for post_id, (expected, shape) in reference.latent_cache.items():
+                actual, actual_shape = components.latent_cache[post_id]
+                self.assertEqual(actual_shape, shape)
+                torch.testing.assert_close(actual, expected)
+            components.vae.factory.assert_not_called()
+            if not memory:
+                components.latent_cache.reader.close()
+
+        first = manifest["entries"][0]
+        with tarfile.open(self.output, "r:") as tar:
+            offset = tar.getmember(first["file"]).offset_data
+        with self.output.open("r+b") as file:
+            file.seek(offset)
+            byte = file.read(1)[0]
+            file.seek(offset)
+            file.write(bytes([byte ^ 1]))
+        components, dataset, config = self.consumer()
+        load_precomputed_anima_latents(components, dataset, config)
+        try:
+            with self.assertRaisesRegex(ValueError, "Missing/corrupt"):
+                components.latent_cache[first["id"]]
+        finally:
+            components.latent_cache.reader.close()
 
     def test_ram_guard_and_unsafe_archives(self):
         self.prepare()

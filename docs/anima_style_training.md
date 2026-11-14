@@ -172,6 +172,9 @@ checked against the dataset and preprocessing settings at startup.
 Upload `tools/colab/anima_style_setup.ipynb` after pushing the branch. The notebook
 expects `images.tar`, `latents.tar` and `tag-cache.json` together under
 `MyDrive/moss-training/anima-1000-p10-512/`, and stages all three on Colab SSD.
+The trainer reads NPZ members by offset from the staged `latents.tar` and
+verifies each selected payload. It reads tags from the single JSON file.
+For local training, `--latent-cache PATH\TO\latents.tar` selects the same reader.
 The options cell sets the Drive path to `step-074000`. Setup reads that adapter's
 saved model revisions and downloads Anima base, Qwen3, the T5 tokenizer and the
 VAE for previews. The config loads tags from the staged JSON.

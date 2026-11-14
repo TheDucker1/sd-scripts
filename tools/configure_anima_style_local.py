@@ -24,7 +24,7 @@ def local_asset(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--latent-cache", type=Path, required=True, help="Directory containing latent-cache.json")
+    parser.add_argument("--latent-cache", type=Path, required=True, help="Portable latent tar or directory containing latent-cache.json")
     parser.add_argument("--tag-cache", type=Path, required=True, help="Portable tag-cache.json")
     parser.add_argument("--output", type=Path, required=True, help="Training config JSON to write")
     parser.add_argument("--pixels", type=int, default=512, help="Square root of the per-image pixel budget")

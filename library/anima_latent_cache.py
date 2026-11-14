@@ -20,8 +20,8 @@ from tqdm import tqdm
 from library.dataset import ImageInfo
 from library.moss_image_style_train_utils import encode_style_images
 from library.strategy_anima import AnimaLatentsCachingStrategy
-from library.danbooru_index import file_sha256, index_path, write_index_json
-from library.anima_latent_archive import LATENT_CACHE_FORMAT, read_latent_manifest
+from library.danbooru_index import LocalRangeReader, file_sha256, index_path, write_index_json
+from library.anima_latent_archive import LATENT_CACHE_FORMAT, index_latent_archive, read_latent_manifest, verify_latent_file
 from library.streaming_dataset import has_image_transparency, stream_rgb_image
 
 
@@ -98,7 +98,8 @@ def load_precomputed_anima_latents(components, dataset, config):
     pairs = dataset.artist_pairs
     options = config.get("latent_cache", {})
     root = Path(options["precomputed_dir"]).resolve()
-    manifest = read_latent_manifest(root)
+    archived = root.is_file()
+    manifest, members = index_latent_archive(root) if archived else (read_latent_manifest(root), {})
     expected = portable_cache_identity(pairs, portable_vae_identity(components.vae))
     if manifest["identity"] != expected:
         raise ValueError("Precomputed latent cache differs from this dataset, VAE, dtype or image geometry; rebuild it locally")
@@ -110,7 +111,8 @@ def load_precomputed_anima_latents(components, dataset, config):
         raise ValueError("Precomputed cache does not account for every dataset image")
     info = expected["vae"]
     strategy = AnimaLatentsCachingStrategy(True, 1, False, latents_stride=info["stride"])
-    disk = AnimaDiskLatentCache(strategy, components.vae.dtype, info["channels"])
+    disk = (AnimaTarLatentCache(strategy, components.vae.dtype, info["channels"], root) if archived
+            else AnimaDiskLatentCache(strategy, components.vae.dtype, info["channels"]))
     memory = options.get("load_to_memory", False)
     needed = sum(info["channels"] * math.prod(item["shape"]) // info["stride"]**2 for item in entries)
     needed *= torch.empty((), dtype=components.vae.dtype).element_size()
@@ -121,21 +123,23 @@ def load_precomputed_anima_latents(components, dataset, config):
     if memory and psutil.virtual_memory().available < needed + reserve:
         raise ValueError("Precomputed latents exceed available RAM plus the configured free RAM reserve")
     cache, valid = {}, []
-    for item in tqdm(entries, desc="Load precomputed latents", unit="image"):
-        path = index_path(root, item["file"])
-        if not path.is_file() or path.stat().st_size != item["bytes"] or file_sha256(path) != item["sha256"]:
-            raise ValueError(f"Missing/corrupt precomputed latent for post {item['id']}; restage the cache archive")
+    for item in tqdm(entries, desc="Index precomputed latents", unit="image"):
+        post_id = item["id"]
         shape = tuple(item["shape"])
         height, width = shape
         manager = pairs.processor.bucket_manager
         if (height % info["stride"] or width % info["stride"] or height * width > manager.max_area
                 or (not pairs.processor.params.bucket_no_upscale and (width, height) not in manager.predefined_resos)):
             raise ValueError(f"Precomputed latent shape differs from allowed buckets: {shape}")
-        value = disk.read(path, shape)
-        disk.entries[item["id"]] = (path, shape)
-        if memory:
-            cache[item["id"]] = value
-        valid.append(ids[item["id"]])
+        if archived:
+            disk.entries[post_id] = (members[item["file"]].offset_data, item["bytes"], item["sha256"], shape)
+        else:
+            disk.entries[post_id] = (verify_latent_file(root, item), shape)
+        if memory or not archived:
+            value = disk[post_id]
+            if memory:
+                cache[post_id] = value
+        valid.append(ids[post_id])
     pairs.restrict_to_indices(sorted(valid))
     active = {str(int(row["id"])) for row in pairs.rows}
     if active != selected:
@@ -161,7 +165,7 @@ class AnimaDiskLatentCache(Mapping):
 
     def read(self, path, shape):
         height, width = shape
-        latent, _, _, _, _ = self.strategy.load_latents_from_disk(str(path), (width, height))
+        latent, _, _, _, _ = self.strategy.load_latents_from_disk(path, (width, height))
         expected = (self.channels, height // self.strategy.latents_stride, width // self.strategy.latents_stride)
         if latent is None or tuple(latent.shape) != expected or not np.isfinite(latent).all():
             raise ValueError(f"Invalid cached latent shape/values: {path}")
@@ -171,6 +175,21 @@ class AnimaDiskLatentCache(Mapping):
     def __getitem__(self, key):
         path, shape = self.entries[key]
         return self.read(path, shape)
+
+
+class AnimaTarLatentCache(AnimaDiskLatentCache):
+    """Seek to the selected NPZ in a local tar and verify its payload before decoding."""
+
+    def __init__(self, strategy, dtype, channels, archive):
+        super().__init__(strategy, dtype, channels)
+        self.reader = LocalRangeReader(archive, archive.stat().st_size)
+
+    def __getitem__(self, key):
+        offset, size, digest, shape = self.entries[key]
+        payload = self.reader.fetch(offset, size)
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise ValueError(f"Missing/corrupt precomputed latent for post {key}; restage the cache archive")
+        return self.read(io.BytesIO(payload), shape)
 
 
 def cache_directory(config, pairs, vae):

@@ -45,6 +45,31 @@ def read_latent_manifest(root):
     return validate_latent_manifest(json.loads(path.read_text(encoding="utf-8")))
 
 
+def index_latent_archive(path):
+    """Read the manifest and member offsets from an uncompressed cache tar."""
+    with tarfile.open(path, "r:") as archive:
+        members = {}
+        for member in archive:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts or "\\" in member.name:
+                raise ValueError(f"Unsafe tar member name: {member.name!r}")
+            name = str(name)
+            if not member.isfile() or name in members:
+                raise ValueError("Latent archive contains duplicate or non-regular files")
+            members[name] = member
+        header = members.pop("latent-cache.json", None)
+        if header is None or header.size > 16 * 1024**2:
+            raise ValueError("Missing/oversized portable latent-cache manifest")
+        with archive.extractfile(header) as manifest_file:
+            manifest = validate_latent_manifest(json.load(manifest_file))
+        if members.keys() != {item["file"] for item in manifest["entries"]}:
+            raise ValueError("Latent archive files differ from its manifest")
+        for item in manifest["entries"]:
+            if members[item["file"]].size != item["bytes"]:
+                raise ValueError(f"Wrong-size latent-cache member: {item['file']}")
+    return manifest, members
+
+
 def verify_latent_file(root, item):
     path = index_path(root, item["file"])
     if not path.is_file() or path.stat().st_size != item["bytes"] or file_sha256(path) != item["sha256"]:

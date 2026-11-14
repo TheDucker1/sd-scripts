@@ -14,6 +14,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 import zipfile
 
 import httpx
@@ -25,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from download_artist_dataset import (
     ArchiveClient, InvalidArchiveImage, MultiRangeUnsupported, download_minimum_selection, download_selection, finalize_rows,
-    load_plan, pick_artist_range, prepare_source, read_journal, request_batches, save_image, save_minimum_plan, select_artists,
+    load_plan, main, pick_artist_range, prepare_source, read_journal, request_batches, save_image, save_minimum_plan, select_artists,
 )
 from pack_artist_dataset import pack_dataset
 
@@ -248,6 +249,44 @@ class TestArtistDownload(unittest.TestCase):
         self.assertEqual(final["artist_pair_counts"], [1, 1])
         saved = json.loads((output / "selection.json").read_text())
         self.assertIn(bad_id, saved["excluded_post_ids"])
+
+    def test_resume_replaces_oversized_post_without_rerolling_other_artist(self):
+        source, output = self.root / "source", self.root / "oversized"
+        output.mkdir()
+        selected = select_artists(self.rows, self.artists, 365, 2, 1, 42)[0]
+        oversized_id = selected[0]["id"]
+        self.rows["size"][self.rows["id"] == oversized_id] = 1024**2
+        write_index_arrays(source / "artist-index.npz", images=self.rows, artists=self.artists)
+        manifest = dict(self.manifest, index_sha256=file_sha256(source / "artist-index.npz"),
+                        archives=[dict(self.manifest["archives"][0], size=2 * 1024**2)])
+        write_index_json(source / "manifest.json", manifest)
+        settings = dict(source_sha256=manifest["index_sha256"], artists=2, min_pairs=1, seed=42, pair_max_days=365)
+        original = save_minimum_plan(output, manifest, self.rows, self.artists, settings)
+        write_index_json(output / "selection.json", dict(original, selection_policy="random-start-min-end-v1"))
+
+        argv = ["download_artist_dataset.py", "--index", str(source), "--output", str(output),
+                "--artists", "2", "--min-pairs", "1", "--response-mib", "1", "--dry-run"]
+        with mock.patch.object(sys, "argv", argv):
+            main()
+        repaired, _, _ = load_plan(output, json.loads((output / "selection.json").read_text()))
+        self.assertNotIn(oversized_id, repaired["id"])
+        np.testing.assert_array_equal(repaired["id"][repaired["artist"] == 1], selected["id"][selected["artist"] == 1])
+        self.assertTrue(all(row["size"] + 512 <= 1024**2 for row in repaired))
+
+    def test_rejected_image_needs_no_repair_if_all_artists_still_qualify(self):
+        output = self.root / "already-qualified"
+        output.mkdir()
+        row = self.rows[0]
+        start, size = int(row["offset"]), int(row["size"])
+        body = self.body[:start] + b"x" * size + self.body[start + size:]
+        with server(body) as (url, state):
+            manifest = dict(self.manifest, archives=[dict(self.manifest["archives"][0], url=url)])
+            args = SimpleNamespace(ranges_per_request=1, response_mib=1, http1=True, retries=1, timeout=3,
+                                   request_interval=0, workers=2, retry_skipped=False, min_pairs=1, require_all_artists=True)
+            final = download_selection(output, manifest, self.rows, self.artists, ["images/a", "images/b"], args)
+        self.assertEqual(final["artist_pair_counts"], [1, 3])
+        self.assertEqual(final["skipped_image_count"], 1)
+        self.assertEqual(len(state.requests), len(self.rows))
 
     def test_batch_intervals_are_exact_never_merged(self):
         batches = list(request_batches(self.rows, np.ones(len(self.rows), dtype=bool), 2, 1024**2))

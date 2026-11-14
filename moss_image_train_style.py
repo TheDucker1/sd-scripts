@@ -47,7 +47,7 @@ class MossImageStyleTrainer:
         setup_logging(args, reset=True)
         torch.set_num_threads(args.num_threads)
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        for name in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir"):
+        for name in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir", "tag_cache"):
             value = getattr(args, name, None)
             if value is not None:
                 config[name] = value
@@ -194,7 +194,7 @@ class MossImageStyleTrainer:
                         len(components.dit.layers))
             logger.info("Component weight dtypes: DiT=%s VAE=%s Qwen=%s tagger=%s DINO=%s style=%s",
                         components.dit.dtype, components.vae.dtype, next(components.text_encoder.parameters()).dtype,
-                        next(components.tagger.parameters()).dtype,
+                        next(components.tagger.parameters()).dtype if components.tagger is not None else "cached",
                         next(components.content.parameters()).dtype if components.content is not None else "disabled (flow L2)",
                         next(components.style.parameters()).dtype if components.style is not None else "disabled")
         parameters = [parameter for parameter in components.dit.parameters() if parameter.requires_grad]

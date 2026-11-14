@@ -129,33 +129,52 @@ and saving/restoring both branches.
 invalid checkpoint rejection before mutation, component integration and a tiny
 CUDA optimizer step. All its checkpoint tensors are synthetic and small.
 
+## Offline tags and local BF16 training
+
+The tag worker reads the completed artist index and uses the same resize, PixAI
+preprocessing, thresholds and prompt categories as training. It commits each
+finished batch and shows progress. Rerun the command with the same output
+directory to continue. Training reads `tag-cache.json` once, then applies the
+usual tag shuffling, dropout and caption rules before encoding text with Qwen.
+With portable latents, training reads only the selected captions and latents.
+The prefetch worker loads the latent batches from SSD while the GPU works.
+Preview triptychs read their source images on demand.
+
+Transparent pixels are composited onto white before resizing. Re-export older
+portable latent caches with the current worker and choose a new archive name.
+Using the same VAE cache output directory reuses the existing NPZs for opaque
+images. Build the tag cache in a new output directory to refresh its captions.
+
+On Windows, run the following from the repo root with the existing `ml`
+environment. Replace the source checkpoint with your downloaded Anima step
+directory. Use `--snapref PATH` in place of `--init-checkpoint PATH` to start
+from a published SnapRef adapter. Set `--steps` before the first launch.
+
+```powershell
+$py = 'C:\Users\d\.conda\envs\ml\python.exe'
+& $py tools/configure_anima_style_local.py --dataset artists-pair-dataset --latent-cache work/anima-local/latents --tag-cache work/anima-local/tags/tag-cache.json --output work/anima-local/train.json --init-checkpoint 'C:\checkpoints\step-039000' --steps 100000
+& $py tools/cache_anima_artist_tags.py --config work/anima-local/train.json --dataset artists-pair-dataset --output work/anima-local/tags --tagger models/wd_taggers/pixai-tagger-v1.0-timm
+& $py tools/cache_anima_artist_latents.py --config work/anima-local/train.json --dataset artists-pair-dataset --output work/anima-local/latents --vae models/vae/qwen_image_vae.safetensors
+& $py anima_train_style.py --config work/anima-local/train.json --output_dir work/anima-local/run --device cuda --num_threads 4
+```
+
+The generated config starts with a 512² per-image budget, batch size one,
+accumulation two, BF16 base and Qwen, FP32 adapters, and AdamW8bit. It runs Qwen
+on the CPU and trims trailing padding before text encoding. The DiT still sees
+the original fixed-length conditioning. All 28 paired blocks use checkpointing,
+and their saved inputs copy asynchronously to pinned RAM. The local profile
+disables previews and per-stage CUDA synchronization. To reuse existing tags and latents, use the
+same `--pixels`, bucket settings, and VAE as their source config. Both caches are
+checked against the dataset and preprocessing settings at startup.
+
 ## Colab
 
-Upload `tools/colab/anima_style_setup.ipynb` after pushing the branch. Its setup
-cell explicitly selects `configs/anima_colab_models.json` while reusing the existing
-isolated environment installer. The manifest downloads Anima **base v1.0** (not
-turbo), Qwen3-0.6B-Base, Qwen Image VAE, T5 tokenizer files only, PixAI and the
-published BF16 SnapRef v1a adapter (pinned to a specific upstream commit).
-It excludes MOSS, Qwen3.5-9B, DINO and MegaStyle. Downloads pin model revisions;
-the trainer validates local files before loading. No full-size model was tested
-on the workstation; memory fit must be checked on the Colab host.
-The Anima asset manifest omits remote dataset discovery; setup downloads only the
-models/tokenizers. Dataset preparation uses the uploaded offline tar.
-
-Rerun setup after updating an older Colab checkout so `resolved_models.json`
-includes `snapref_adapter`. Use a new run name to begin from the published adapter;
-the notebook's default name has changed accordingly. The preset contains
-`reference_adapter = {"format": "snapref_v1a", "mode": "cs"}`. An explicit `path`
-may be supplied for a local upstream-format checkpoint; ranks and alpha must match
-the configured adapter. Random toy presets remain randomly initialized unless an
-explicit tiny adapter fixture is requested.
-
-This is a weight warm-start, with a fresh optimizer/scheduler. Normal `--resume`
-subsequently restores our own adapter, mode vector, optimizer and scheduler states.
-Checkpoint metadata records the initial adapter's revision, SHA256 and selected
-mode. It does not continue the upstream optimizer or reproduce its character
-training recipe, and pretrained image conditioning is not a guarantee of style
-transfer quality after finetuning.
+Upload `tools/colab/anima_style_setup.ipynb` after pushing the branch. The notebook
+expects `images.tar`, `latents.tar` and `tag-cache.json` together under
+`MyDrive/moss-training/anima-1000-p10-512/`, and stages all three on Colab SSD.
+The options cell sets the Drive path to `step-074000`. Setup reads that adapter's
+saved model revisions and downloads Anima base, Qwen3, the T5 tokenizer and the
+VAE for previews. The config loads tags from the staged JSON.
 
 To initialize a new run from a checkpoint produced by this trainer, set
 `INIT_CHECKPOINT` in the notebook to the old `step-XXXXXX` directory and choose a
@@ -176,20 +195,14 @@ and checkpoint. Replay reads and preprocesses the skipped batches. New checkpoin
 record the stream position and active seed. Older checkpoints use the saved config
 seed and may fall back to the lifetime batch count.
 
-The notebook uses the staged RAM/local tar index and has its own Anima run name.
-It retains batch size 2, accumulation 2, a 768-square pixel budget with aspect
-buckets, AdamW8bit, the decaying cyclic cosine schedule, 1,000-step previews and
-adapter/resume saves, and retention of three checkpoints. `CHECKPOINT_BLOCKS=0`
-disables recomputation; an integer selects the first N blocks. Both reference and
-target block functions support per-block `torch.compile` with Inductor. Whole-model
-compilation is explicitly rejected. Preview JPEGs are ordered A, B, generated
-result, with a JSON sidecar containing prompt, seed and source IDs.
-
-After updating an existing Colab checkout, use a new `RUN_NAME` for the velocity-only
-recipe. Old uploaded notebooks may still set `style_weight` or decoder/feature
-checkpointing flags: Anima normalizes the saved loss weights to content 1/style 0,
-and these checkpointing flags have no work to checkpoint during training. Existing
-MegaStyle files in the model directory are ignored and need not be downloaded again.
+The run uses batch size one, accumulation two, a 512-square pixel budget with
+aspect buckets, AdamW8bit, and the decaying cyclic cosine schedule. It defaults
+to 100,000 optimizer updates with previews and saves every 1,000 updates. The
+background uploader verifies each checkpoint on Drive and retains the latest
+three. `CHECKPOINT_BLOCKS=0` disables recomputation. If the assigned GPU runs
+out of memory, set `CHECKPOINT_BLOCKS=28` and rerun the settings and launch cells.
+`COMPILE` controls per-block Inductor compilation. Preview JPEGs are ordered A, B,
+generated result, with a JSON sidecar containing prompt, seed and source IDs.
 
 ## Investigating degraded previews
 

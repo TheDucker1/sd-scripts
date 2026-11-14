@@ -13,7 +13,7 @@ import zipfile
 
 import numpy as np
 import psutil
-from PIL import Image, ImageOps
+from PIL import Image
 import torch
 from tqdm import tqdm
 
@@ -22,6 +22,7 @@ from library.moss_image_style_train_utils import encode_style_images
 from library.strategy_anima import AnimaLatentsCachingStrategy
 from library.danbooru_index import file_sha256, index_path, write_index_json
 from library.anima_latent_archive import LATENT_CACHE_FORMAT, read_latent_manifest
+from library.streaming_dataset import has_image_transparency, stream_rgb_image
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def portable_vae_identity(vae):
     return dict(sha256=digest, stride=vae.spatial_compression_ratio, channels=vae.z_dim, dtype=str(vae.dtype))
 
 
-def portable_cache_identity(pairs, vae_identity):
+def portable_artist_identity(pairs):
     """Same identity for local images and their repacked/staged tar equivalent."""
     subset = validate_cache_dataset(pairs)
     digest = hashlib.sha256()
@@ -66,10 +67,14 @@ def portable_cache_identity(pairs, vae_identity):
                 ("enable_bucket", "bucket_no_upscale", "bucket_reso_steps", "max_aspect_ratio", "resolution")}
     geometry.update(max_area=manager.max_area, buckets=manager.predefined_resos,
                     interpolation=subset.resize_interpolation or processor.resize_interpolation,
-                    skip_image_resolution=processor.skip_image_resolution)
+                    skip_image_resolution=processor.skip_image_resolution, alpha_background="white")
     # Normalize tuples/arrays to the same JSON values read on another machine.
     return json.loads(json.dumps(dict(version=1, images_sha256=digest.hexdigest(), image_count=len(pairs.rows),
-        pair_max_days=pairs.manifest["pair_max_days"], geometry=geometry, vae=vae_identity)))
+        pair_max_days=pairs.manifest["pair_max_days"], geometry=geometry)))
+
+
+def portable_cache_identity(pairs, vae_identity):
+    return dict(portable_artist_identity(pairs), vae=vae_identity)
 
 
 def export_anima_latents(root, cache, identity, source_ids):
@@ -258,14 +263,17 @@ def cache_anima_latents(components, dataset, config, device):
         for index, row in enumerate(pairs.rows):
             post_id = str(int(row["id"]))
             with Image.open(io.BytesIO(pairs.fetch(index))) as source:
-                image = ImageOps.exif_transpose(source).convert("RGB")
+                transparent = has_image_transparency(source)
+                image = stream_rgb_image(source)
             processed = pairs.processor._process_image(image, subset, random.Random(config.get("seed", 42) + int(row["id"])))
             if processed is None:
                 bar.update(1)
                 continue
             path, info = None, None
             if disk:
-                path = Path(strategy.get_latents_npz_path(str(root / f"{post_id}.jpg"), image.size))
+                # Preserve hits for images whose pixels are unaffected by compositing.
+                filename = f"{post_id}-white-alpha.jpg" if transparent else f"{post_id}.jpg"
+                path = Path(strategy.get_latents_npz_path(str(root / filename), image.size))
                 shape = tuple(processed["image"].shape[-2:])
                 try:
                     ready = strategy.is_disk_cached_latents_expected(tuple(processed["bucket_reso"]), str(path), False, False)

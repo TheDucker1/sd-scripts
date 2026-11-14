@@ -11,10 +11,11 @@ import tarfile
 import threading
 
 import numpy as np
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 import torch
 
 from library.danbooru_index import LocalRangeReader, RemoteRangeReader, index_path, load_artist_index, validate_archive_image
+from library.streaming_dataset import stream_rgb_image
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class MossArtistPairs:
         self.fetch_workers, self.cache_bytes = fetch_workers, cache_bytes
         self.cache, self.cached_bytes, self.cache_lock = OrderedDict(), 0, threading.Lock()
         self.metadata_mismatches = 0
+        self.skip_image_reads = False
         count = len(self.rows)
         self._build_pair_bounds()
         self.local_root = None
@@ -152,7 +154,11 @@ class MossArtistPairs:
 
     def process(self, payload, rng):
         with Image.open(io.BytesIO(payload)) as image:
-            return self.processor._process_image(ImageOps.exif_transpose(image).convert("RGB"), self.processor.subsets[0], rng)
+            return self.processor._process_image(stream_rgb_image(image), self.processor.subsets[0], rng)
+
+    def preview_image(self, post_id):
+        index, = np.flatnonzero(self.rows["id"] == int(post_id))
+        return self.process(self.fetch(index), random.Random(int(post_id)))["image"].unsqueeze(0)
 
     def __iter__(self):
         if torch.utils.data.get_worker_info() is not None:
@@ -168,6 +174,12 @@ class MossArtistPairs:
                 b = rng.randrange(left, right - 1)
                 if b >= a:
                     b += 1
+                pair = dict(id_a=str(self.rows[a]["id"]), id_b=str(self.rows[b]["id"]))
+                if self.skip_image_reads:
+                    subset = self.processor.subsets[0]
+                    count += 1
+                    yield dict(pair, subsets_a=subset, subsets_b=subset)
+                    continue
                 futures = [pool.submit(self.fetch, index) for index in (a, b)]
                 try:
                     payloads = [future.result() for future in futures]
@@ -190,8 +202,8 @@ class MossArtistPairs:
                 count += 1
                 image_a, image_b = processed
                 yield dict(
+                    pair,
                     image_a=image_a["image"], image_b=image_b["image"],
-                    id_a=str(self.rows[a]["id"]), id_b=str(self.rows[b]["id"]),
                     subsets_a=image_a["subset"], subsets_b=image_b["subset"],
                     original_sizes_a=image_a["original_size"], original_sizes_b=image_b["original_size"],
                 )

@@ -163,8 +163,7 @@ class TestAnimaReference(unittest.TestCase):
         pair = dict(image_a=clean, image_b=clean, id_a=["1"], id_b=["2"])
         config = dict(seed=42, training={}, sampling=dict(num_pairs=1, steps=3, guidance_scale=1.0, flow_shift=5))
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as folder:
-            with mock.patch("anima_train_style.prepare_anima_batch", return_value=prepared), \
-                    mock.patch("anima_train_style.anima_context", side_effect=AssertionError("Unneeded negative branch")):
+            with mock.patch("anima_train_style.prepare_anima_batch", return_value=prepared):
                 AnimaStyleTrainer().sample_images(components, iter([pair]), config, folder, 0, 0)
         self.assertEqual(model.calls, 3)
         torch.testing.assert_close(captured[0], clean, atol=3e-7, rtol=1e-5)
@@ -208,6 +207,52 @@ class TestAnimaReference(unittest.TestCase):
             self.assertTrue(any(name.endswith(suffix) and parameter.grad is not None and parameter.grad.abs().sum() > 0
                                 for name, parameter in parameters.items()))
         self.assertTrue(all(parameter.grad is None for name, parameter in parameters.items() if not parameter.requires_grad))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Requires CUDA to move checkpoint inputs between devices")
+    def test_bf16_cpu_checkpoint_inputs_preserve_cuda_gradients(self):
+        # Move frozen weights separately so trainable adapters keep FP32 storage.
+        self.model.cuda()
+        with torch.no_grad():
+            for parameter in self.model.parameters():
+                if not parameter.requires_grad:
+                    parameter.data = parameter.to(torch.bfloat16)
+        self.model.checkpoint_blocks = len(self.model.layers)
+        inputs = [value.to(device="cuda", dtype=torch.bfloat16) for value in (self.x, self.context, self.ref, self.ref_context)]
+        x, context, ref, ref_context = inputs
+        timesteps = self.t.cuda()
+
+        def gradients():
+            self.model.zero_grad(set_to_none=True)
+            output = self.model(x, timesteps, context, ref, ref_context=ref_context)
+            output.float().square().mean().backward()
+            return {name: value.grad.clone() for name, value in self.model.named_parameters() if value.grad is not None}
+
+        expected = gradients()
+        self.model.checkpoint_cpu_offload = True
+        offloaded = gradients()
+        self.assertTrue(any(name.endswith("ref_B") and value.abs().sum() > 0 for name, value in offloaded.items()))
+        self.assertTrue(any(name.endswith("lora_B") and value.abs().sum() > 0 for name, value in offloaded.items()))
+        torch.testing.assert_close(offloaded, expected)
+
+    def test_text_padding_trim_preserves_conditioning_shape_and_values(self):
+        from types import SimpleNamespace
+        from transformers import Qwen3Config, Qwen3Model
+
+        from library.anima_models import LLMAdapter
+        from library.anima_style_train_utils import anima_context
+
+        text = Qwen3Model(Qwen3Config(vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                                     num_attention_heads=4, num_key_value_heads=2, head_dim=8, use_cache=False)).eval()
+        self.model.model.llm_adapter = LLMAdapter(32, 32, 32, num_layers=1, num_heads=4, self_attn=True).eval()
+        ids = torch.tensor([[3, 4, 0, 0, 0], [0, 0, 0, 0, 0]])
+        target = torch.tensor([[7, 8, 1, 0, 0, 0], [1, 0, 0, 0, 0, 0]])
+        tokenizer = SimpleNamespace(tokenize=lambda _: [ids, ids.ne(0), target, target.ne(0)])
+        components = SimpleNamespace(dit=self.model, text_encoder=text, tokenizer=tokenizer, trim_text_padding=False)
+        expected = anima_context(components, ["sample", ""], "cpu")
+        components.trim_text_padding = True
+        actual = anima_context(components, ["sample", ""], "cpu")
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(actual.shape, (2, 6, 32))
 
     def test_adapter_checkpoint_restores_both_branches(self):
         import tempfile

@@ -36,6 +36,22 @@ logger = logging.getLogger(__name__)
 _stream_random_lock = threading.RLock()
 
 
+def has_image_transparency(image):
+    return "transparency" in image.info or any(band in ("A", "a") for band in image.getbands())
+
+
+def stream_rgb_image(image):
+    image = ImageOps.exif_transpose(image)
+    if not has_image_transparency(image):
+        return image.convert("RGB")
+    if image.mode == "La":
+        image = image.convert("LA")
+    rgba = image.convert("RGBA")
+    background = Image.new("RGB", rgba.size, "white")
+    background.paste(rgba, mask=rgba.getchannel("A"))
+    return background
+
+
 class PrefetchIterator:
     """One bounded producer for CPU batches; never touches training components."""
 
@@ -390,7 +406,7 @@ class StreamingDataset(BaseDataset, torch.utils.data.IterableDataset):
                                 raise tarfile.ReadError(f"Incomplete member {member.name}")
                             try:
                                 with Image.open(io.BytesIO(payload)) as image:
-                                    result = self._process_image(ImageOps.exif_transpose(image).convert("RGB"), subset, rng)
+                                    result = self._process_image(stream_rgb_image(image), subset, rng)
                             except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as error:
                                 logger.warning("Skipping corrupt stream image %s in %s: %s", member.name, source, error)
                                 continue

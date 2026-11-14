@@ -23,6 +23,7 @@ from library import qwen_image_autoencoder_kl
 from library.danbooru_index import IMAGE_DTYPE, file_sha256, write_index_arrays, write_index_json
 from library.moss_image_style_dataset import read_image_pairs_batch, resolve_style_dataset_config
 from library.moss_image_style_train_utils import style_objective
+from library.streaming_dataset import stream_rgb_image
 
 
 class TestAnimaLatentCache(unittest.TestCase):
@@ -96,6 +97,43 @@ class TestAnimaLatentCache(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "free RAM reserve"):
                 cache_anima_latents(components, dataset, self.config, "cpu")
         self.assertIsNotNone(components.vae.model)
+
+    def test_rgba_and_palette_transparency_composite_on_white(self):
+        rgba = Image.new("RGBA", (2, 1))
+        rgba.putdata([(0, 0, 0, 0), (255, 0, 0, 128)])
+        palette = Image.new("P", (2, 1))
+        palette.putpalette([0, 0, 0, 255, 0, 0])
+        palette.putdata([0, 1])
+        palette.info["transparency"] = bytes([0, 128])
+        for image in (rgba, palette):
+            with self.subTest(mode=image.mode):
+                result = stream_rgb_image(image)
+                self.assertEqual(result.getpixel((0, 0)), (255, 255, 255))
+                self.assertEqual(result.getpixel((1, 0)), (255, 127, 127))
+
+    def test_transparent_latent_replaces_old_entry_and_opaque_entries_are_reused(self):
+        self.config.update(cache_latents_to_disk=True, latent_cache_dir=str(self.root / "ssd"))
+        components, dataset = self.components_and_dataset()
+        cache_anima_latents(components, dataset, self.config, "cpu")
+        old_entries = components.latent_cache.entries
+
+        fixed, dataset = self.components_and_dataset()
+        pairs = dataset.artist_pairs
+        stream = io.BytesIO()
+        Image.new("RGBA", (8, 6), (12, 34, 56, 0)).save(stream, format="PNG")
+        fetch = pairs.fetch
+        pairs.fetch = lambda index: stream.getvalue() if index == 0 else fetch(index)
+        preview = pairs.preview_image("100")
+        torch.testing.assert_close(preview, torch.ones_like(preview))
+        with mock.patch.object(fixed.vae.model, "encode_pixels_to_latents",
+                               wraps=fixed.vae.model.encode_pixels_to_latents) as encode:
+            cache_anima_latents(fixed, dataset, self.config, "cpu")
+        self.assertEqual(encode.call_count, 1)
+        pixels = encode.call_args.args[0]
+        torch.testing.assert_close(pixels, torch.ones_like(pixels))
+        self.assertNotEqual(fixed.latent_cache.entries["100"], old_entries["100"])
+        self.assertEqual({key: entry for key, entry in fixed.latent_cache.entries.items() if key != "100"},
+                         {key: entry for key, entry in old_entries.items() if key != "100"})
 
     def test_standard_cache_arguments_and_disk_implies_caching(self):
         args = setup_parser().parse_args(["--config", "unused", "--output_dir", str(self.root),

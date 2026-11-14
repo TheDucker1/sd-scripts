@@ -209,6 +209,8 @@ class AnimaReference(nn.Module):
         if not 0 <= checkpoint_blocks <= len(model.blocks):
             raise ValueError("Invalid checkpoint_blocks")
         self.checkpoint_blocks = checkpoint_blocks
+        self.checkpoint_cpu_offload = False
+        self._checkpoint_copy_stream = None
         for index, block in enumerate(model.blocks):
             block.gradient_checkpointing = index < checkpoint_blocks
 
@@ -230,13 +232,17 @@ class AnimaReference(nn.Module):
         embedding, extra = model.t_embedder(sigma[:, None])
         return tokens, model.t_embedding_norm(embedding), extra, rope
 
-    def encode_reference(self, reference, context, target_hw):
+    def embed_reference(self, reference, target_hw):
         patch = self.model.patch_spatial
         shift = (round((target_hw[0] // patch - reference.shape[-2] // patch) / 2),
                  round((target_hw[1] // patch - reference.shape[-1] // patch) / 2))
         zero = reference.new_zeros(reference.shape[0])
         ref, embedding, extra, rope = self.embed(reference, zero, 10, shift)
         embedding = embedding + self.reference_mode.to(embedding.dtype)[None, None]
+        return ref, embedding, extra, rope
+
+    def encode_reference(self, reference, context, target_hw):
+        ref, embedding, extra, rope = self.embed_reference(reference, target_hw)
         cache = []
         for index, block in enumerate(self.model.blocks):
             args = (block, ref, embedding, extra, context, rope)
@@ -247,6 +253,41 @@ class AnimaReference(nn.Module):
 
     reference_step = staticmethod(reference_block)
     target_step = staticmethod(target_block)
+
+    def paired_step(self, block, ref, target, ref_conditioning, target_conditioning):
+        ref, k, v = self.reference_step(block, ref, *ref_conditioning)
+        target = self.target_step(block, target, *target_conditioning, (k, v))
+        return ref, target
+
+    def checkpoint_step(self, function, *args):
+        device = self.model.device
+        if self.checkpoint_cpu_offload and device.type == "cuda":
+            if self._checkpoint_copy_stream is None or self._checkpoint_copy_stream.device != device:
+                self._checkpoint_copy_stream = torch.cuda.Stream(device=device)
+            # The outer hook sees the saved block inputs. The checkpoint's own
+            # hooks handle activations created inside the block.
+            with torch.autograd.graph.saved_tensors_hooks(self._pack_checkpoint_input, self._unpack_checkpoint_input):
+                return checkpoint(function, *args, use_reentrant=False)
+        return checkpoint(function, *args, use_reentrant=False)
+
+    def _pack_checkpoint_input(self, value):
+        if value.device.type != "cuda" or value.numel() == 0:
+            return value.detach(), value.device, None
+        stream = self._checkpoint_copy_stream
+        stream.wait_stream(torch.cuda.current_stream(value.device))
+        with torch.cuda.stream(stream):
+            host = torch.empty_like(value, device="cpu", pin_memory=True)
+            host.copy_(value, non_blocking=True)
+            value.record_stream(stream)
+            ready = stream.record_event()
+        return host, value.device, ready
+
+    @staticmethod
+    def _unpack_checkpoint_input(saved):
+        host, device, ready = saved
+        if ready is not None:
+            torch.cuda.current_stream(device).wait_event(ready)
+        return host.to(device, non_blocking=True)
 
     def forward(self, x, timesteps, context, reference=None, mask=None, ref_context=None, ref_kv=None):
         if isinstance(x, list):
@@ -260,12 +301,21 @@ class AnimaReference(nn.Module):
         if reference is not None:
             if ref_context is None:
                 raise ValueError("Reference conditioning must be supplied separately from the generation prompt")
-            ref_kv = self.encode_reference(reference, ref_context, x.shape[-2:])
-        for index, block in enumerate(self.model.blocks):
-            args = (block, target, te, ta, context, tr, None if ref_kv is None else ref_kv[index])
-            if self.training and index < self.checkpoint_blocks:
-                target = checkpoint(self.target_step, *args, use_reentrant=False)
-            else:
-                target = self.target_step(*args)
+            # Recompute both streams together so checkpointed blocks do not retain
+            # each layer's reference K/V or the target's concatenated K/V.
+            ref, re, ra, rr = self.embed_reference(reference, x.shape[-2:])
+            for index, block in enumerate(self.model.blocks):
+                args = (block, ref, target, (re, ra, ref_context, rr), (te, ta, context, tr))
+                if self.training and index < self.checkpoint_blocks:
+                    ref, target = self.checkpoint_step(self.paired_step, *args)
+                else:
+                    ref, target = self.paired_step(*args)
+        else:
+            for index, block in enumerate(self.model.blocks):
+                args = (block, target, te, ta, context, tr, None if ref_kv is None else ref_kv[index])
+                if self.training and index < self.checkpoint_blocks:
+                    target = self.checkpoint_step(self.target_step, *args)
+                else:
+                    target = self.target_step(*args)
         output = self.model.final_layer(target, te, adaln_lora_B_T_3D=ta)
         return self.model.unpatchify(output).squeeze(2)

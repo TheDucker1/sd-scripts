@@ -221,7 +221,7 @@ class MossStyleComponents:
     vae: flux2_vae.AutoEncoder
     text_encoder: nn.Module
     tokenizer: object
-    tagger: StylePromptTagger
+    tagger: StylePromptTagger | None
     content: FrozenImageFeatures | None
     style: FrozenImageFeatures | None
 
@@ -700,10 +700,12 @@ def load_style_checkpoint(folder, components, optimizer, config):
     saved_config["training"].pop("max_steps")
     current_config["training"].pop("max_steps")
     if saved_config.get("architecture") == current_config.get("architecture") == "anima":
-        # Cache execution and stream positioning may change at resume. Image
-        # geometry, augmentation, VAE assets and optimizer settings must match.
+        # Cache, text and activation execution can change at resume. Image
+        # geometry, augmentation, model assets and optimizer settings must match.
         for value in (saved_config, current_config):
-            for key in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir", "latent_cache"):
+            for key in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir", "latent_cache",
+                        "checkpoint_cpu_offload", "checkpoint_blocks", "gradient_checkpointing", "tag_cache",
+                        "offload_text_encoder", "trim_text_padding"):
                 value.pop(key, None)
             value["training"].pop("resume_data_mode", None)
     if saved_config != current_config:

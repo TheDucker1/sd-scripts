@@ -111,9 +111,11 @@ it detects later file changes, but does not authenticate that payload against th
 original metadata.
 
 Invalid images (bad member identity, corrupt payload or below-minimum actual size)
-are recorded in `skipped.jsonl` and do not abort later downloads. The worker excludes
-failed posts and picks replacement ranges from the source index, reusing verified
-downloads. If an artist no longer supplies enough pairs, another is rolled. It
+are recorded in `skipped.jsonl`. The request limit set by `--response-mib`
+also excludes individual posts whose payload plus tar header exceeds the limit.
+The worker repairs only artists below the pair minimum and keeps qualifying saved
+ranges. For a deficient artist it looks for a qualifying range using the fewest
+missing downloads. If an artist no longer supplies enough pairs, another is rolled. It
 finishes only with the requested artist count, or reports that too few artists
 remain. Disk failures and exhausted network/protocol failures still stop with
 recoverable state; they do not silently exclude images.

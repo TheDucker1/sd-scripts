@@ -61,6 +61,9 @@ def resolve_style_dataset_config(config):
         if not manifest.get("complete"):
             raise ValueError("Artist index is unfinished; complete the dataset builder before training")
         config["dataset_index"] = dict(revision=manifest["revision"], sha256=manifest["index_sha256"])
+    if config.get("tag_cache") and (config.get("architecture") != "anima" or not config["data"].get("artist_index")
+                                    or manifest.get("storage") not in ("local", "local_tar")):
+        raise ValueError("Offline Anima tags require a completed local or staged artist index")
     for name in ("cache_latents", "cache_latents_to_disk", "cache_text_encoder_outputs", "cache_text_encoder_outputs_to_disk"):
         if config.get(name) or config["training"].get(name):
             if (name in ("cache_latents", "cache_latents_to_disk") and config.get("cache_latents") and config.get("architecture") == "anima"
@@ -93,14 +96,17 @@ def read_image_pairs_batch(samples):
         return torch.stack(values) if len({tuple(value.shape) for value in values}) == 1 else values
 
     batch = {
-        "image_a": images("image_a"),
-        "image_b": images("image_b"),
         "id_a": [sample["id_a"] for sample in samples],
         "id_b": [sample["id_b"] for sample in samples],
     }
+    if "image_a" in samples[0]:
+        batch.update(image_a=images("image_a"), image_b=images("image_b"))
     for name in ("subsets_a", "subsets_b", "original_sizes_a", "original_sizes_b"):
         if name in samples[0]:
             batch[name] = [sample[name] for sample in samples]
+    if "latent_a" in samples[0]:
+        batch.update(latent_a=[sample["latent_a"] for sample in samples],
+                     latent_b=[sample["latent_b"] for sample in samples])
     return batch
 
 
@@ -128,6 +134,7 @@ class MossStylePairDataset(IterableDataset):
         self.dataset = config_util.generate_streaming_dataset_by_blueprint(blueprint, seed=seed)
         self.bucket_sizes = self.dataset.bucket_manager.predefined_resos
         self.artist_pairs = None
+        self.latent_cache = None
         if artist_index:
             from library.moss_image_artist_dataset import MossArtistPairs
 
@@ -140,7 +147,11 @@ class MossStylePairDataset(IterableDataset):
 
     def __iter__(self):
         if self.artist_pairs is not None:
-            yield from self.artist_pairs
+            if self.latent_cache is None:
+                yield from self.artist_pairs
+            else:
+                for pair in self.artist_pairs:
+                    yield dict(pair, latent_a=self.latent_cache[pair["id_a"]][0], latent_b=self.latent_cache[pair["id_b"]][0])
             return
         pending = None
         for image in self.dataset:

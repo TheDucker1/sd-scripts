@@ -12,7 +12,7 @@ from PIL import Image
 from moss_image_train_style import MossImageStyleTrainer, setup_parser as setup_style_parser
 from library import compile_utils
 from library.anima_reference import reference_block, target_block
-from library.anima_style_train_utils import anima_context, build_anima_style_components, prepare_anima_batch
+from library.anima_style_train_utils import build_anima_style_components, prepare_anima_batch
 from library.moss_image_style_dataset import iter_image_pairs_batch
 from library.moss_image_style_train_utils import get_style_sampling_options, sample_style_sigmas, style_objective
 
@@ -27,11 +27,18 @@ def setup_parser():
     parser.add_argument("--cache_latents_to_disk", action="store_true", default=None)
     parser.add_argument("--vae_batch_size", type=int, default=None)
     parser.add_argument("--latent_cache_dir", default=None, help="Local SSD directory for standard Anima NPZ caches")
+    parser.add_argument("--tag_cache", default=None, help="Portable tag-cache.json from the Anima tag worker")
     return parser
 
 
 class AnimaStyleTrainer(MossImageStyleTrainer):
     def prepare_dataset(self, components, loader, config, device):
+        tags = None
+        pairs = loader.dataset.artist_pairs
+        if config.get("tag_cache"):
+            from library.anima_tag_cache import load_anima_tags
+
+            tags = load_anima_tags(config["tag_cache"], pairs, config["tagger"])
         if config.get("cache_latents", False):
             from library.anima_latent_cache import cache_anima_latents, load_precomputed_anima_latents
 
@@ -39,6 +46,17 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                 load_precomputed_anima_latents(components, loader.dataset, config)
             else:
                 cache_anima_latents(components, loader.dataset, config, device)
+        if tags is not None:
+            selected = [index for index, row in enumerate(pairs.rows) if tags[str(int(row["id"]))] is not None]
+            if len(selected) != len(pairs.rows):
+                pairs.restrict_to_indices(selected)
+            components.cached_tags = tags
+            if getattr(components, "latent_cache", None) is not None:
+                pairs.skip_image_reads = True
+                components.artist_pairs = pairs
+                loader.dataset.latent_cache = components.latent_cache
+            logger.info("Using cached Anima captions for %d images; tagger unloaded; training image reads=%s",
+                        len(pairs.rows), "disabled" if pairs.skip_image_reads else "enabled")
 
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
@@ -104,7 +122,7 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                     shift = options["flow_shift"]
                     grid = shift * grid / (1 + (shift - 1) * grid)
                     use_cfg = options["guidance_scale"] != 1
-                    negative = anima_context(components, [""], device) if use_cfg else None
+                    negative = prepared["ref_context"] if use_cfg else None
                     # Ephemeral inference cache only. Training builds a fresh
                     # differentiable reference graph for every batch.
                     cache = (components.dit.encode_reference(prepared["reference"], prepared["ref_context"], latent.shape[-2:])
@@ -119,6 +137,9 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                             velocity = unconditional + options["guidance_scale"] * (velocity - unconditional)
                         latent += (right - left) * velocity
                     result = components.vae.decode_from_dit(latent)
+                    if "image_a" not in pair:
+                        pair["image_a"] = components.artist_pairs.preview_image(pair["id_a"][0])
+                        pair["image_b"] = components.artist_pairs.preview_image(pair["id_b"][0])
                     images = [Image.fromarray(((value[0].float().cpu().permute(1, 2, 0) + 1) * 127.5).clamp(0, 255).byte().numpy())
                               for value in (pair["image_a"], pair["image_b"], result)]
                     board = Image.new("RGB", (sum(image.width for image in images), max(image.height for image in images)))

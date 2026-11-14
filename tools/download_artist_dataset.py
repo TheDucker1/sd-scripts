@@ -143,7 +143,49 @@ def pick_artist_range(times, window, min_pairs, rng):
             return start, end + 1, pairs
 
 
-def select_artists(rows, artists, window_days, count, min_pairs, seed, preferred_artists=(), preferred_folders=None):
+def repair_artist_range(block, previous_ids, saved_ids, window, min_pairs, rng):
+    """Keep a qualifying saved range, or find the cheapest replacement range."""
+    previous = np.isin(block["id"], previous_ids)
+    saved = np.fromiter((int(post_id) in saved_ids for post_id in block["id"]), dtype=bool, count=len(block))
+    retained = block[previous]
+    if count_pairs(retained["timestamp"], window) >= min_pairs and (saved[previous].all() or not saved[~previous].any()):
+        return retained
+    if not saved.any():
+        selection = pick_artist_range(block["timestamp"], window, min_pairs, rng)
+        return None if selection is None else block[selection[0]:selection[1]]
+
+    downloaded = block[saved]
+    if count_pairs(downloaded["timestamp"], window) >= min_pairs:
+        block = downloaded
+        previous = previous[saved]
+        saved = np.ones(len(block), dtype=bool)
+
+    times = block["timestamp"]
+    left = np.searchsorted(times, times - window, side="left")
+    right = np.searchsorted(times, times + window, side="right")
+    missing = np.r_[0, np.cumsum(~saved)]
+    missing_bytes = np.r_[0, np.cumsum(block["size"] * ~saved)]
+    previous_count = np.r_[0, np.cumsum(previous)]
+    end, pairs = 0, 0
+    best = None
+    for start in range(len(block)):
+        # Removing the first post never adds pairs. The earliest qualifying
+        # endpoint can only move forward, even across gaps in timestamps.
+        while end < len(block) and pairs < min_pairs:
+            pairs += end - max(start, int(left[end]))
+            end += 1
+        if pairs < min_pairs:
+            break
+        score = (missing[end] - missing[start], missing_bytes[end] - missing_bytes[start],
+                 end - start, previous_count[start] - previous_count[end])
+        if best is None or score < best[0]:
+            best = score, start, end
+        pairs -= min(end, int(right[start])) - start - 1
+    return None if best is None else block[best[1]:best[2]]
+
+
+def select_artists(rows, artists, window_days, count, min_pairs, seed, preferred_artists=(), preferred_folders=None,
+                   previous_ranges=None, saved_ids=()):
     """Roll artists without replacement; choose a random start and minimum end."""
     boundaries = np.r_[0, np.flatnonzero(np.diff(rows["artist"])) + 1, len(rows)]
     window = window_days * 86400
@@ -155,23 +197,32 @@ def select_artists(rows, artists, window_days, count, min_pairs, seed, preferred
     chosen, attempted = [], 0
     with tqdm(total=count, desc="Select artist ranges", unit="artist") as bar:
         for start, end in groups:
-            times = rows["timestamp"][start:end]
+            block = rows[start:end]
+            times = block["timestamp"]
             if np.any(times[1:] < times[:-1]):
                 raise ValueError("Artist timestamps are not sorted")
             attempted += 1
-            selection = pick_artist_range(times, window, min_pairs, rng)
-            if selection is None:
-                continue
-            chosen.append((start, end, selection))
+            if previous_ranges is None:
+                selection = pick_artist_range(times, window, min_pairs, rng)
+                if selection is None:
+                    continue
+                first, last, _ = selection
+                selected_block = block[first:last]
+            else:
+                name = str(artists[int(block[0]["artist"])])
+                selected_block = repair_artist_range(block, previous_ranges.get(name, ()), saved_ids, window, min_pairs, rng)
+                if selected_block is None:
+                    continue
+            chosen.append((start, end, selected_block))
             bar.update(1)
             if len(chosen) == count:
                 break
     if len(chosen) < count:
         raise ValueError(f"Only {len(chosen)} artists have >= {min_pairs} unordered pairs; requested {count}")
     selected, names, folders, summary = [], [], [], []
-    for artist, (start, end, (first, last, pairs)) in enumerate(sorted(chosen)):
+    for artist, (start, end, selected_block) in enumerate(sorted(chosen, key=lambda entry: entry[0])):
         times = rows["timestamp"][start:end]
-        block = rows[start + first:start + last].copy()
+        block = selected_block.copy()
         name = str(artists[int(rows[start]["artist"])])
         slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_-")[:64] or "artist"
         folder = (preferred_folders or {}).get(name, f"images/a{int(rows[start]['artist']):06d}-{slug}")
@@ -179,7 +230,7 @@ def select_artists(rows, artists, window_days, count, min_pairs, seed, preferred
         selected.append(block)
         names.append(name)
         folders.append(folder)
-        summary.append(dict(name=name, folder=folder, images=len(block), pairs=pairs,
+        summary.append(dict(name=name, folder=folder, images=len(block), pairs=count_pairs(block["timestamp"], window),
                             candidate_images=end - start, candidate_pairs=count_pairs(times, window),
                             bytes=int(block["size"].sum())))
     return np.concatenate(selected), np.asarray(names), np.asarray(folders), summary, attempted
@@ -442,6 +493,10 @@ class InvalidArchiveImage(Exception):
 class RepairSelection(Exception):
     """Compact selection needs replacement candidates after invalid images."""
 
+    def __init__(self, failed_ids):
+        super().__init__("Some artists fell below the minimum pair count")
+        self.failed_ids = failed_ids
+
 
 def save_image(root, index, row, folder, block, min_side=0, min_pixels=0):
     payload = block[512:]
@@ -482,8 +537,6 @@ def finalize_rows(rows, artists, good, window_days, min_pairs):
         kept.extend(indices.tolist())
         names.append(str(artists[int(available[start]["artist"])]))
         pair_counts.append(pairs)
-    if len(kept) < 2:
-        raise RuntimeError("No artists retain enough valid pairs after skips; see skipped.jsonl and adjust the selection")
     result = rows[kept].copy()
     original_artists = result["artist"].copy()
     result["artist"] = np.searchsorted(np.unique(original_artists), original_artists)
@@ -585,10 +638,14 @@ def download_selection(root, manifest, rows, artists, folders, args):
             client.close()
     if len(good) + len(skipped) != len(rows):
         raise RuntimeError("Incomplete offline dataset; rerun the same command")
-    if getattr(args, "require_all_artists", False) and skipped:
-        raise RepairSelection("Replacing invalid posts while retaining minimum image counts")
     final_rows, final_artists, kept, pair_counts = finalize_rows(rows, artists, good, manifest["pair_max_days"],
                                                               getattr(args, "min_pairs", 1))
+    if getattr(args, "require_all_artists", False) and len(final_artists) != len(artists):
+        if not skipped:
+            raise RuntimeError("Saved selection falls below the requested pair count")
+        raise RepairSelection({int(rows[index]["id"]) for index in skipped})
+    if not len(final_rows):
+        raise RuntimeError("No artists retain enough valid pairs after skips; see skipped.jsonl and adjust the selection")
     write_index_arrays(root / "artist-index.npz", images=final_rows, artists=final_artists,
         files=np.asarray([good[index]["file"] for index in kept]),
         sha256=np.asarray([good[index]["sha256"] for index in kept], dtype="S64"))
@@ -614,29 +671,49 @@ def load_plan(root, plan):
         return data["images"], data["artists"], data["folders"]
 
 
-def save_minimum_plan(root, manifest, all_rows, all_artists, settings, previous=None, excluded=()):
+SELECTION_POLICY = "random-start-min-end-repair-v2"
+
+
+def save_minimum_plan(root, manifest, all_rows, all_artists, settings, previous=None, excluded=(), *, response_bytes=None):
     folders = {}
+    previous_ranges = None
+    saved_ids = set()
     if previous:
-        load_plan(root, previous)
+        previous_rows, previous_artists, _ = load_plan(root, previous)
         folders = {entry["name"]: entry["folder"] for entry in previous["artists"]}
-    available = all_rows[~np.isin(all_rows["id"], list(excluded))] if excluded else all_rows
+        if previous.get("selection_policy") in ("random-start-min-end-v1", SELECTION_POLICY):
+            bounds = np.searchsorted(previous_rows["artist"], np.arange(len(previous_artists) + 1))
+            previous_ranges = {str(name): previous_rows["id"][start:end]
+                               for name, start, end in zip(previous_artists, bounds[:-1], bounds[1:])}
+            saved_ids = {post_id for post_id, record in read_post_records(root / "downloaded.jsonl").items()
+                         if record.get("metadata_dimensions_match", True)}
+        if response_bytes is not None:
+            oversized = previous_rows["size"] > response_bytes - 512
+            if oversized.any():
+                print(f"Skipping {oversized.sum():,} selected post(s) over the {response_bytes / 1024**2:g} MiB response limit.", flush=True)
+    eligible = np.ones(len(all_rows), dtype=bool)
+    if response_bytes is not None:
+        eligible &= all_rows["size"] <= response_bytes - 512
+    if excluded:
+        eligible &= ~np.isin(all_rows["id"], list(excluded))
+    available = all_rows if eligible.all() else all_rows[eligible]
     rows, artists, folder_table, summary, attempted = select_artists(available, all_artists, manifest["pair_max_days"],
-        settings["artists"], settings["min_pairs"], settings["seed"], folders.keys(), folders)
+        settings["artists"], settings["min_pairs"], settings["seed"], folders.keys(), folders, previous_ranges, saved_ids)
     # Commit a versioned array file first, then atomically switch one JSON pointer.
     # The old plan and all journals remain usable if interrupted before the switch.
     digest = hashlib.sha256(rows.tobytes()).hexdigest()[:24]
     filename = f"download-plan-range-{digest}.npz"
     write_index_arrays(root / filename, images=rows, artists=artists, folders=folder_table)
-    plan = dict(settings=settings, selection_policy="random-start-min-end-v1", plan_file=filename,
+    plan = dict(settings=settings, selection_policy=SELECTION_POLICY, plan_file=filename,
                 attempted_artists=attempted, artists=summary, images=len(rows), bytes=int(rows["size"].sum()),
                 excluded_post_ids=sorted(excluded), plan_sha256=file_sha256(root / filename))
     # An old complete index could otherwise reference the oversized selection.
     write_index_json(root / "manifest.json", dict(manifest, storage="local", complete=False))
     write_index_json(root / "selection.json", plan)
     if previous:
-        print(f"Compacted selection: {previous['images']:,} -> {len(rows):,} images; "
-              f"{previous['bytes'] / 1024**3:.2f} -> {plan['bytes'] / 1024**3:.2f} GiB. "
-              "Existing image files and journals were preserved.", flush=True)
+        reused = sum(int(post_id) in saved_ids for post_id in rows["id"])
+        print(f"Updated selection: {previous['images']:,} -> {len(rows):,} images. "
+              f"{reused:,} have saved journal entries to verify.", flush=True)
     return plan
 
 
@@ -646,13 +723,12 @@ def download_minimum_selection(root, source, manifest, plan, args):
         rows, artists, folders = load_plan(root, plan)
         try:
             return download_selection(root, dict(manifest, selection_policy=plan["selection_policy"]), rows, artists, folders, args)
-        except RepairSelection:
-            completed = read_journal(root, rows)
-            failures = set(read_records(root / "skipped.jsonl", rows)) - set(completed)
-            excluded = set(plan.get("excluded_post_ids", ())) | {int(rows[index]["id"]) for index in failures}
-            print("Replacing invalid images; reusing completed downloads and rolling another artist if needed.", flush=True)
+        except RepairSelection as error:
+            excluded = set(plan.get("excluded_post_ids", ())) | error.failed_ids
+            print("Repairing artists below the pair minimum; keeping qualifying saved ranges.", flush=True)
             _, all_rows, all_artists = load_artist_index(source)
-            plan = save_minimum_plan(root, manifest, all_rows, all_artists, plan["settings"], plan, excluded)
+            plan = save_minimum_plan(root, manifest, all_rows, all_artists, plan["settings"], plan, excluded,
+                                     response_bytes=args.response_mib * 1024**2)
             del all_rows, all_artists
 
 
@@ -665,7 +741,7 @@ def main():
     parser.add_argument("--min-pairs", type=int, default=101, help="Random range start; stop at the first endpoint with this many valid unordered pairs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ranges-per-request", type=int, default=16)
-    parser.add_argument("--response-mib", type=int, default=64, help="Maximum sum of requested bytes per batch")
+    parser.add_argument("--response-mib", type=int, default=64, help="Request budget in MiB; posts larger than this are skipped")
     parser.add_argument("--workers", type=int, default=4, help="Single-range fallback streams; HTTP/1.1 queues on one connection")
     parser.add_argument("--request-interval", type=float, default=0.2, help="Minimum seconds between request starts")
     parser.add_argument("--retries", type=int, default=8)
@@ -679,6 +755,7 @@ def main():
     if args.workers > 8 or args.ranges_per_request > 128 or args.retries < 0 or args.timeout <= 0 or args.request_interval < 0:
         parser.error("Require workers<=8, ranges-per-request<=128, retries>=0, timeout>0 and request-interval>=0")
     root = args.output.resolve()
+    response_bytes = args.response_mib * 1024**2
     root.mkdir(parents=True, exist_ok=True)
     with OutputLock(root):
         source = prepare_source(args.index, root, args.index_subdir)
@@ -691,17 +768,20 @@ def main():
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             if plan["settings"] != settings:
                 raise ValueError("Saved selection/settings differ; use the original selection settings or a new output directory")
-            load_plan(root, plan)
-            if plan.get("selection_policy") != "random-start-min-end-v1":
-                completed = read_journal(root)
-                excluded = set() if args.retry_skipped else set(read_post_records(root / "skipped.jsonl")) - set(completed)
-                plan = save_minimum_plan(root, manifest, all_rows, all_artists, settings, plan, excluded)
+            rows, _, _ = load_plan(root, plan)
+            if plan.get("selection_policy") != SELECTION_POLICY or np.any(rows["size"] > response_bytes - 512):
+                completed = read_post_records(root / "downloaded.jsonl")
+                excluded = set(plan.get("excluded_post_ids", ()))
+                if not args.retry_skipped:
+                    excluded.update(set(read_post_records(root / "skipped.jsonl")) - set(completed))
+                plan = save_minimum_plan(root, manifest, all_rows, all_artists, settings, plan, excluded,
+                                         response_bytes=response_bytes)
         else:
-            plan = save_minimum_plan(root, manifest, all_rows, all_artists, settings)
+            plan = save_minimum_plan(root, manifest, all_rows, all_artists, settings, response_bytes=response_bytes)
         del all_rows, all_artists
         rows, artists, folders = load_plan(root, plan)
         requests = sum(1 for _ in request_batches(rows, np.ones(len(rows), dtype=bool),
-                                                args.ranges_per_request, args.response_mib * 1024**2))
+                                                args.ranges_per_request, response_bytes))
         print(f"Selected {len(artists):,} artists from {plan['attempted_artists']:,} tried; {len(rows):,} unique images; "
               f"{int(rows['size'].sum()) / 1024**3:.2f} GiB payload; {requests:,} multi-range batches "
               f"({len(rows):,} requests if unsupported).\nSelection: {plan_path}", flush=True)

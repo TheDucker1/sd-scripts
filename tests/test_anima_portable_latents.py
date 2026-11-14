@@ -14,12 +14,14 @@ import test_anima_latent_cache as fixtures
 from library import qwen_image_autoencoder_kl
 from library.anima_latent_cache import AnimaDiskLatentCache, load_precomputed_anima_latents
 from library.anima_latent_archive import pack_latent_cache
+from library.anima_tag_cache import load_anima_tags
 from library.anima_style_train_utils import AnimaStyleVAE, build_anima_style_components
 from library.moss_image_style_dataset import MossStylePairDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/colab"))
 from cache_anima_artist_latents import build_cache_config, download_vae, prepare_latents
+from cache_anima_artist_tags import cache_tags
 from pack_artist_dataset import pack_dataset
 from stage_anima_latents import stage_latents
 from stage_artist_dataset import stage_dataset
@@ -117,6 +119,50 @@ class TestPortableAnimaLatents(unittest.TestCase):
         self.assertIsNone(components.vae.model)
         self.assertEqual(components.vae.dtype, torch.bfloat16)
         self.assertEqual(components.vae.source_path, str(self.root / "vae/fixture.safetensors"))
+
+    def test_offline_tags_resume_and_train_without_tagger_or_image_reads(self):
+        pairs = MossStylePairDataset(**self.config["data"]).artist_pairs
+        tagger = build_anima_style_components(self.config, torch.device("cpu")).tagger
+        output = self.root / "tags"
+        output.mkdir()
+        settings = self.config["tagger"]
+        forward = tagger.forward
+        batches = iter((True, False))
+
+        def interrupted(images):
+            if not next(batches):
+                raise KeyboardInterrupt
+            return forward(images)
+
+        with mock.patch.object(tagger, "forward", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                cache_tags(pairs, settings, output, {}, lambda: tagger, 2, "cpu")
+        with mock.patch.object(tagger, "forward", wraps=forward) as resumed:
+            path = cache_tags(pairs, settings, output, {}, lambda: tagger, 2, "cpu")
+            self.assertEqual(resumed.call_count, 1)
+        self.assertEqual(len(load_anima_tags(path, pairs, settings)), 4)
+
+        config = self.config
+        config["tag_cache"] = str(path)
+        config["sampling"].update(enabled=True, every_n_steps=1, steps=1, num_pairs=1, guidance_scale=1.0)
+        config["training"].update(max_steps=1, save_every=1, prefetch_batches=2)
+        prepare = self.trainer.prepare_dataset
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda":
+            config.update(dtype="bfloat16", gradient_checkpointing=True, checkpoint_blocks=None,
+                          checkpoint_cpu_offload=True, offload_text_encoder=True)
+
+        def track_image_reads(components, loader, config, device):
+            prepare(components, loader, config, device)
+            self.assertIsNone(components.tagger)
+            pairs = loader.dataset.artist_pairs
+            pairs.fetch = mock.Mock(wraps=pairs.fetch)
+
+        with mock.patch.object(self.trainer, "prepare_dataset", side_effect=track_image_reads):
+            components, history = self.trainer.train_config(config, self.root / "cached-training", device)
+        self.assertGreater(history[0]["gradient_norm"], 0)
+        self.assertEqual(components.text_encoder.device.type, "cpu")
+        self.assertEqual(components.artist_pairs.fetch.call_count, 2)  # Only preview A and B.
 
     def test_pack_stage_local_tar_and_import_without_loading_vae(self):
         self.prepare()

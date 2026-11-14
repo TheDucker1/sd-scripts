@@ -57,6 +57,7 @@ def main():
     components = trainer.load_target_model(config, device)
     restore_adapter(components.dit, args.checkpoint)
     loader = trainer.get_train_dataloader(config, device)
+    trainer.prepare_dataset(components, loader, config, device)
     pair = next(iter_image_pairs_batch(next(iter(loader))))
     step = json.loads((args.checkpoint / "complete.json").read_text())["step"]
     cfg = config["sampling"]["guidance_scale"]

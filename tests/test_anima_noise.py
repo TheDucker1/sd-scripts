@@ -7,10 +7,36 @@ from unittest import mock
 
 import torch
 
-from library.moss_image_style_train_utils import sample_style_sigmas
+from library.moss_image_style_train_utils import sample_style_sigmas, soft_plateau_cdf
 
 
 class TestAnimaNoise(unittest.TestCase):
+    def test_soft_plateau_matches_proposed_probability_bands(self):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(17)
+            sigma = sample_style_sigmas(8192, "cpu", distribution="soft_plateau")
+        self.assertTrue(torch.isfinite(sigma).all())
+        self.assertTrue(((sigma >= 0) & (sigma <= 1)).all())
+        for edge in (0.1, 0.5, 0.7, 0.9):
+            self.assertAlmostEqual((sigma < edge).float().mean().item(), soft_plateau_cdf(edge), delta=0.02)
+        self.assertAlmostEqual(soft_plateau_cdf(0.5), 0.09742210538877397)
+        self.assertAlmostEqual(soft_plateau_cdf(1), 1.0)
+
+    def test_soft_plateau_inverse_cdf_and_uniform_component(self):
+        quantiles = torch.tensor([0.0, 0.01, 0.1, 0.5, 0.9, 0.99, 1.0])
+        with mock.patch("library.moss_image_style_train_utils.torch.rand", side_effect=[quantiles, torch.ones_like(quantiles)]):
+            sigma = sample_style_sigmas(len(quantiles), "cpu", distribution="soft_plateau", uniform_probability=0)
+        recovered = torch.tensor([soft_plateau_cdf(value.item(), uniform_probability=0) for value in sigma])
+        torch.testing.assert_close(recovered, quantiles, atol=1e-6, rtol=1e-5)
+        with mock.patch("library.moss_image_style_train_utils.torch.rand", side_effect=[quantiles, torch.zeros_like(quantiles)]):
+            uniform = sample_style_sigmas(len(quantiles), "cpu", distribution="soft_plateau", uniform_probability=1)
+        torch.testing.assert_close(uniform, quantiles)
+
+    def test_soft_plateau_rejects_invalid_parameters(self):
+        for options in (dict(width=0), dict(center=-0.1), dict(uniform_probability=1.1), dict(width=float("nan"))):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                sample_style_sigmas(1, "cpu", distribution="soft_plateau", **options)
+
     def test_preset_is_smooth_and_mostly_after_thirty_percent(self):
         root = Path(__file__).resolve().parents[1]
         noise = json.loads((root / "configs/anima_style_colab.json").read_text())["noise"]

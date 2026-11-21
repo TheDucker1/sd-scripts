@@ -23,6 +23,49 @@ class TestDriveCheckpointPublisher(unittest.TestCase):
         self.publisher.folder_id = "run"
         self.publisher.keep_last = 1
         self.publisher.files = mock.Mock()
+        self.publisher.run_signatures = {}
+        self.publisher.run_folders = {".": "run"}
+
+    def test_run_files_upload_stable_snapshots_and_retry_changed_logs(self):
+        publisher = self.publisher
+        run = self.root / "local-run"
+        run.mkdir()
+        log = run / "console.log"
+        log.write_bytes(b"first line\n")
+        sample = run / "samples" / "step-000300" / "pair-000.jpg"
+        sample.parent.mkdir(parents=True)
+        sample.write_bytes(b"tiny preview")
+        publisher.find_folder = mock.Mock(return_value=None)
+        publisher.files.create.return_value.execute.side_effect = [{"id": "samples"}, {"id": "preview-step"}]
+        publisher.children = mock.Mock(return_value=iter(()))
+        seen = []
+
+        def upload(folder, snapshot, existing):
+            payload = snapshot.read_bytes()
+            seen.append((folder, snapshot.name, payload))
+            if snapshot.name == "console.log" and payload == b"first line\n":
+                log.write_bytes(b"first line\nsecond line\n")
+            return dict(size=str(len(payload)), md5Checksum=hashlib.md5(payload, usedforsecurity=False).hexdigest())
+
+        publisher.upload_file = mock.Mock(side_effect=upload)
+        publisher.sync_run_files(run)
+        self.assertIn(("preview-step", sample.name, b"tiny preview"), seen)
+        publisher.sync_run_files(run)
+        self.assertIn(("run", log.name, b"first line\nsecond line\n"), seen)
+        self.assertEqual(len(seen), 3)
+        publisher.sync_run_files(run)
+        self.assertEqual(len(seen), 3)
+
+    def test_run_file_checksum_failure_is_retried(self):
+        publisher = self.publisher
+        run = self.root / "local-run"
+        run.mkdir()
+        (run / "metrics.jsonl").write_bytes(b"{}\n")
+        publisher.children = mock.Mock(return_value=iter(()))
+        publisher.upload_file = mock.Mock(return_value=dict(size="0", md5Checksum="bad"))
+        with self.assertRaisesRegex(OSError, "checksum or size mismatch"):
+            publisher.sync_run_files(run)
+        self.assertEqual(publisher.run_signatures, {})
 
     def test_publishes_only_after_all_files_are_verified(self):
         publisher = self.publisher

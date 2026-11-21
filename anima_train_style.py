@@ -14,7 +14,7 @@ from library import compile_utils
 from library.anima_reference import reference_block, target_block
 from library.anima_style_train_utils import build_anima_style_components, prepare_anima_batch
 from library.moss_image_style_dataset import iter_image_pairs_batch
-from library.moss_image_style_train_utils import get_style_sampling_options, sample_style_sigmas, style_objective
+from library.moss_image_style_train_utils import get_style_sampling_options, sample_style_sigmas, soft_plateau_cdf, style_objective
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,20 @@ def setup_parser():
 
 
 class AnimaStyleTrainer(MossImageStyleTrainer):
+    def train_config(self, config, output_dir, device="cpu", compile_args=None, resume=None):
+        config = dict(config)
+        if config.pop("auto_resume", False) and resume is None:
+            root = Path(getattr(compile_args, "checkpoint_dir", None) or output_dir)
+            files = ("complete.json", "training_state.pt", "adapter_config.json", "adapter_model.safetensors")
+            resume = max(
+                (path for path in root.glob("step-*") if path.name[5:].isdecimal() and path.is_dir()
+                 and all((path / name).is_file() for name in files)),
+                key=lambda path: int(path.name[5:]), default=None,
+            )
+            if resume is not None:
+                logger.info("Automatically resuming Anima from %s", resume)
+        return super().train_config(config, output_dir, device, compile_args, resume)
+
     def prepare_dataset(self, components, loader, config, device):
         tags = None
         pairs = loader.dataset.artist_pairs
@@ -67,11 +81,19 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
         config["training"].update(content_weight=1.0, style_weight=0.0)
         logger.info("Training objective: velocity L2 only; no perceptual encoders or training VAE decode")
         noise = config.get("noise", {})
-        if noise.get("distribution") == "progress_logit_normal":
+        if noise.get("distribution") == "soft_plateau":
+            options = {key: noise[key] for key in ("center", "width", "uniform_probability") if key in noise}
+            half, seventy, ninety = [soft_plateau_cdf(sigma, **options) for sigma in (0.5, 0.7, 0.9)]
+            logger.info("Smooth plateau noise: below 50%%=%.1f%% | 50-70%%=%.1f%% | 70-90%%=%.1f%% | 90-100%%=%.1f%%",
+                        100 * half, 100 * (seventy - half), 100 * (ninety - seventy), 100 * (1 - ninety))
+        elif noise.get("distribution") == "progress_logit_normal":
             mean, std = noise.get("mean", -0.5), noise.get("std", 0.9)
-            before = (1 + math.erf((math.log(0.3 / 0.7) - mean) / (std * math.sqrt(2)))) / 2
-            logger.info("Smooth progress curve over (0,1): median=%.1f%%; %.1f%% before 30%% progress, %.1f%% after; no interior cutoffs",
-                        50 * (1 + math.tanh(mean / 2)), 100 * before, 100 * (1 - before))
+            if not math.isfinite(mean) or not math.isfinite(std) or std <= 0:
+                raise ValueError("progress_logit_normal requires a finite mean and positive finite std")
+            at_ninety, at_sixty = [50 * (1 + math.erf((math.log((1 - sigma) / sigma) - mean) / (std * math.sqrt(2))))
+                                  for sigma in (0.9, 0.6)]
+            logger.info("Smooth noise curve: median=%.1f%% | 90-100%%: %.1f%% | 60-90%%: %.1f%% | below 60%%: %.1f%%",
+                        50 * (1 - math.tanh(mean / 2)), at_ninety, at_sixty - at_ninety, 100 - at_sixty)
         else:
             low, high = noise.get("minimum", 0.05), noise.get("maximum", 0.7)
             median = low + (high - low) * (1 + math.tanh(noise.get("mean", -0.5) / 2)) / 2
@@ -102,17 +124,36 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                                       content_weight=1.0, style_weight=0.0, stage_timer=stage_timer)
         return loss, values, prepared
 
+    @staticmethod
+    def random_preview_batches(components, options, step):
+        pairs = getattr(components, "artist_pairs", None)
+        if pairs is None or pairs.local_root is None:
+            raise ValueError("Random preview pairs require a local artist index with cached tags and latents")
+        rng = random.Random(options["seed"] + step)
+        subset = pairs.processor.subsets[0]
+        for _ in range(options["num_pairs"]):
+            a, b = rng.sample(range(len(pairs.rows)), 2)
+            yield dict(id_a=[str(pairs.rows[a]["id"])], id_b=[str(pairs.rows[b]["id"])],
+                       subsets_a=[subset], subsets_b=[subset])
+
     @torch.no_grad()
     def sample_images(self, components, stream, config, folder, step, batches_seen):
         options = get_style_sampling_options(config)
         device = next(components.dit.parameters()).device
+        decode_device = options.get("vae_decode_device", device)
+        if torch.device(decode_device) != device and getattr(components, "latent_cache", None) is None:
+            raise ValueError("A separate preview VAE device requires cached latents")
+        random_pairs = options.get("pair_source") == "random"
+        if random_pairs:
+            stream = self.random_preview_batches(components, options, step)
         was_training = components.dit.training
         components.dit.eval()
         count = 0
         try:
             while count < options["num_pairs"]:
                 batch = next(stream)
-                batches_seen += 1
+                if not random_pairs:
+                    batches_seen += 1
                 for pair in iter_image_pairs_batch(batch):
                     seed = config.get("seed", 42) + count
                     prepared = prepare_anima_batch(components, pair, device, random.Random(seed), review=True)
@@ -136,7 +177,7 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                                 ref_kv=cache if options.get("ref_in_uncond", False) else None).float()
                             velocity = unconditional + options["guidance_scale"] * (velocity - unconditional)
                         latent += (right - left) * velocity
-                    result = components.vae.decode_from_dit(latent)
+                    result = components.vae.decode_from_dit(latent.to(decode_device))
                     if "image_a" not in pair:
                         pair["image_a"] = components.artist_pairs.preview_image(pair["id_a"][0])
                         pair["image_b"] = components.artist_pairs.preview_image(pair["id_b"][0])

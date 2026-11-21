@@ -65,11 +65,38 @@ class StyleStageTimer:
             logger.info("stage[%d.%d] %s %.3fs", self.step, self.microbatch, name, elapsed)
 
 
+def _soft_plateau_bounds(center, width, uniform_probability):
+    if (not math.isfinite(center) or not 0 <= center <= 1 or not math.isfinite(width) or width <= 0
+            or not math.isfinite(uniform_probability) or not 0 <= uniform_probability <= 1):
+        raise ValueError("soft_plateau requires center in [0, 1], positive width and uniform_probability in [0, 1]")
+    lower, upper = [-center / width, (1 - center) / width]
+    lower, upper = [max(value, 0) + math.log1p(math.exp(-abs(value))) for value in (lower, upper)]
+    if not math.isfinite(upper) or upper <= lower:
+        raise ValueError("soft_plateau width exceeds the numerical range")
+    return lower, upper
+
+
+def soft_plateau_cdf(sigma, center=0.5, width=0.055, uniform_probability=0.05):
+    """Probability below sigma for a normalized smooth step plus uniform tail."""
+    lower, upper = _soft_plateau_bounds(center, width, uniform_probability)
+    value = (sigma - center) / width
+    integral = max(value, 0) + math.log1p(math.exp(-abs(value)))
+    return uniform_probability * sigma + (1 - uniform_probability) * (integral - lower) / (upper - lower)
+
+
 def sample_style_sigmas(
     batch_size, device, mean=-0.5, std=0.9, minimum=0.05, maximum=0.7, tail_probability=0.05, tail_maximum=0.95,
-    distribution="bounded_logit_normal",
+    distribution="bounded_logit_normal", center=0.5, width=0.055, uniform_probability=0.05,
 ):
     """Sample noise sigma; the progress distribution has no interior cutoffs."""
+    if distribution == "soft_plateau":
+        lower, upper = _soft_plateau_bounds(center, width, uniform_probability)
+        values = torch.rand(batch_size, device=device)
+        integral = lower + values * (upper - lower)
+        # Invert softplus using log(expm1(x)) in a form stable for large x.
+        smooth = center + width * (integral + torch.log(-torch.expm1(-integral)))
+        uniform = torch.rand(batch_size, device=device) < uniform_probability
+        return torch.where(uniform, values, smooth).clamp(0, 1)
     values = (torch.randn(batch_size, device=device) * std + mean).sigmoid()
     if distribution == "progress_logit_normal":
         # values is denoising progress over the entire (0, 1) trajectory.
@@ -522,7 +549,9 @@ def validate_style_config(config):
         raise ValueError("Loss weights must be finite/nonnegative with at least one positive weight")
     noise = config.get("noise", {})
     distribution = noise.get("distribution", "bounded_logit_normal")
-    if distribution == "progress_logit_normal":
+    if distribution == "soft_plateau":
+        soft_plateau_cdf(0.5, noise.get("center", 0.5), noise.get("width", 0.055), noise.get("uniform_probability", 0.05))
+    elif distribution == "progress_logit_normal":
         if any(key in noise for key in ("minimum", "maximum", "tail_probability", "tail_maximum")):
             raise ValueError("progress_logit_normal uses only mean/std, without cutoffs or a separate tail")
     elif distribution == "bounded_logit_normal":

@@ -169,19 +169,24 @@ checked against the dataset and preprocessing settings at startup.
 
 ## Colab
 
-Upload `tools/colab/anima_style_setup.ipynb` after pushing the branch. The notebook
-expects `images.tar`, `latents.tar` and `tag-cache.json` together under
-`MyDrive/moss-training/anima-1000-p10-512/`, and stages all three on Colab SSD.
+The notebook now defaults to the refinement phase described in
+[anima_plateau_colab.md](anima_plateau_colab.md). Run
+`tools/prepare_anima_colab_upload.py` to package the original step-20,000
+adapter. Push the updated Git branch and upload the initialization ZIP under
+`MyDrive/moss-training/anima-v2a-plateau/`, then open the packaged notebook.
+The existing dataset and caches come from
+`MyDrive/moss-training/anima-1000-p10-512-all-paired/`. Source code and training
+inputs are staged on Colab SSD.
 The trainer reads NPZ members by offset from the staged `latents.tar` and
 verifies each selected payload. It reads tags from the single JSON file.
 For local training, `--latent-cache PATH\TO\latents.tar` selects the same reader.
-The options cell sets the Drive path to `step-074000`. Setup reads that adapter's
+The options cell stages `init-step-020000.zip`. Setup reads that adapter's
 saved model revisions and downloads Anima base, Qwen3, the T5 tokenizer and the
 VAE for previews. The config loads tags from the staged JSON.
 
-To initialize a new run from a checkpoint produced by this trainer, set
-`INIT_CHECKPOINT` in the notebook to the old `step-XXXXXX` directory and choose a
-new `RUN_NAME`. Use the latest step confirmed by `Drive verified step-XXXXXX`.
+To initialize another phase, prepare its initialization ZIP with
+`--checkpoint` and update `INIT_ARCHIVE`, `INIT_CHECKPOINT` and `RUN_NAME` in
+the notebook. Use the latest step confirmed by `Drive verified step-XXXXXX`.
 For a manually configured launch, set `reference_adapter` to
 `{"format": "anima_checkpoint", "path": "/path/to/old/step-XXXXXX"}`.
 The source directory supplies `adapter_model.safetensors` and `adapter_config.json`.
@@ -200,9 +205,11 @@ seed and may fall back to the lifetime batch count.
 
 The run uses batch size one, accumulation two, a 512-square pixel budget with
 aspect buckets, AdamW8bit, and the decaying cyclic cosine schedule. It defaults
-to 100,000 optimizer updates with previews and saves every 1,000 updates. The
-background uploader verifies each checkpoint on Drive and retains the latest
-three. `CHECKPOINT_BLOCKS=0` disables recomputation. If the assigned GPU runs
+to 20,000 additional optimizer updates with three 30-step previews and saves
+every 300 updates. The smooth noise plateau keeps about 90% of draws above
+50% noise. The background uploader verifies each checkpoint on Drive and
+retains the latest three, and snapshots local logs and previews every minute.
+`CHECKPOINT_BLOCKS=0` disables recomputation. If the assigned GPU runs
 out of memory, set `CHECKPOINT_BLOCKS=28` and rerun the settings and launch cells.
 `COMPILE` controls per-block Inductor compilation. Preview JPEGs are ordered A, B,
 generated result, with a JSON sidecar containing prompt, seed and source IDs.

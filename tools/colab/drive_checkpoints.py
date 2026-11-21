@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -65,6 +66,8 @@ class DriveCheckpointPublisher:
         self.folder_id = parent
         self.staging_dir = Path("/content/anima-checkpoint-staging") / self.folder_id
         self.staging_dir.mkdir(parents=True, exist_ok=True)
+        self.run_signatures = {}
+        self.run_folders = {".": self.folder_id}
 
     def children(self, parent, name=None):
         query = f"'{parent}' in parents and trashed = false"
@@ -175,8 +178,58 @@ class DriveCheckpointPublisher:
             except (HttpError, OSError) as error:
                 print(f"Checkpoint verified. Retention will retry after the next upload: {error}", flush=True)
 
-    def watch(self, stop):
+    def sync_run_files(self, run_dir):
+        """Publish stable SSD snapshots of logs, previews and TensorBoard events."""
+        run_dir = Path(run_dir).resolve()
+        paths = [run_dir / name for name in ("config.json", "launch_config.json", "metrics.jsonl", "console.log")]
+        paths += list((run_dir / "samples").rglob("*.jpg")) + list((run_dir / "samples").rglob("*.json"))
+        paths += list((run_dir / "tensorboard").glob("events.out.tfevents*"))
+        uploaded = 0
+        for path in paths:
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(run_dir)
+            stat = path.stat()
+            signature = (stat.st_size, stat.st_mtime_ns)
+            if self.run_signatures.get(str(relative)) == signature:
+                continue
+            parent = self.folder_id
+            for directory in relative.parents[::-1][1:]:
+                key = str(directory)
+                if key not in self.run_folders:
+                    folder = self.find_folder(parent, directory.name)
+                    if folder is None:
+                        folder = self.files.create(body={"name": directory.name, "parents": [parent],
+                            "mimeType": FOLDER_MIME}, fields="id,name").execute(num_retries=3)
+                    self.run_folders[key] = folder["id"]
+                parent = self.run_folders[key]
+            matches = list(self.children(parent, path.name))
+            if len(matches) > 1:
+                raise ValueError(f"Duplicate Drive run file: {relative}")
+            existing = matches[0] if matches else None
+            # Appending logs can change during upload. Snapshot first so Drive
+            # validates the exact bytes that were sent, while training continues.
+            with tempfile.TemporaryDirectory(prefix=".run-upload-", dir=self.staging_dir) as temporary:
+                snapshot = Path(temporary) / path.name
+                shutil.copyfile(path, snapshot)
+                size, checksum = file_signature(snapshot)
+                if existing is None or (existing.get("size"), existing.get("md5Checksum")) != (size, checksum):
+                    result = self.upload_file(parent, snapshot, existing)
+                    if (result.get("size"), result.get("md5Checksum")) != (size, checksum):
+                        raise IOError(f"Drive checksum or size mismatch for run file {relative}")
+                    uploaded += 1
+            self.run_signatures[str(relative)] = signature
+        if uploaded:
+            print(f"Drive synchronized {uploaded} run files (logs, previews and TensorBoard)", flush=True)
+
+    def watch(self, stop, run_dir=None, sync_interval=60):
+        last_sync = -float("inf")
         while not stop.is_set():
             self.publish_pending()
+            if run_dir is not None and time.monotonic() - last_sync >= sync_interval:
+                self.sync_run_files(run_dir)
+                last_sync = time.monotonic()
             stop.wait(2)
         self.publish_pending()
+        if run_dir is not None:
+            self.sync_run_files(run_dir)

@@ -14,6 +14,7 @@ CHECKPOINT_FILES = ("adapter_model.safetensors", "adapter_config.json", "trainin
 FOLDER_MIME = "application/vnd.google-apps.folder"
 FILE_FIELDS = "id,name,mimeType,size,md5Checksum,appProperties"
 UPLOAD_MARKER = ".drive-confirmed"
+RUN_FILES_MARKER = ".drive-run-files-confirmed"
 
 
 def is_rate_limit_error(error):
@@ -28,6 +29,11 @@ def is_rate_limit_error(error):
         return False
     reasons = {item.get("reason") for item in payload.get("error", {}).get("errors", [])}
     return bool(reasons & {"rateLimitExceeded", "userRateLimitExceeded"})
+
+
+def is_connection_error(error):
+    status = getattr(getattr(error, "resp", None), "status", None)
+    return isinstance(error, (TimeoutError, ConnectionError)) or status in (408, 500, 502, 503, 504)
 
 
 def checkpoint_step(name):
@@ -87,9 +93,9 @@ class DriveCheckpointPublisher:
         self.run_signatures = {}
         self.run_folders = {".": self.folder_id}
 
-    def request(self, operation):
-        """Pace calls and retry per-minute quota failures in the upload worker."""
-        delay = 30
+    def request(self, operation, retry_timeout=False):
+        """Pace calls, backing off on quota errors and resumable upload timeouts."""
+        delay = 60
         while True:
             remaining = self.next_request_at - time.monotonic()
             if remaining > 0:
@@ -98,14 +104,16 @@ class DriveCheckpointPublisher:
             try:
                 return operation()
             except Exception as error:
-                if not is_rate_limit_error(error):
+                quota = is_rate_limit_error(error)
+                if not quota and not (retry_timeout and is_connection_error(error)):
                     raise
                 wait = delay + random.uniform(0, 1)
-                print(f"Drive request quota reached; upload will retry in {wait:.0f}s. SSD checkpoints remain queued.", flush=True)
+                reason = "request quota reached" if quota else "upload connection interrupted"
+                print(f"Drive {reason}; upload will retry in {wait:.0f}s. SSD checkpoints remain queued.", flush=True)
                 time.sleep(wait)
-                delay = min(delay * 2, 60)
+                delay = min(delay * 2, 300)
 
-    def execute(self, request, num_retries=3):
+    def execute(self, request, num_retries=0):
         return self.request(lambda: request.execute(num_retries=num_retries))
 
     def children(self, parent, name=None):
@@ -150,7 +158,8 @@ class DriveCheckpointPublisher:
                 request = self.files.update(fileId=existing["id"], media_body=media, fields=FILE_FIELDS)
             result = None
             while result is None:
-                _, result = self.request(lambda: request.next_chunk(num_retries=5))
+                # One retry controller: SDK retries would bypass our pacing.
+                _, result = self.request(lambda: request.next_chunk(num_retries=0), retry_timeout=True)
             return result
 
     def publish(self, checkpoint):
@@ -200,18 +209,29 @@ class DriveCheckpointPublisher:
             for old in managed[:-self.keep_last]:
                 self.execute(self.files.update(fileId=old["id"], body={"trashed": True}))
 
-    def publish_pending(self):
+    def publish_pending(self, run_dir=None):
         from googleapiclient.errors import HttpError
 
+        processed = False
         for checkpoint in completed_checkpoints(self.staging_dir):
-            if (checkpoint / UPLOAD_MARKER).is_file():
+            uploaded = (checkpoint / UPLOAD_MARKER).is_file()
+            run_files_uploaded = run_dir is None or (checkpoint / RUN_FILES_MARKER).is_file()
+            if uploaded and run_files_uploaded:
                 continue
-            print(f"Uploading {checkpoint.name} from Colab SSD to Drive", flush=True)
-            try:
-                self.publish(checkpoint)
-            except HttpError as error:
-                raise RuntimeError(f"Drive upload failed for {checkpoint.name} (HTTP {error.resp.status}). "
-                                   f"The local checkpoint remains in {checkpoint} for retry.") from None
+            if not uploaded:
+                print(f"Uploading {checkpoint.name} from Colab SSD to Drive", flush=True)
+                try:
+                    self.publish(checkpoint)
+                except HttpError as error:
+                    if is_connection_error(error):
+                        raise
+                    raise RuntimeError(f"Drive upload failed for {checkpoint.name} (HTTP {error.resp.status}). "
+                                       f"The local checkpoint remains in {checkpoint} for retry.") from None
+            if not run_files_uploaded:
+                self.sync_run_files(run_dir)
+                (checkpoint / RUN_FILES_MARKER).write_text("verified\n", encoding="utf-8")
+            processed = True
+        if processed:
             try:
                 self.prune()
             except (HttpError, OSError) as error:
@@ -265,14 +285,25 @@ class DriveCheckpointPublisher:
         if uploaded:
             print(f"Drive synchronized {uploaded} run files (logs, previews and TensorBoard)", flush=True)
 
-    def watch(self, stop, run_dir=None, sync_interval=60):
-        last_sync = -float("inf")
-        while not stop.is_set():
-            self.publish_pending()
-            if run_dir is not None and time.monotonic() - last_sync >= sync_interval:
-                self.sync_run_files(run_dir)
-                last_sync = time.monotonic()
+    def watch(self, stop, run_dir=None, sync_interval=None):
+        # Accept the old notebook's interval argument for compatibility. Run
+        # files now sync only as part of a completed checkpoint's publication.
+        delay = 60
+        while True:
+            finishing = stop.is_set()
+            try:
+                self.publish_pending(run_dir)
+            except Exception as error:
+                if not is_connection_error(error):
+                    raise
+                # Metadata creation can time out after succeeding remotely.
+                # Reconcile folders/files on the next pass instead of blindly
+                # repeating the create request and making duplicate folders.
+                print(f"Drive connection interrupted ({error}); retrying queued saves in {delay}s.", flush=True)
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+                continue
+            delay = 60
+            if finishing:
+                return
             stop.wait(2)
-        self.publish_pending()
-        if run_dir is not None:
-            self.sync_run_files(run_dir)

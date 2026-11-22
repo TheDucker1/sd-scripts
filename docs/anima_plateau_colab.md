@@ -64,9 +64,11 @@ The default run name is `anima-v2a-plateau-512`. Outputs are published under
 - Save every 300 updates and at the end. Keep three completed checkpoints after
   the Drive API confirms their sizes and checksums.
 - Write logs, TensorBoard events and previews on SSD. A background API uploader
-  publishes snapshots every 60 seconds while training continues.
+  publishes their snapshots only when a completed checkpoint is uploaded.
+  Between saves, local log updates do not trigger Drive uploads or API polling.
 - Use the existing Colab Drive authentication. Uploads use 128 MiB chunks,
-  cache file IDs and pace API calls. Per-minute quota errors retry with backoff
+  cache file IDs and pace API calls through one retry controller. Per-minute
+  quota errors and resumable upload timeouts retry with backoff
   in the background while completed checkpoints stay queued on SSD. Training
   continues during these waits; a runtime loss can still lose queued uploads.
 - Initialize this phase from adapter weights at the first launch. Later launches

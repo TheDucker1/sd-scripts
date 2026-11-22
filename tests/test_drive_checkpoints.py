@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from tools.colab.drive_checkpoints import CHECKPOINT_FILES, FOLDER_MIME, UPLOAD_MARKER, DriveCheckpointPublisher, is_rate_limit_error
+from tools.colab.drive_checkpoints import (
+    CHECKPOINT_FILES, FOLDER_MIME, RUN_FILES_MARKER, UPLOAD_MARKER,
+    DriveCheckpointPublisher, is_connection_error, is_rate_limit_error,
+)
+
+
+class FakeHttpError(Exception):
+    pass
 
 
 class TestDriveCheckpointPublisher(unittest.TestCase):
@@ -30,6 +37,9 @@ class TestDriveCheckpointPublisher(unittest.TestCase):
         self.publisher.run_files = {}
         self.publisher.run_signatures = {}
         self.publisher.run_folders = {".": "run"}
+        errors = mock.patch.dict("sys.modules", {"googleapiclient.errors": SimpleNamespace(HttpError=FakeHttpError)})
+        errors.start()
+        self.addCleanup(errors.stop)
 
     def quota_error(self, status=403, reason="rateLimitExceeded"):
         error = Exception(reason)
@@ -51,7 +61,104 @@ class TestDriveCheckpointPublisher(unittest.TestCase):
         operation = mock.Mock(side_effect=[self.quota_error(), self.quota_error(), "uploaded"])
         self.assertEqual(self.publisher.request(operation), "uploaded")
         self.assertEqual(operation.call_count, 3)
-        self.assertEqual(sleep.call_args_list, [mock.call(30), mock.call(60)])
+        self.assertEqual(sleep.call_args_list, [mock.call(60), mock.call(120)])
+
+    @mock.patch("tools.colab.drive_checkpoints.random.uniform", return_value=0)
+    @mock.patch("tools.colab.drive_checkpoints.time.sleep")
+    def test_resumable_upload_retries_ssl_timeout(self, sleep, uniform):
+        operation = mock.Mock(side_effect=[TimeoutError("The read operation timed out"), "uploaded"])
+        self.assertEqual(self.publisher.request(operation, retry_timeout=True), "uploaded")
+        self.assertEqual(operation.call_count, 2)
+        sleep.assert_called_once_with(60)
+
+    def test_transient_http_and_connection_errors(self):
+        self.assertTrue(is_connection_error(TimeoutError()))
+        self.assertTrue(is_connection_error(ConnectionResetError()))
+        self.assertTrue(is_connection_error(self.quota_error(status=503)))
+        self.assertFalse(is_connection_error(self.quota_error(status=403)))
+        self.assertFalse(is_connection_error(ValueError("invalid checkpoint")))
+
+    def test_sdk_does_not_make_unpaced_metadata_retries(self):
+        request = mock.Mock()
+        self.publisher.execute(request)
+        request.execute.assert_called_once_with(num_retries=0)
+
+    @mock.patch("tools.colab.drive_checkpoints.random.uniform", return_value=0)
+    @mock.patch("tools.colab.drive_checkpoints.time.sleep")
+    def test_upload_keeps_resumable_request_after_timeout(self, sleep, uniform):
+        publisher = self.publisher
+        request = publisher.files.update.return_value
+        result = {"id": "remote-file", "size": "10", "md5Checksum": "checksum"}
+        request.next_chunk.side_effect = [TimeoutError("SSL read timed out"), (None, None), (None, result)]
+        media = SimpleNamespace(MediaIoBaseUpload=mock.Mock())
+        with mock.patch.dict("sys.modules", {"googleapiclient.http": media}):
+            actual = publisher.upload_file("run", self.checkpoint / CHECKPOINT_FILES[0], {"id": "remote-file"})
+        self.assertEqual(actual, result)
+        publisher.files.update.assert_called_once()
+        self.assertEqual(request.next_chunk.call_args_list, [mock.call(num_retries=0)] * 3)
+        sleep.assert_called_once_with(60)
+
+    def test_run_files_sync_once_per_completed_checkpoint(self):
+        publisher = self.publisher
+        publisher.publish = mock.Mock(side_effect=lambda path: (path / UPLOAD_MARKER).write_text("remote-id"))
+        publisher.sync_run_files = mock.Mock()
+        publisher.prune = mock.Mock()
+        run = self.root / "local-run"
+        run.mkdir()
+        log = run / "console.log"
+        log.write_text("first step\n")
+        publisher.publish_pending(run)
+        log.write_text("first step\nsecond step\n")
+        publisher.publish_pending(run)
+        publisher.publish.assert_called_once_with(self.checkpoint)
+        publisher.sync_run_files.assert_called_once_with(run)
+        publisher.prune.assert_called_once()
+        self.assertTrue((self.checkpoint / RUN_FILES_MARKER).is_file())
+
+        next_checkpoint = self.root / "step-000003"
+        next_checkpoint.mkdir()
+        publisher.publish_pending(run)  # Ignore a save still being written.
+        self.assertEqual(publisher.sync_run_files.call_count, 1)
+        for name in CHECKPOINT_FILES:
+            (next_checkpoint / name).write_bytes(b"next save")
+        publisher.publish_pending(run)
+        self.assertEqual(publisher.publish.call_count, 2)
+        self.assertEqual(publisher.sync_run_files.call_count, 2)
+
+    def test_failed_run_sync_stays_pending_without_reuploading_checkpoint(self):
+        publisher = self.publisher
+        publisher.publish = mock.Mock(side_effect=lambda path: (path / UPLOAD_MARKER).write_text("remote-id"))
+        publisher.sync_run_files = mock.Mock(side_effect=[TimeoutError("offline"), None])
+        publisher.prune = mock.Mock()
+        with self.assertRaises(TimeoutError):
+            publisher.publish_pending(self.root)
+        self.assertFalse((self.checkpoint / RUN_FILES_MARKER).exists())
+        publisher.prune.assert_not_called()
+        publisher.publish_pending(self.root)
+        publisher.publish.assert_called_once()
+        self.assertEqual(publisher.sync_run_files.call_count, 2)
+        self.assertTrue((self.checkpoint / RUN_FILES_MARKER).is_file())
+
+    def test_idle_watch_makes_no_drive_calls_even_with_legacy_interval(self):
+        publisher = self.publisher
+        (self.checkpoint / UPLOAD_MARKER).write_text("remote-id")
+        (self.checkpoint / RUN_FILES_MARKER).write_text("verified")
+        publisher.sync_run_files = mock.Mock()
+        stop = mock.Mock()
+        stop.is_set.side_effect = [False, True]
+        publisher.watch(stop, self.root, sync_interval=0)
+        publisher.sync_run_files.assert_not_called()
+        self.assertEqual(publisher.files.mock_calls, [])
+
+    @mock.patch("tools.colab.drive_checkpoints.time.sleep")
+    def test_watch_reconciles_after_metadata_timeout_and_drains(self, sleep):
+        publisher = self.publisher
+        publisher.publish_pending = mock.Mock(side_effect=[TimeoutError("offline"), None, None])
+        stop = mock.Mock()
+        stop.is_set.side_effect = [False, False, True]
+        publisher.watch(stop, self.root)
+        self.assertEqual(publisher.publish_pending.call_count, 3)
+        sleep.assert_called_once_with(60)
 
     @mock.patch("tools.colab.drive_checkpoints.time.sleep")
     def test_permission_error_still_fails(self, sleep):

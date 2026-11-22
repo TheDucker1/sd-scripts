@@ -98,14 +98,20 @@ def export_adapter(config, weights, step, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="Native checkpoint directory, ZIP or adapter .safetensors file")
-    parser.add_argument("--output", type=Path, required=True, help="Destination .safetensors file")
+    parser.add_argument("--output", type=Path, required=True, help="Destination .safetensors file; adds snapref- if needed for node discovery")
     parser.add_argument("--step", type=int, help="Training step, for adapter-only downloads without complete.json")
     args = parser.parse_args()
     if args.step is not None and args.step < 0:
         parser.error("--step must be nonnegative")
     torch.set_num_threads(min(4, torch.get_num_threads()))
     output = args.output.resolve()
-    if output.suffix.lower() != ".safetensors" or output.exists():
+    if output.suffix.lower() != ".safetensors":
+        parser.error("--output must be a .safetensors file")
+    # SnapRef's dropdown filters by path text before reading file metadata.
+    if "snapref" not in output.name.lower() and "anima_ref_kv" not in output.name:
+        output = output.with_name("snapref-" + output.name)
+        print(f"Using SnapRef-discoverable output name: {output.name}")
+    if output.exists():
         parser.error("--output must be a new .safetensors file")
     output.parent.mkdir(parents=True, exist_ok=True)
 

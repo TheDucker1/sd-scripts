@@ -49,7 +49,7 @@ The architecture accepts an explicit `ref_context` for that purpose.
 Run the CPU-only exporter from the repository root in Windows CMD:
 
 ```cmd
-"C:\Users\d\.conda\envs\ml\python.exe" tools\export_anima_snapref.py "12000-new" --step 12000 --output "12000-new\anima-style-step-012000-comfyui.safetensors"
+"C:\Users\d\.conda\envs\ml\python.exe" tools\export_anima_snapref.py "12000-new" --step 12000 --output "12000-new\snapref-anima-style-step-012000-comfyui.safetensors"
 ```
 
 The input can be a native checkpoint directory, a checkpoint ZIP, or the
@@ -57,6 +57,12 @@ The input can be a native checkpoint directory, a checkpoint ZIP, or the
 configuration embedded in the weights. A full checkpoint supplies its step
 through `complete.json`; use `--step` when that file is absent. The output path
 must be new.
+
+SnapRef's adapter dropdown filters names for `snapref` or `anima_ref_kv` before
+reading metadata. The exporter adds a `snapref-` filename prefix when needed
+and prints the resulting path. For an existing export missing from the picker,
+rename the file to include `snapref`, then refresh ComfyUI's model list. The
+weights and metadata can stay as they are.
 
 The exporter converts both LoRA branches and the learned reference-mode vector
 to the SnapRef BF16 inference format. It loads no base model, text encoder or

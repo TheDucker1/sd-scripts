@@ -1,12 +1,14 @@
 """Check checkpoint publication and retention with a fake Drive API."""
 
 import hashlib
+import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from tools.colab.drive_checkpoints import CHECKPOINT_FILES, FOLDER_MIME, UPLOAD_MARKER, DriveCheckpointPublisher
+from tools.colab.drive_checkpoints import CHECKPOINT_FILES, FOLDER_MIME, UPLOAD_MARKER, DriveCheckpointPublisher, is_rate_limit_error
 
 
 class TestDriveCheckpointPublisher(unittest.TestCase):
@@ -23,8 +25,50 @@ class TestDriveCheckpointPublisher(unittest.TestCase):
         self.publisher.folder_id = "run"
         self.publisher.keep_last = 1
         self.publisher.files = mock.Mock()
+        self.publisher.request_interval = 0
+        self.publisher.next_request_at = 0
+        self.publisher.run_files = {}
         self.publisher.run_signatures = {}
         self.publisher.run_folders = {".": "run"}
+
+    def quota_error(self, status=403, reason="rateLimitExceeded"):
+        error = Exception(reason)
+        error.resp = SimpleNamespace(status=status)
+        error.content = json.dumps({"error": {"errors": [{"reason": reason}]}}).encode()
+        return error
+
+    def test_recognizes_only_request_rate_limits(self):
+        self.assertTrue(is_rate_limit_error(self.quota_error()))
+        self.assertTrue(is_rate_limit_error(self.quota_error(reason="userRateLimitExceeded")))
+        self.assertTrue(is_rate_limit_error(self.quota_error(status=429)))
+        self.assertFalse(is_rate_limit_error(self.quota_error(reason="insufficientPermissions")))
+        self.assertFalse(is_rate_limit_error(self.quota_error(status=500)))
+        self.assertFalse(is_rate_limit_error(ValueError("invalid checkpoint")))
+
+    @mock.patch("tools.colab.drive_checkpoints.random.uniform", return_value=0)
+    @mock.patch("tools.colab.drive_checkpoints.time.sleep")
+    def test_quota_errors_retry_without_losing_the_operation(self, sleep, uniform):
+        operation = mock.Mock(side_effect=[self.quota_error(), self.quota_error(), "uploaded"])
+        self.assertEqual(self.publisher.request(operation), "uploaded")
+        self.assertEqual(operation.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(30), mock.call(60)])
+
+    @mock.patch("tools.colab.drive_checkpoints.time.sleep")
+    def test_permission_error_still_fails(self, sleep):
+        operation = mock.Mock(side_effect=self.quota_error(reason="insufficientPermissions"))
+        with self.assertRaisesRegex(Exception, "insufficientPermissions"):
+            self.publisher.request(operation)
+        operation.assert_called_once()
+        sleep.assert_not_called()
+
+    @mock.patch("tools.colab.drive_checkpoints.time.monotonic", return_value=10)
+    @mock.patch("tools.colab.drive_checkpoints.time.sleep")
+    def test_paces_successful_requests(self, sleep, monotonic):
+        self.publisher.request_interval = 1
+        self.publisher.next_request_at = 11
+        self.assertEqual(self.publisher.request(lambda: "uploaded"), "uploaded")
+        sleep.assert_called_once_with(1)
+        self.assertEqual(self.publisher.next_request_at, 11)
 
     def test_run_files_upload_stable_snapshots_and_retry_changed_logs(self):
         publisher = self.publisher
@@ -53,6 +97,7 @@ class TestDriveCheckpointPublisher(unittest.TestCase):
         publisher.sync_run_files(run)
         self.assertIn(("run", log.name, b"first line\nsecond line\n"), seen)
         self.assertEqual(len(seen), 3)
+        self.assertEqual(publisher.children.call_count, 2)
         publisher.sync_run_files(run)
         self.assertEqual(len(seen), 3)
 

@@ -44,6 +44,30 @@ optimizer updates. The reference caption defaults to empty and is independent of
 A's prompt. Fixed nonempty reference captions can also be cached during inference.
 The architecture accepts an explicit `ref_context` for that purpose.
 
+## Export for ComfyUI
+
+Run the CPU-only exporter from the repository root in Windows CMD:
+
+```cmd
+"C:\Users\d\.conda\envs\ml\python.exe" tools\export_anima_snapref.py "12000-new" --step 12000 --output "12000-new\anima-style-step-012000-comfyui.safetensors"
+```
+
+The input can be a native checkpoint directory, a checkpoint ZIP, or the
+`adapter_model.safetensors` file itself. Adapter-only downloads use the
+configuration embedded in the weights. A full checkpoint supplies its step
+through `complete.json`; use `--step` when that file is absent. The output path
+must be new.
+
+The exporter converts both LoRA branches and the learned reference-mode vector
+to the SnapRef BF16 inference format. It loads no base model, text encoder or
+VAE and uses no GPU. Training checkpoints keep their FP32 tensors.
+
+Copy the resulting file into `ComfyUI/models/loras/` and select it in the
+[SnapRef custom node](https://github.com/ArcAnima/SnapRef), using Character &
+Style (`cs`) mode. This trainer exports that single mode. Use the SnapRef node
+to load the adapter; the standard LoRA loader does not implement its reference
+branch or mode embedding.
+
 ## Data and loss
 
 The existing persistent Danbooru artist/date index is reusable without rebuilding.

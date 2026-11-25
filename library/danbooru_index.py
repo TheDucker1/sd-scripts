@@ -13,6 +13,7 @@ import os
 import re
 import time
 import threading
+from collections import OrderedDict
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -120,6 +121,37 @@ class LocalRangeReader:
     def __del__(self):
         if hasattr(self, "handle"):
             self.handle.close()
+
+
+class LocalShardReaders:
+    """Bound local tar handles for large resized datasets; safe for fetch threads."""
+
+    def __init__(self, root, archives, max_open=8):
+        self.root, self.archives, self.max_open = Path(root), archives, max_open
+        self.readers, self.lock = OrderedDict(), threading.Lock()
+
+    def fetch(self, archive_id, offset, length):
+        # Keep the handle alive through its read, including LRU eviction.
+        with self.lock:
+            reader = self.readers.pop(archive_id, None)
+            if reader is None:
+                archive = self.archives[archive_id]
+                reader = LocalRangeReader(index_path(self.root, archive["file"]), archive["size"])
+            self.readers[archive_id] = reader
+            while len(self.readers) > self.max_open:
+                _, old = self.readers.popitem(last=False)
+                old.close()
+            return reader.fetch(offset, length)
+
+    def close(self):
+        with self.lock:
+            for reader in self.readers.values():
+                reader.close()
+            self.readers.clear()
+
+    def __del__(self):
+        if hasattr(self, "readers"):
+            self.close()
 
 
 class RemoteRangeReader(io.RawIOBase):

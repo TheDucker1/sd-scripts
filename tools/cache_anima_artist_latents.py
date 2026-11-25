@@ -61,7 +61,7 @@ def prepare_latents(config, dataset, output, vae_path, device="cuda", dtype=None
     from library.moss_image_style_dataset import MossStylePairDataset
 
     manifest, _, _ = load_artist_index(dataset)
-    if manifest.get("storage") not in ("local", "local_tar"):
+    if manifest.get("storage") not in ("local", "local_tar", "local_shards"):
         raise ValueError("Worker accepts only a completed offline artist dataset; no remote image fetching")
     config = build_cache_config(config, dataset, output, dtype)
     dataset = MossStylePairDataset(seed=config.get("seed", 42), **config["data"])

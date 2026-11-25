@@ -11,7 +11,7 @@ from library import config_util
 from library.streaming_dataset import make_stream_bucket_manager
 
 
-ARTIST_INDEX_OPTIONS = ("artist_index", "index_fetch_workers", "index_cache_bytes")
+ARTIST_INDEX_OPTIONS = ("artist_index", "index_fetch_workers", "index_cache_bytes", "artist_sampling")
 
 
 def style_stream_user_config(settings):
@@ -126,7 +126,7 @@ class MossStylePairDataset(IterableDataset):
     """Pair consecutive stream images or sample from a persisted artist index."""
 
     def __init__(self, shards=None, seed=42, artist_index=None, index_fetch_workers=2,
-                 index_cache_bytes=256 * 1024 * 1024, **settings):
+                 index_cache_bytes=256 * 1024 * 1024, artist_sampling="image_random", **settings):
         super().__init__()
         if shards is not None:
             settings["shards"] = [str(shard) for shard in shards]
@@ -138,7 +138,8 @@ class MossStylePairDataset(IterableDataset):
         if artist_index:
             from library.moss_image_artist_dataset import MossArtistPairs
 
-            self.artist_pairs = MossArtistPairs(artist_index, self.dataset, seed, index_fetch_workers, index_cache_bytes)
+            self.artist_pairs = MossArtistPairs(artist_index, self.dataset, seed, index_fetch_workers,
+                                               index_cache_bytes, artist_sampling)
 
     def set_seed(self, seed):
         self.dataset.seed = seed

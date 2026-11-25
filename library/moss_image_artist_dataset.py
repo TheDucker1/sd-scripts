@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 import torch
 
-from library.danbooru_index import LocalRangeReader, RemoteRangeReader, index_path, load_artist_index, validate_archive_image
+from library.danbooru_index import LocalRangeReader, LocalShardReaders, RemoteRangeReader, index_path, load_artist_index, validate_archive_image
 from library.streaming_dataset import stream_rgb_image
 
 
@@ -36,9 +36,13 @@ def validate_metadata_mismatch(reader, row, payload):
 class MossArtistPairs:
     """Reuse StreamingDataset's image/caption settings, replacing only pairing/I/O."""
 
-    def __init__(self, directory, processor, seed=42, fetch_workers=2, cache_bytes=256 * 1024 * 1024):
+    def __init__(self, directory, processor, seed=42, fetch_workers=2, cache_bytes=256 * 1024 * 1024,
+                 sampling="image_random"):
         self.manifest, self.rows, self.artists = load_artist_index(directory)
         self.processor, self.seed = processor, seed
+        if sampling not in ("image_random", "artist_cycle"):
+            raise ValueError("artist_sampling must be image_random or artist_cycle")
+        self.sampling = sampling
         if len(processor.subsets) != 1 or processor.params.world_size != 1:
             raise ValueError("Artist-index training currently requires one subset and world_size=1")
         if not isinstance(fetch_workers, int) or not 1 <= fetch_workers <= 8:
@@ -53,7 +57,8 @@ class MossArtistPairs:
         self._build_pair_bounds()
         self.local_root = None
         self.local_tar = None
-        if self.manifest.get("storage") in ("local", "local_tar"):
+        self.local_shards = None
+        if self.manifest.get("storage") in ("local", "local_tar", "local_shards"):
             self.local_root = Path(directory).resolve()
             with np.load(index_path(directory, self.manifest["index_file"]), allow_pickle=False) as data:
                 self.local_files, self.local_sha256 = data["files"], data["sha256"]
@@ -61,7 +66,9 @@ class MossArtistPairs:
                     or self.local_sha256.shape != (count,) or self.local_sha256.dtype != np.dtype("S64")):
                 raise ValueError("Invalid local image/checksum table")
             self.readers = []
-            if self.manifest["storage"] == "local_tar":
+            if self.manifest["storage"] == "local_shards":
+                self.local_shards = LocalShardReaders(self.local_root, self.manifest["archives"])
+            elif self.manifest["storage"] == "local_tar":
                 with np.load(index_path(directory, self.manifest["index_file"]), allow_pickle=False) as data:
                     self.tar_offsets = data["tar_offsets"]
                 size = self.manifest["local_tar"]["size"]
@@ -73,11 +80,13 @@ class MossArtistPairs:
             self.readers = [RemoteRangeReader(item["url"], item["size"]) for item in self.manifest["archives"]]
         logger.info("Loaded artist index into RAM: %d images, %d artists, revision=%s", count,
                     self.manifest["artist_count"], self.manifest["revision"])
+        logger.info("Artist pairing sampler: %s; %d active artists", self.sampling, len(self.artist_ranges))
 
     def _build_pair_bounds(self):
         count = len(self.rows)
         self.left, self.right = np.empty(count, dtype=np.int64), np.empty(count, dtype=np.int64)
         groups = np.r_[0, np.flatnonzero(np.diff(self.rows["artist"])) + 1, count]
+        self.artist_ranges = list(zip(groups[:-1], groups[1:]))
         window = self.manifest["pair_max_days"] * 86400
         for start, end in zip(groups[:-1], groups[1:]):
             times = self.rows["timestamp"][start:end]
@@ -119,7 +128,9 @@ class MossArtistPairs:
         if not 0 < row["size"] <= subset.max_member_bytes:
             raise ValueError(f"Post {key} exceeds max_member_bytes")
         if self.local_root is not None:
-            if self.local_tar is not None:
+            if getattr(self, "local_shards", None) is not None:
+                payload = self.local_shards.fetch(int(row["archive"]), int(row["offset"]), int(row["size"]))
+            elif self.local_tar is not None:
                 payload = self.local_tar.fetch(int(self.tar_offsets[index]), int(row["size"]))
             else:
                 path = index_path(self.local_root, str(self.local_files[index]))
@@ -165,11 +176,22 @@ class MossArtistPairs:
             raise ValueError("Artist-index loading requires num_workers=0")
         rng = random.Random(self.seed)
         count, failures = 0, 0
-        # Sampling already randomizes across the complete eligible RAM table;
-        # the sequential loader's shuffle window is not needed for this backend.
+        artists = list(range(len(self.artist_ranges)))
+        cursor = len(artists)
+        limit = len(artists) if self.sampling == "artist_cycle" else len(self.rows)
+        # Shuffle artist visits without replacement, then choose an A/B pair
+        # within that artist. Rebuild ranges after cache/tag preprocessing rejects.
         with ThreadPoolExecutor(max_workers=self.fetch_workers, thread_name_prefix="artist-image") as pool:
-            while self.processor.params.repeat or count < len(self.rows):
-                a = rng.randrange(len(self.rows))
+            while self.processor.params.repeat or count < limit:
+                if self.sampling == "artist_cycle":
+                    if cursor == len(artists):
+                        rng.shuffle(artists)
+                        cursor = 0
+                    start, end = self.artist_ranges[artists[cursor]]
+                    cursor += 1
+                    a = rng.randrange(int(start), int(end))
+                else:
+                    a = rng.randrange(len(self.rows))
                 left, right = int(self.left[a]), int(self.right[a])
                 b = rng.randrange(left, right - 1)
                 if b >= a:

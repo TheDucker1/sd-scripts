@@ -1,5 +1,10 @@
 # Download an offline artist subset
 
+For the larger local dataset strategy—one original tar at a time, high-quality
+512-pixel-budget JPEG buckets, one compact output tar, then original deletion—see
+[resized artist shards](resized_artist_dataset.md). That worker resumes per tar
+and preserves artist/date pairing metadata.
+
 `tools/download_artist_dataset.py` runs locally without importing torch, loading
 models, scanning tars or downloading metadata. It accepts your completed
 `dataset-index` ZIP directly, or an extracted index directory. From a ZIP it

@@ -25,3 +25,6 @@ tests/mask_viz/
 # local-only regression tests (local model paths, recorded references)
 tests/local/models.toml
 tests/local/references/
+
+# Resized Danbooru downloads, temporary originals and generated indexes
+/danbooru-artists-512/

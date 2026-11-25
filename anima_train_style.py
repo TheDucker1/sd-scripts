@@ -11,6 +11,7 @@ from PIL import Image
 
 from moss_image_train_style import MossImageStyleTrainer, setup_parser as setup_style_parser
 from library import compile_utils
+from library.anima_latent_pair_filter import AnimaClassifierPairFilter, AnimaLatentPairFilter
 from library.anima_reference import reference_block, target_block
 from library.anima_style_train_utils import build_anima_style_components, prepare_anima_batch
 from library.moss_image_style_dataset import iter_image_pairs_batch
@@ -28,12 +29,29 @@ def setup_parser():
     parser.add_argument("--vae_batch_size", type=int, default=None)
     parser.add_argument("--latent_cache_dir", default=None, help="Local SSD directory for standard Anima NPZ caches")
     parser.add_argument("--tag_cache", default=None, help="Portable tag-cache.json from the Anima tag worker")
+    filtering = parser.add_mutually_exclusive_group()
+    filtering.add_argument("--latent_pair_max_mse", type=float, default=None,
+                        help="Reject artist pairs with clean latent MSE at or below this value; requires cached latents")
+    filtering.add_argument("--latent_pair_classifier", default=None, help="Portable pair classifier JSON for CPU duplicate filtering")
+    parser.add_argument("--latent_pair_scores", default=None, help="Optional compatible precomputed pair score NPZ")
+    parser.add_argument("--latent_pair_min_score", type=float, default=None, help="Classifier rejection score, default 0.95")
     return parser
 
 
 class AnimaStyleTrainer(MossImageStyleTrainer):
     def train_config(self, config, output_dir, device="cpu", compile_args=None, resume=None):
         config = dict(config)
+        pair_threshold = getattr(compile_args, "latent_pair_max_mse", None)
+        if pair_threshold is not None:
+            config["latent_pair_filter"] = dict(config.get("latent_pair_filter", {}), enabled=True, method="mse", max_mse=pair_threshold)
+        classifier = getattr(compile_args, "latent_pair_classifier", None)
+        if classifier is not None:
+            config["latent_pair_filter"] = dict(config.get("latent_pair_filter", {}), enabled=True, method="classifier", model=classifier)
+        for argument, key in (("latent_pair_scores", "scores"), ("latent_pair_min_score", "min_score")):
+            value = getattr(compile_args, argument, None)
+            if value is not None:
+                config.setdefault("latent_pair_filter", {})[key] = value
+        AnimaLatentPairFilter.from_config(config.get("latent_pair_filter", {}))
         if config.pop("auto_resume", False) and resume is None:
             root = Path(getattr(compile_args, "checkpoint_dir", None) or output_dir)
             files = ("complete.json", "training_state.pt", "adapter_config.json", "adapter_model.safetensors")
@@ -71,6 +89,16 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                 loader.dataset.latent_cache = components.latent_cache
             logger.info("Using cached Anima captions for %d images; tagger unloaded; training image reads=%s",
                         len(pairs.rows), "disabled" if pairs.skip_image_reads else "enabled")
+        pair_filter = AnimaLatentPairFilter.from_config(config.get("latent_pair_filter", {}))
+        if pair_filter is not None:
+            cache = getattr(components, "latent_cache", None)
+            if pairs is None or cache is None:
+                raise ValueError("latent_pair_filter requires an artist index and cached Anima latents")
+            loader.dataset.latent_cache = cache
+            loader.dataset.latent_pair_filter = pair_filter
+            if isinstance(pair_filter, AnimaClassifierPairFilter):
+                pair_filter.bind_dataset(pairs, config)
+            logger.info("Pair filtering: reject %s; resample within existing artist/date rules", pair_filter.description)
 
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":

@@ -135,6 +135,7 @@ class MossStylePairDataset(IterableDataset):
         self.bucket_sizes = self.dataset.bucket_manager.predefined_resos
         self.artist_pairs = None
         self.latent_cache = None
+        self.latent_pair_filter = None
         if artist_index:
             from library.moss_image_artist_dataset import MossArtistPairs
 
@@ -152,7 +153,13 @@ class MossStylePairDataset(IterableDataset):
                 yield from self.artist_pairs
             else:
                 for pair in self.artist_pairs:
-                    yield dict(pair, latent_a=self.latent_cache[pair["id_a"]][0], latent_b=self.latent_cache[pair["id_b"]][0])
+                    if self.latent_pair_filter is None:
+                        latents = self.latent_cache[pair["id_a"]][0], self.latent_cache[pair["id_b"]][0]
+                    else:
+                        latents = self.latent_pair_filter(self.latent_cache, pair["id_a"], pair["id_b"])
+                        if latents is None:
+                            continue
+                    yield dict(pair, latent_a=latents[0], latent_b=latents[1])
             return
         pending = None
         for image in self.dataset:

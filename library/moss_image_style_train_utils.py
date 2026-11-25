@@ -734,7 +734,7 @@ def load_style_checkpoint(folder, components, optimizer, config):
         for value in (saved_config, current_config):
             for key in ("cache_latents", "cache_latents_to_disk", "vae_batch_size", "latent_cache_dir", "latent_cache",
                         "checkpoint_cpu_offload", "checkpoint_blocks", "gradient_checkpointing", "tag_cache",
-                        "offload_text_encoder", "trim_text_padding"):
+                        "offload_text_encoder", "trim_text_padding", "latent_pair_filter"):
                 value.pop(key, None)
             value["training"].pop("resume_data_mode", None)
     if saved_config != current_config:

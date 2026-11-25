@@ -1,0 +1,140 @@
+{
+  "initialization": "pretrained",
+  "auto_resume": true,
+  "content_loss": "flow_l2",
+  "cache_latents": true,
+  "cache_latents_to_disk": true,
+  "vae_batch_size": 1,
+  "latent_cache_dir": "work/anima-1000-p10-512-all-paired/latents",
+  "latent_cache": {
+    "reserve_ram_gib": 8,
+    "precomputed_dir": "work/anima-1000-p10-512-all-paired/latents",
+    "load_to_memory": false
+  },
+  "data": {
+    "datasets": [
+      {
+        "batch_size": 1,
+        "resolution": [
+          512,
+          512
+        ],
+        "enable_bucket": true,
+        "max_pixels": 262144,
+        "min_bucket_reso": 256,
+        "max_bucket_reso": 1536,
+        "bucket_reso_steps": 64,
+        "bucket_no_upscale": false,
+        "max_aspect_ratio": 3.0,
+        "repeat": true,
+        "shuffle_buffer": 0,
+        "shuffle_caption": true,
+        "resize_interpolation": "area",
+        "subsets": [
+          {
+            "caption_tag_dropout_rate": 0.1
+          }
+        ]
+      }
+    ],
+    "artist_index": "artists-1000-p10-all-paired",
+    "index_cache_bytes": 0
+  },
+  "reference_adapter": {
+    "format": "anima_checkpoint",
+    "path": "work/anima-snapref-v2a-512/run-high-noise/step-020000"
+  },
+  "seed": 42,
+  "dtype": "bfloat16",
+  "gradient_checkpointing": true,
+  "checkpoint_blocks": null,
+  "max_prompt_length": 512,
+  "offload_text_encoder": true,
+  "assets_manifest": "work/anima-snapref-v2a-512/train.assets.json",
+  "tagger": {
+    "dtype": "bfloat16",
+    "max_tags": 256,
+    "prompt_categories": [
+      "general",
+      "character",
+      "copyright"
+    ],
+    "thresholds": {
+      "general": 0.17,
+      "character": 0.27,
+      "style": 0.15,
+      "copyright": 0.24,
+      "meta": 0.17,
+      "rating": 0.41
+    }
+  },
+  "noise": {
+    "distribution": "soft_plateau",
+    "center": 0.5,
+    "width": 0.055,
+    "uniform_probability": 0.05
+  },
+  "sampling": {
+    "enabled": true,
+    "every_n_steps": 300,
+    "at_end": true,
+    "num_pairs": 3,
+    "steps": 30,
+    "pair_source": "random",
+    "vae_decode_device": "cpu",
+    "guidance_scale": 3.0,
+    "flow_shift": 5.0,
+    "jpeg_quality": 95,
+    "preview_max_side": 0,
+    "reference_cutoff_sigma": 0.75,
+    "use_reference": true,
+    "ref_in_uncond": false
+  },
+  "training": {
+    "max_steps": 20000,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 2,
+    "optimizer_type": "AdamW8bit",
+    "learning_rate": 3e-05,
+    "optimizer_args": [
+      "weight_decay=0.01",
+      "betas=(0.9, 0.999)",
+      "eps=1e-8"
+    ],
+    "lr_scheduler": "cosine_cycles",
+    "warmup_steps": 0,
+    "lr_cycles": 5,
+    "min_lr_ratio": 0.01,
+    "num_workers": 0,
+    "prefetch_batches": 2,
+    "content_weight": 1.0,
+    "style_weight": 0.0,
+    "max_grad_norm": 1.0,
+    "save_every": 300,
+    "keep_last_checkpoints": 3,
+    "tensorboard": true,
+    "history_limit": 1000,
+    "resume_data_mode": "reseed",
+    "log_timing": true,
+    "log_stage_timing": false
+  },
+  "architecture": "anima",
+  "adapter": {
+    "ref": {
+      "rank": 128,
+      "alpha": 128
+    },
+    "tgt": {
+      "rank": 64,
+      "alpha": 64
+    }
+  },
+  "tag_cache": "work/anima-1000-p10-512-all-paired/tags/tag-cache.json",
+  "checkpoint_cpu_offload": true,
+  "trim_text_padding": true,
+  "reference_dropout": {
+    "enabled": true,
+    "center": 0.75,
+    "width": 0.05
+  }
+}

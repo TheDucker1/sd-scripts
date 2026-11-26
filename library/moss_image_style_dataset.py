@@ -62,12 +62,12 @@ def resolve_style_dataset_config(config):
             raise ValueError("Artist index is unfinished; complete the dataset builder before training")
         config["dataset_index"] = dict(revision=manifest["revision"], sha256=manifest["index_sha256"])
     if config.get("tag_cache") and (config.get("architecture") != "anima" or not config["data"].get("artist_index")
-                                    or manifest.get("storage") not in ("local", "local_tar")):
+                                    or manifest.get("storage") not in ("local", "local_tar", "local_shards")):
         raise ValueError("Offline Anima tags require a completed local or staged artist index")
     for name in ("cache_latents", "cache_latents_to_disk", "cache_text_encoder_outputs", "cache_text_encoder_outputs_to_disk"):
         if config.get(name) or config["training"].get(name):
             if (name in ("cache_latents", "cache_latents_to_disk") and config.get("cache_latents") and config.get("architecture") == "anima"
-                    and config["data"].get("artist_index") and manifest.get("storage") in ("local", "local_tar")):
+                    and config["data"].get("artist_index") and manifest.get("storage") in ("local", "local_tar", "local_shards")):
                 continue
             raise ValueError(f"{name} is unavailable for strict streaming and on-the-fly prompts")
     for name in ("num_workers", "max_data_loader_n_workers"):

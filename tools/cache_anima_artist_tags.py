@@ -3,14 +3,37 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import random
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from download_artist_dataset import OutputLock
+from tools.download_artist_dataset import OutputLock
 from library.danbooru_index import file_sha256, write_index_json
+
+
+def read_tag_journal(path, captions):
+    """Recover completed batches and discard only an interrupted trailing write."""
+    if not path.exists():
+        return
+    with path.open("r+b") as handle:
+        while True:
+            start = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                handle.seek(start)
+                handle.truncate()
+                break
+            saved = json.loads(line)
+            if not isinstance(saved, dict) or any(value is not None and not isinstance(value, str) for value in saved.values()):
+                raise ValueError("Invalid caption batch in tag progress journal")
+            if captions.keys() & saved.keys():
+                raise ValueError("Duplicate IDs in tag progress journal")
+            captions.update(saved)
 
 
 def cache_tags(pairs, settings, output, source, load_tagger, batch_size, device):
@@ -34,17 +57,23 @@ def cache_tags(pairs, settings, output, source, load_tagger, batch_size, device)
         if captions.keys() & saved.keys():
             raise ValueError(f"Duplicate IDs in tag cache progress: {part}")
         captions.update(saved)
+    journal = output / "batches.jsonl"
+    read_tag_journal(journal, captions)
     indices = {str(int(row["id"])): index for index, row in enumerate(pairs.rows)}
     if captions.keys() - indices.keys():
         raise ValueError("Tag cache progress contains unknown image IDs")
     pending = [post_id for post_id in indices if post_id not in captions]
+    if "archive" in pairs.rows.dtype.names and "offset" in pairs.rows.dtype.names:
+        pending.sort(key=lambda post_id: (int(pairs.rows[indices[post_id]]["archive"]),
+                                          int(pairs.rows[indices[post_id]]["offset"])))
 
     def read(post_id):
         return pairs.process(pairs.fetch(indices[post_id]), random.Random(int(post_id)))
 
     if pending:
         tagger = load_tagger().requires_grad_(False).eval()
-        with ThreadPoolExecutor(max_workers=pairs.fetch_workers) as pool, tqdm(
+        with journal.open("a", encoding="utf-8", newline="\n") as handle, \
+                ThreadPoolExecutor(max_workers=pairs.fetch_workers) as pool, tqdm(
             total=len(indices), initial=len(captions), unit="image", desc="Cache Anima tags"
         ) as bar:
             for offset in range(0, len(pending), batch_size):
@@ -56,9 +85,13 @@ def cache_tags(pairs, settings, output, source, load_tagger, batch_size, device)
                     scores = tagger([image for _, image in valid])
                     prompts = tagger.prompts(scores, random.Random(0), shuffle=False)
                     result.update(zip((post_id for post_id, _ in valid), prompts))
-                write_index_json(output / f"part-{len(parts) + offset // batch_size:08d}.json", result)
+                handle.write(json.dumps(result, ensure_ascii=True) + "\n")
+                handle.flush()
+                if offset % 256 < batch_size:
+                    os.fsync(handle.fileno())
                 captions.update(result)
                 bar.update(len(ids))
+            os.fsync(handle.fileno())
 
     path = output / "tag-cache.json"
     write_index_json(path, dict(progress, captions=captions))

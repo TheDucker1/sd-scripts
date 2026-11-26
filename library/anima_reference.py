@@ -14,6 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from library import attention
 from library.anima_models import apply_rotary_pos_emb
 from library.danbooru_index import file_sha256
 
@@ -118,8 +119,11 @@ def load_snapref_adapter(model, path, mode="cs"):
             for key, parameter in mapping.items():
                 parameter.copy_(handle.get_tensor(key))
             model.reference_mode.copy_(handle.get_tensor(mode_key)[modes.index(mode)])
-    return dict(format="snapref_v1a", mode=mode, sha256=file_sha256(path), source_step=metadata.get("step"),
-                source_name=metadata.get("name"), source_version=metadata.get("version"), tensors=len(expected))
+    provenance = dict(format="snapref_v1a", mode=mode, sha256=file_sha256(path), source_step=metadata.get("step"),
+                      source_name=metadata.get("name"), source_version=metadata.get("version"), tensors=len(expected))
+    if metadata.get("compression") is not None:
+        provenance["compression"] = metadata["compression"]
+    return provenance
 
 
 def reference_rope(model, height, width, frame, shift, device):
@@ -165,8 +169,13 @@ def _qkv(module, value, context, rope, stream):
 
 
 def _attention(module, q, k, v, stream):
-    result = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-    return _linear(module.output_proj, result.transpose(1, 2).flatten(2), stream)
+    if getattr(module, "reference_attention_mode", "torch") == "flash":
+        params = attention.AttentionParams.create_attention_params("flash", False)
+        result = attention.attention(q, k, v, attn_params=params)
+    else:
+        result = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        result = result.transpose(1, 2).flatten(2)
+    return _linear(module.output_proj, result, stream)
 
 
 def reference_block(block, value, embedding, extra, context, rope):
@@ -176,6 +185,19 @@ def reference_block(block, value, embedding, extra, context, rope):
     value = value + mods[0][2] * _attention(module, q, k, v, "ref").reshape_as(value)
     value = finish_block(block, value, mods, context, "ref")
     return value, k, v
+
+
+def configure_reference_attention(model, mode):
+    if mode not in ("torch", "flash"):
+        raise ValueError("Anima attn_mode must be torch or flash")
+    if mode == "flash":
+        if attention.flash_attn_func is None:
+            raise ValueError("attn_mode=flash requires the flash-attn package with forward/backward support")
+        if model.model.device.type != "cuda" or model.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("attn_mode=flash requires CUDA and a BF16/FP16 frozen base")
+    for block in model.layers:
+        for module in (block.self_attn, block.cross_attn):
+            module.reference_attention_mode = mode
 
 
 def finish_block(block, value, mods, context, stream):

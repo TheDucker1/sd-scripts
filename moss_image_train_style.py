@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 class MossImageStyleTrainer:
     """Single-reference MOSS trainer with stream/index pairs and configurable losses."""
 
+    def prepare_training_batch(self, components, batch, config, device, stage_timer):
+        return batch
+
     def train(self, args: argparse.Namespace):
         setup_logging(args, reset=True)
         torch.set_num_threads(args.num_threads)
@@ -271,17 +274,21 @@ class MossImageStyleTrainer:
                     for microbatch in range(accumulation):
                         stage_timer = StyleStageTimer(device, log_stages, step, microbatch + 1,
                                                       verbose=train.get("verbose_stage_timing", False))
-                        data_start = time.perf_counter()
-                        try:
-                            with stage_timer.measure("data_wait"):
-                                batch = next(stream)
-                        except StopIteration as error:
-                            raise RuntimeError(
-                                "Dataset exhausted before max_steps; enable data.repeat or provide more shards"
-                            ) from error
-                        data_seconds += time.perf_counter() - data_start
+                        while True:
+                            data_start = time.perf_counter()
+                            try:
+                                with stage_timer.measure("data_wait"):
+                                    batch = next(stream)
+                            except StopIteration as error:
+                                raise RuntimeError(
+                                    "Dataset exhausted before max_steps; enable data.repeat or provide more shards"
+                                ) from error
+                            data_seconds += time.perf_counter() - data_start
+                            batches_seen += 1
+                            batch = self.prepare_training_batch(components, batch, config, device, stage_timer)
+                            if batch is not None:
+                                break
                         pairs_seen += len(batch["id_a"])
-                        batches_seen += 1
                         loss, values, prepared = self.process_batch(components, batch, config, device, prompt_rng, step - 1, stage_timer)
                         if not torch.isfinite(loss):
                             raise FloatingPointError(f"Nonfinite loss at step {step}")

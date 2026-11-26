@@ -85,6 +85,7 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
             if len(selected) != len(pairs.rows):
                 pairs.restrict_to_indices(selected)
             components.cached_tags = tags
+            components.artist_pairs = pairs
             if getattr(components, "latent_cache", None) is not None:
                 pairs.skip_image_reads = True
                 components.artist_pairs = pairs
@@ -94,13 +95,49 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
         pair_filter = AnimaLatentPairFilter.from_config(config.get("latent_pair_filter", {}))
         if pair_filter is not None:
             cache = getattr(components, "latent_cache", None)
-            if pairs is None or cache is None:
-                raise ValueError("latent_pair_filter requires an artist index and cached Anima latents")
-            loader.dataset.latent_cache = cache
-            loader.dataset.latent_pair_filter = pair_filter
+            if pairs is None:
+                raise ValueError("latent_pair_filter requires an artist index")
+            if cache is None:
+                if config.get("cache_latents", False):
+                    raise ValueError("Configured Anima latent cache was not prepared")
+                components.online_pair_filter = pair_filter
+            else:
+                loader.dataset.latent_cache = cache
+                loader.dataset.latent_pair_filter = pair_filter
             if isinstance(pair_filter, AnimaClassifierPairFilter):
                 pair_filter.bind_dataset(pairs, config)
             logger.info("Pair filtering: reject %s; resample within existing artist/date rules", pair_filter.description)
+
+    @torch.no_grad()
+    def prepare_training_batch(self, components, batch, config, device, stage_timer):
+        pair_filter = getattr(components, "online_pair_filter", None)
+        if getattr(components, "latent_cache", None) is not None:
+            return batch
+        if pair_filter is None and not config.get("vae_encoder_only", False):
+            return batch
+        from library.moss_image_style_train_utils import encode_style_images
+
+        batch = dict(batch)
+        for source, target, label in (("image_a", "latent_a", "vae_encode_A"), ("image_b", "latent_b", "vae_encode_B")):
+            with stage_timer.measure(label):
+                # Encoding is always batch one, including mixed image buckets.
+                batch[target] = [encode_style_images(components.vae, image[None].to(device))[0]
+                                 for image in batch[source]]
+        if pair_filter is None:
+            return batch
+        retained = []
+        with stage_timer.measure("pair_filter"):
+            for index, (id_a, id_b) in enumerate(zip(batch["id_a"], batch["id_b"])):
+                current = {id_a: (batch["latent_a"][index], None), id_b: (batch["latent_b"][index], None)}
+                if pair_filter(current, id_a, id_b) is not None:
+                    retained.append(index)
+        if not retained:
+            return None
+        if len(retained) == len(batch["id_a"]):
+            return batch
+        return {name: [value[index] for index in retained] if isinstance(value, list) else value[retained]
+                for name, value in batch.items()}
+
 
     def load_target_model(self, config, device):
         if config.get("architecture") != "anima" or config.get("content_loss") != "flow_l2":
@@ -139,6 +176,8 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
             raise ValueError("Anima style compilation supports --compile_scope blocks --compile_modules dit")
         # Bind the block as a module argument: checkpoint and eager use the same
         # function, while Dynamo guards each module's parameters normally.
+        if args.compile_cache_size_limit is not None:
+            torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
         options = dict(backend=args.compile_backend, dynamic=args.compile_dynamic != "false",
                        fullgraph=args.compile_fullgraph, mode=args.compile_mode)
         components.dit.reference_step = torch.compile(reference_block, **options)
@@ -159,20 +198,28 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
     def random_preview_batches(components, options, step):
         pairs = getattr(components, "artist_pairs", None)
         if pairs is None or pairs.local_root is None:
-            raise ValueError("Random preview pairs require a local artist index with cached tags and latents")
+            raise ValueError("Random preview pairs require a local artist index and offline tags")
         rng = random.Random(options["seed"] + step)
         subset = pairs.processor.subsets[0]
         for _ in range(options["num_pairs"]):
             a, b = rng.sample(range(len(pairs.rows)), 2)
-            yield dict(id_a=[str(pairs.rows[a]["id"])], id_b=[str(pairs.rows[b]["id"])],
-                       subsets_a=[subset], subsets_b=[subset])
+            batch = dict(id_a=[str(pairs.rows[a]["id"])], id_b=[str(pairs.rows[b]["id"])],
+                         subsets_a=[subset], subsets_b=[subset])
+            if getattr(components, "latent_cache", None) is None:
+                for index, name in ((a, "image_a"), (b, "image_b")):
+                    image = pairs.process(pairs.fetch(index), rng)
+                    if image is None:
+                        raise ValueError("Selected preview image failed the training geometry filters")
+                    batch[name] = image["image"].unsqueeze(0)
+            yield batch
 
     @torch.no_grad()
     def sample_images(self, components, stream, config, folder, step, batches_seen):
         options = get_style_sampling_options(config)
         device = next(components.dit.parameters()).device
         decode_device = options.get("vae_decode_device", device)
-        if torch.device(decode_device) != device and getattr(components, "latent_cache", None) is None:
+        if (torch.device(decode_device) != device and getattr(components, "latent_cache", None) is None
+                and not getattr(components.vae, "encoder_only", False)):
             raise ValueError("A separate preview VAE device requires cached latents")
         random_pairs = options.get("pair_source") == "random"
         if random_pairs:

@@ -9,7 +9,7 @@ from torch import nn
 
 from library import anima_models, anima_utils, qwen_image_autoencoder_kl, strategy_anima
 from library.anima_caption_sampling import process_anima_caption
-from library.anima_reference import AnimaReference, install_reference_lora, load_snapref_adapter
+from library.anima_reference import AnimaReference, configure_reference_attention, install_reference_lora, load_snapref_adapter
 from library.moss_image_style_train_utils import (
     BytePromptTokenizer, DTYPES, MossStyleComponents, StylePromptTagger,
     StyleStageTimer, encode_style_images, load_style_adapter_weights,
@@ -28,6 +28,7 @@ class AnimaStyleVAE(nn.Module):
         self.source_path = source_path
         self.spatial_compression_ratio = model.spatial_compression_ratio if model is not None else 8
         self.z_dim = model.z_dim if model is not None else 16
+        self.encoder_only = False
 
     @property
     def dtype(self):
@@ -55,9 +56,26 @@ class AnimaStyleVAE(nn.Module):
             raise RuntimeError("VAE encoder was released after caching; encountered an uncached image")
         return self.model.encode_pixels_to_latents(pixels.to(self.dtype))
 
+    def keep_encoder_on(self, device):
+        if self.model is None:
+            raise ValueError("Encoder residency requires an uncached VAE")
+        self.model.encoder.to(device)
+        self.model.quant_conv.to(device)
+        self.model.decoder.to("cpu")
+        self.model.post_quant_conv.to("cpu")
+        self.encoder_only = True
+
     def decode_from_dit(self, latents):
         self.ensure_loaded(latents.device)
-        return self.model.decode_to_pixels(latents.to(self.dtype))
+        if not self.encoder_only:
+            return self.model.decode_to_pixels(latents.to(self.dtype))
+        self.model.decoder.to(latents.device)
+        self.model.post_quant_conv.to(latents.device)
+        try:
+            return self.model.decode_to_pixels(latents.to(self.dtype))
+        finally:
+            self.model.decoder.to("cpu")
+            self.model.post_quant_conv.to("cpu")
 
 
 def build_anima_style_components(config, device):
@@ -147,6 +165,7 @@ def build_anima_style_components(config, device):
     if count is None:
         count = len(model.blocks) if config.get("gradient_checkpointing", False) else 0
     dit = AnimaReference(model, count)
+    configure_reference_attention(dit, config.get("attn_mode", "torch"))
     dit.checkpoint_cpu_offload = config.get("checkpoint_cpu_offload", False)
     if dit.checkpoint_cpu_offload and not count:
         raise ValueError("checkpoint_cpu_offload requires checkpointed Anima blocks")
@@ -176,6 +195,11 @@ def build_anima_style_components(config, device):
         placement = "cpu" if module is text and config.get("offload_text_encoder", False) else device
         module.requires_grad_(False).eval().to(device=placement)
         module._apply(lambda tensor: tensor.to(dtype) if tensor.is_floating_point() else tensor)
+    if config.get("vae_encoder_only", False):
+        if config.get("cache_latents", False):
+            raise ValueError("vae_encoder_only is for online encoding; disable latent caching")
+        components.vae.keep_encoder_on(device)
+        logger.info("Online VAE: encoder resident on %s; decoder on CPU; no dataset latent cache", device)
     logger.info("Anima Qwen device=%s; trim text padding=%s", next(text.parameters()).device, components.trim_text_padding)
     return components
 
@@ -235,7 +259,13 @@ def prepare_anima_batch(components, batch, device, rng, current_step=0, max_step
         if getattr(components, "empty_context", None) is None:
             components.empty_context = anima_context(components, [""], device)
         ref_context = components.empty_context.expand(len(prompts), -1, -1)
-    if cache is not None:
+    if "latent_a" in batch:
+        with timer.measure("latent_cache"):
+            latents = [latent.to(device, non_blocking=True) for latent in batch["latent_a"]]
+            reference = [latent.to(device, non_blocking=True) for latent in batch["latent_b"]]
+            if all(len({value.shape for value in values}) == 1 for values in (latents, reference)):
+                latents, reference = torch.stack(latents), torch.stack(reference)
+    elif cache is not None:
         def cached(ids, pixels):
             values = []
             for index, post_id in enumerate(ids):
@@ -245,12 +275,8 @@ def prepare_anima_batch(components, batch, device, rng, current_step=0, max_step
                 values.append(latent.to(device))
             return values
         with timer.measure("latent_cache"):
-            if "latent_a" in batch:
-                latents = [latent.to(device, non_blocking=True) for latent in batch["latent_a"]]
-                reference = [latent.to(device, non_blocking=True) for latent in batch["latent_b"]]
-            else:
-                latents = cached(batch["id_a"], a)
-                reference = cached(batch["id_b"], b)
+            latents = cached(batch["id_a"], a)
+            reference = cached(batch["id_b"], b)
             if all(len({value.shape for value in values}) == 1 for values in (latents, reference)):
                 latents, reference = torch.stack(latents), torch.stack(reference)
     else:

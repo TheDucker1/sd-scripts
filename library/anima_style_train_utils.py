@@ -8,12 +8,12 @@ import torch
 from torch import nn
 
 from library import anima_models, anima_utils, qwen_image_autoencoder_kl, strategy_anima
+from library.anima_caption_sampling import process_anima_caption
 from library.anima_reference import AnimaReference, install_reference_lora, load_snapref_adapter
 from library.moss_image_style_train_utils import (
     BytePromptTokenizer, DTYPES, MossStyleComponents, StylePromptTagger,
     StyleStageTimer, encode_style_images, load_style_adapter_weights,
 )
-from library.streaming_dataset import process_stream_caption
 
 
 logger = logging.getLogger(__name__)
@@ -207,7 +207,8 @@ def anima_context(components, prompts, device):
 
 
 @torch.no_grad()
-def prepare_anima_batch(components, batch, device, rng, current_step=0, max_steps=0, timer=None, review=False):
+def prepare_anima_batch(components, batch, device, rng, current_step=0, max_steps=0, timer=None, review=False,
+                        tag_retention=None):
     timer = timer or StyleStageTimer(device)
     cache = getattr(components, "latent_cache", None)
     tags = getattr(components, "cached_tags", None)
@@ -222,9 +223,11 @@ def prepare_anima_batch(components, batch, device, rng, current_step=0, max_step
             prompts = components.tagger.prompts(components.tagger(move(a)), rng, shuffle="subsets_a" not in batch)
     else:
         prompts = [tags[post_id] for post_id in batch["id_a"]]
-    if "subsets_a" in batch:
-        prompts = [process_stream_caption(prompt, subset, rng, current_step, max_steps, review=review)
-                   for prompt, subset in zip(prompts, batch["subsets_a"])]
+    if "subsets_a" in batch or tag_retention is not None:
+        subsets = batch.get("subsets_a", [None] * len(prompts))
+        prompts = [process_anima_caption(prompt, subset, rng, current_step, max_steps,
+                                        options=tag_retention, review=review)
+                   for prompt, subset in zip(prompts, subsets)]
     with timer.measure("qwen"):
         context = anima_context(components, prompts, device)
         if isinstance(context, list):

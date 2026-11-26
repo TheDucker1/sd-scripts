@@ -11,6 +11,7 @@ from PIL import Image
 
 from moss_image_train_style import MossImageStyleTrainer, setup_parser as setup_style_parser
 from library import compile_utils
+from library.anima_caption_sampling import validate_anima_tag_retention
 from library.anima_latent_pair_filter import AnimaClassifierPairFilter, AnimaLatentPairFilter
 from library.anima_reference import reference_block, target_block
 from library.anima_style_train_utils import build_anima_style_components, prepare_anima_batch
@@ -41,6 +42,7 @@ def setup_parser():
 class AnimaStyleTrainer(MossImageStyleTrainer):
     def train_config(self, config, output_dir, device="cpu", compile_args=None, resume=None):
         config = dict(config)
+        validate_anima_tag_retention(config.get("tag_retention"))
         pair_threshold = getattr(compile_args, "latent_pair_max_mse", None)
         if pair_threshold is not None:
             config["latent_pair_filter"] = dict(config.get("latent_pair_filter", {}), enabled=True, method="mse", max_mse=pair_threshold)
@@ -144,7 +146,8 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
 
     def process_batch(self, components, batch, config, device, prompt_rng, current_step=0, stage_timer=None):
         train = config["training"]
-        prepared = prepare_anima_batch(components, batch, device, prompt_rng, current_step, train["max_steps"], stage_timer)
+        prepared = prepare_anima_batch(components, batch, device, prompt_rng, current_step, train["max_steps"], stage_timer,
+                                       tag_retention=config.get("tag_retention"))
         latents = prepared["latents"]
         sigmas = sample_style_sigmas(len(latents), device, **config.get("noise", {}))
         noise = [torch.randn_like(value) for value in latents] if isinstance(latents, list) else torch.randn_like(latents)

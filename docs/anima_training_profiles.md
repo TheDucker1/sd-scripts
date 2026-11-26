@@ -22,6 +22,11 @@ The high-noise and refinement profiles use shuffled artist cycles. Reference
 dropout is disabled in both. The dropout and sparse profiles record experiments,
 not recommended replacements for the dense high-noise recipe.
 
+The newer [variable tag-retention profile](../configs/anima_style_svd_r32_tag_retention_local.json)
+keeps the rank-32 high-noise recipe and samples tag retention per prompt, using a
+Beta(5, 2) curve peaking at 80%. See [caption sampling](anima_caption_sampling.md)
+for its settings. The four archived profiles above preserve their original rates.
+
 ## Noise distributions
 
 Sigma is the noise fraction in `z_sigma = (1 - sigma) * z_image + sigma * noise`.

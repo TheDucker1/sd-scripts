@@ -35,6 +35,11 @@
   "gradient_checkpointing": false,
   "checkpoint_blocks": 0,
   "max_prompt_length": 512,
+  "tag_retention": {
+    "distribution": "beta",
+    "alpha": 5.0,
+    "beta": 2.0
+  },
   "offload_text_encoder": false,
   "assets_manifest": "/content/anima-models/resolved_models.json",
   "tagger": {

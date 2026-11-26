@@ -1,4 +1,4 @@
-"""Run only the PixAI tagger over a local artist index and save portable captions."""
+"""Run only a local PyTorch tagger over an artist index and save portable captions."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -105,9 +105,10 @@ def main():
     parser.add_argument("--dataset", type=Path, required=True, help="Completed local or staged artist index directory")
     parser.add_argument("--output", type=Path, required=True, help="Resumable cache directory")
     parser.add_argument("--config", type=Path, default=root / "configs/anima_style_colab.json")
+    parser.add_argument("--tagger-config", type=Path, help="Tagger-only settings JSON, replacing the config's tagger section")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--tagger", type=Path, help="Existing PixAI model directory")
-    source.add_argument("--download-tagger", action="store_true", help="Download only PixAI from the Anima model manifest")
+    source.add_argument("--tagger", type=Path, help="Existing timm-compatible model directory")
+    source.add_argument("--download-tagger", action="store_true", help="Download only the configured tagger")
     parser.add_argument("--tagger-download-dir", type=Path, default=Path("cache/anima-tagger"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=4)
@@ -124,6 +125,8 @@ def main():
     if device.type == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA is unavailable; use a CUDA PyTorch environment or --device cpu")
     config = json.loads(args.config.read_text(encoding="utf-8"))
+    if args.tagger_config is not None:
+        config["tagger"] = json.loads(args.tagger_config.read_text(encoding="utf-8"))
     config["data"].update(artist_index=str(args.dataset.resolve()), index_cache_bytes=0)
     config = resolve_style_dataset_config(config)
     pairs = MossStylePairDataset(**config["data"]).artist_pairs
@@ -135,12 +138,17 @@ def main():
 
         manifest = json.loads((root / "configs/anima_colab_models.json").read_text(encoding="utf-8"))
         spec = next(item for item in manifest["models"] if item["name"] == "tagger")
-        directory = Path(snapshot_download(spec["repo_id"], revision=spec["revision"],
+        directory = Path(snapshot_download(config["tagger"].get("repo_id", spec["repo_id"]),
+                                           revision=config["tagger"].get("revision", spec["revision"]),
                                            allow_patterns=spec["allow_patterns"], local_dir=args.tagger_download_dir))
     source = {path.name: file_sha256(path) for path in sorted(directory.iterdir())
               if path.is_file() and path.suffix in (".safetensors", ".json", ".csv", ".py")}
     args.output.mkdir(parents=True, exist_ok=True)
     with OutputLock(args.output):
+        snapshot = args.output / "tagging-config.json"
+        if snapshot.exists() and json.loads(snapshot.read_text(encoding="utf-8")) != config:
+            raise ValueError("Saved tagging config differs; use the same settings or another output directory")
+        write_index_json(snapshot, config)
         cache_tags(pairs, config["tagger"], args.output, source,
                    lambda: load_prompt_tagger(directory, config["tagger"], device), args.batch_size, device)
 

@@ -1,0 +1,21 @@
+{
+  "repo_id": "Bedovyy/OppaiOracle-V1.1-timm",
+  "revision": "main",
+  "dtype": "bfloat16",
+  "max_tags": 256,
+  "prompt_categories": [
+    "general"
+  ],
+  "thresholds": {
+    "general": 0.75,
+    "character": 1.0,
+    "copyright": 1.0,
+    "style": 1.0,
+    "meta": 1.0,
+    "rating": 1.0
+  },
+  "preprocessing": {
+    "color_space": "BGR",
+    "pad_color": 114
+  }
+}

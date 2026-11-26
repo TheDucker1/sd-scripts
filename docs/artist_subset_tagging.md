@@ -53,3 +53,42 @@ The final `tags/tag-cache.json` stores the complete threshold-selected tags in
 unshuffled order. Per-prompt retention and shuffling happen later in training;
 tagging does not apply them. Use the selected index and the same image geometry
 when loading this tag cache in training.
+
+## Faster general-only tagging
+
+The prepared local run now uses OppaiOracle V1.1 through the
+`Bedovyy/OppaiOracle-V1.1-timm` repack. It has a native 448 x 448 input and
+roughly 248M parameters, compared with PixAI's 1008 x 1008 input and 491M.
+The reusable settings are in
+[`configs/tagger_oppai_oracle_v1_1.json`](../configs/tagger_oppai_oracle_v1_1.json).
+This profile emits only general descriptive tags, uses BF16 and an initial
+general-tag threshold of 0.75. It keeps the existing maximum of 256 selected
+tags. Training still applies shuffling and the configured retention curve later.
+
+The profile uses gray padding (114) and BGR channel order for this repack. The
+[repack card](https://huggingface.co/Bedovyy/OppaiOracle-V1.1-timm) explicitly notes
+the RGB-to-BGR conversion. The original Grio43 checkpoint instead specifies RGB;
+do not mix its preprocessing with the repacked weights. The threshold is based
+on the author's approximately 0.75 macro precision/recall operating point in
+the [published calibration](https://huggingface.co/Grio43/OppaiOracle/blob/main/V1.1_safetensors/pr_thresholds.json).
+This is a starting point, not a measured optimum on this local dataset. The
+published file contains per-tag summaries, not a usable full per-tag threshold
+table, so this profile uses the calibrated global threshold.
+
+For existing local weights, run:
+
+```bat
+"%PY%" -u tools\cache_anima_artist_tags.py --dataset work\danbooru-0000-0101-p20 --config work\danbooru-0000-0101-p20\tagging-config.json --tagger-config configs\tagger_oppai_oracle_v1_1.json --output work\danbooru-0000-0101-p20\tags-oppai-v1_1 --tagger "C:\Users\d\Documents\comfy\ComfyUI\models\wd_taggers\OppaiOracle-V1.1-timm" --device cuda --batch-size 16
+```
+
+This reads only model files from the ComfyUI folder; it does not import or start
+ComfyUI. The existing timm implementation executes native PyTorch. To download
+the same repack elsewhere, replace `--tagger PATH` with
+`--download-tagger --tagger-download-dir work\oppai-oracle-v1_1`; the worker reads
+the repository and revision from the profile.
+
+The output directory is separate from the earlier PixAI cache. Completed
+PixAI captions are not reused for the new model. The worker saves the resolved
+`tagging-config.json` beside its journal; use its `tagger` settings in training
+with the final `tags-oppai-v1_1/tag-cache.json` so cache identity checks agree.
+All artist/date filtering and shard references stay unchanged.

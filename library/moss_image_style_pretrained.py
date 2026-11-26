@@ -145,6 +145,7 @@ def load_prompt_tagger(directory, settings, device):
         antialias=notes.get("antialias", False),
         color_space=notes.get("color_space") or ("RGB" if (directory / "preprocess.json").exists() else "BGR"),
     )
+    preprocessing.update(settings.get("preprocessing", {}))
     return StylePromptTagger(model, read_tag_labels(directory / "selected_tags.csv"), preprocessing, thresholds,
                              settings.get("prompt_categories", ["general", "character", "copyright"]),
                              settings.get("max_tags", 256))

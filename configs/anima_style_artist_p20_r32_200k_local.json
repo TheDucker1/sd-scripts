@@ -143,5 +143,13 @@
     "alpha": 5.0,
     "beta": 2.0
   },
-  "vae_encoder_only": true
+  "vae_encoder_only": true,
+  "jpeg_denoiser": {
+    "enabled": true,
+    "weights": "work/csp-jpeg/csp_jpeg_weights.npz",
+    "weights_sha256": "b37f7683295ad605115c4b63366cdca3cf1bf1f14b0f0d46a6b64f753f89771e",
+    "device": "training",
+    "tile_size": 256,
+    "strength": 1.0
+  }
 }

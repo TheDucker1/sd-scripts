@@ -12,6 +12,7 @@ from PIL import Image
 from moss_image_train_style import MossImageStyleTrainer, setup_parser as setup_style_parser
 from library import compile_utils
 from library.anima_caption_sampling import validate_anima_tag_retention
+from library.anima_jpeg_denoiser import denoise_anima_batch, load_anima_jpeg_denoiser
 from library.anima_latent_pair_filter import AnimaClassifierPairFilter, AnimaLatentPairFilter
 from library.anima_reference import reference_block, target_block
 from library.anima_style_train_utils import build_anima_style_components, prepare_anima_batch
@@ -69,6 +70,8 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
     def prepare_dataset(self, components, loader, config, device):
         tags = None
         pairs = loader.dataset.artist_pairs
+        if config.get("jpeg_denoiser", {}).get("enabled", False) and (pairs is None or config.get("cache_latents", False)):
+            raise ValueError("JPEG denoising requires an artist index and online VAE encoding; disable latent caching")
         if config.get("tag_cache"):
             from library.anima_tag_cache import load_anima_tags
 
@@ -107,17 +110,22 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
             if isinstance(pair_filter, AnimaClassifierPairFilter):
                 pair_filter.bind_dataset(pairs, config)
             logger.info("Pair filtering: reject %s; resample within existing artist/date rules", pair_filter.description)
+        components.jpeg_denoiser = load_anima_jpeg_denoiser(config.get("jpeg_denoiser"), device)
+        if components.jpeg_denoiser is not None and components.jpeg_denoiser.device.type == "cpu":
+            pairs.image_postprocessor = components.jpeg_denoiser
 
     @torch.no_grad()
     def prepare_training_batch(self, components, batch, config, device, stage_timer):
         pair_filter = getattr(components, "online_pair_filter", None)
         if getattr(components, "latent_cache", None) is not None:
             return batch
-        if pair_filter is None and not config.get("vae_encoder_only", False):
+        if (pair_filter is None and not config.get("vae_encoder_only", False)
+                and getattr(components, "jpeg_denoiser", None) is None):
             return batch
         from library.moss_image_style_train_utils import encode_style_images
 
-        batch = dict(batch)
+        with stage_timer.measure("jpeg_denoise"):
+            batch = dict(denoise_anima_batch(components, batch))
         for source, target, label in (("image_a", "latent_a", "vae_encode_A"), ("image_b", "latent_b", "vae_encode_B")):
             with stage_timer.measure(label):
                 # Encoding is always batch one, including mixed image buckets.
@@ -234,6 +242,7 @@ class AnimaStyleTrainer(MossImageStyleTrainer):
                     batches_seen += 1
                 for pair in iter_image_pairs_batch(batch):
                     seed = config.get("seed", 42) + count
+                    pair = denoise_anima_batch(components, pair)
                     prepared = prepare_anima_batch(components, pair, device, random.Random(seed), review=True)
                     latent = torch.randn(prepared["latents"].shape, device=device,
                                          generator=torch.Generator(device=device).manual_seed(seed))

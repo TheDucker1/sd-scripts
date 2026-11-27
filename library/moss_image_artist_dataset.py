@@ -53,6 +53,7 @@ class MossArtistPairs:
         self.cache, self.cached_bytes, self.cache_lock = OrderedDict(), 0, threading.Lock()
         self.metadata_mismatches = 0
         self.skip_image_reads = False
+        self.image_postprocessor = None
         count = len(self.rows)
         self._build_pair_bounds()
         self.local_root = None
@@ -165,7 +166,10 @@ class MossArtistPairs:
 
     def process(self, payload, rng):
         with Image.open(io.BytesIO(payload)) as image:
-            return self.processor._process_image(stream_rgb_image(image), self.processor.subsets[0], rng)
+            result = self.processor._process_image(stream_rgb_image(image), self.processor.subsets[0], rng)
+        if result is not None and self.image_postprocessor is not None:
+            result["image"] = self.image_postprocessor(result["image"])
+        return result
 
     def preview_image(self, post_id):
         index, = np.flatnonzero(self.rows["id"] == int(post_id))
